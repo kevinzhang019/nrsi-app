@@ -6,11 +6,11 @@ Built on Next.js 16 (App Router + Cache Components), Vercel Workflow DevKit, and
 
 ## What you see
 
-- All MLB games for the day, **active games at the top**
+- **Every MLB game for the day**, grouped into four sections in this order: **Highlighted → Active → Upcoming → Finished**. Empty sections are hidden. Cards smoothly fade between sections (via `motion`'s `AnimatePresence` + `layoutId`) when a game's state changes — most commonly when a decision moment starts or ends.
 - Per-card: teams, score, current inning + half + outs, current pitcher (R/L), upcoming batter chips with per-batter `P(reach)` percentages, and a footer with `P(NRSI)` and **break-even American odds**
-- **Decision-moment cards highlighted** in amber: end-of-half-inning, or top-of-inning with 0 outs (the windows where a "no run this inning" bet is being priced)
+- **Decision-moment cards** (end-of-half-inning, or top-of-inning with 0 outs) are surfaced into the **Highlighted** section with an amber ring — the windows where a "no run this inning" bet is being priced
 - **Drill-down at `/games/{gamePk}`** for the full upcoming lineup table with each batter's reach probability
-- Live updates pushed via **SSE** as watchers detect inning transitions
+- Live updates pushed via **SSE** as watchers detect inning transitions; cards re-render in place without remount, so live data keeps flowing through any cross-section animation
 
 ## Tech stack
 

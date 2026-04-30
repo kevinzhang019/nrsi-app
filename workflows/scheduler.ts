@@ -1,6 +1,7 @@
 import { sleep } from "workflow";
 import { start } from "workflow/api";
 import { fetchScheduleStep } from "./steps/fetch-schedule";
+import { seedSnapshotStep } from "./steps/seed-snapshot";
 import { gameWatcherWorkflow } from "./game-watcher";
 import { redis } from "@/lib/cache/redis";
 import { k } from "@/lib/cache/keys";
@@ -34,6 +35,9 @@ export async function schedulerWorkflow() {
   const date = todayInTz("America/New_York");
   const games = await fetchScheduleStep(date);
   console.log("[scheduler] games", games.length);
+
+  await seedSnapshotStep(games);
+  console.log("[scheduler] seeded snapshot");
 
   for (const g of games) {
     const t = new Date(g.gameDate).getTime();

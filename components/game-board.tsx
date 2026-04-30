@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo } from "react";
+import { AnimatePresence, motion } from "motion/react";
 import { useGameStream } from "@/lib/hooks/use-game-stream";
 import { GameCard } from "@/components/game-card";
 import type { GameState } from "@/lib/state/game-state";
@@ -23,11 +24,39 @@ function sortGames(a: GameState, b: GameState): number {
   return 0;
 }
 
+function sortByStartTime(a: GameState, b: GameState): number {
+  return (a.startTime ?? "").localeCompare(b.startTime ?? "");
+}
+
+type Section = { id: string; label: string; games: GameState[] };
+
 export function GameBoard({ initial }: { initial: GameState[] }) {
   const games = useGameStream(initial);
-  const sorted = useMemo(() => [...games].sort(sortGames), [games]);
 
-  if (sorted.length === 0) {
+  const sections = useMemo<Section[]>(() => {
+    const hi: GameState[] = [];
+    const ac: GameState[] = [];
+    const up: GameState[] = [];
+    const fi: GameState[] = [];
+    for (const g of games) {
+      if (g.isDecisionMoment) hi.push(g);
+      else if (g.status === "Live" || g.status === "Delayed" || g.status === "Suspended") ac.push(g);
+      else if (g.status === "Final") fi.push(g);
+      else up.push(g);
+    }
+    hi.sort(sortGames);
+    ac.sort(sortGames);
+    up.sort(sortByStartTime);
+    fi.sort(sortGames);
+    return [
+      { id: "highlighted", label: "Highlighted", games: hi },
+      { id: "active", label: "Active", games: ac },
+      { id: "upcoming", label: "Upcoming", games: up },
+      { id: "finished", label: "Finished", games: fi },
+    ].filter((s) => s.games.length > 0);
+  }, [games]);
+
+  if (sections.length === 0) {
     return (
       <div className="rounded-md border border-[var(--color-border)] bg-[var(--color-card)] p-12 text-center">
         <p className="text-sm text-[var(--color-muted)]">
@@ -38,9 +67,31 @@ export function GameBoard({ initial }: { initial: GameState[] }) {
   }
 
   return (
-    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-      {sorted.map((g) => (
-        <GameCard key={g.gamePk} game={g} />
+    <div className="space-y-8">
+      {sections.map((section) => (
+        <section key={section.id}>
+          <h2 className="mb-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--color-muted)]">
+            {section.label}
+            <span className="ml-2 font-mono text-[var(--color-muted)]/70">{section.games.length}</span>
+          </h2>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+            <AnimatePresence mode="popLayout" initial={false}>
+              {section.games.map((g) => (
+                <motion.div
+                  key={g.gamePk}
+                  layout
+                  layoutId={`card-${g.gamePk}`}
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ type: "spring", stiffness: 350, damping: 32, opacity: { duration: 0.25 } }}
+                >
+                  <GameCard game={g} />
+                </motion.div>
+              ))}
+            </AnimatePresence>
+          </div>
+        </section>
       ))}
     </div>
   );

@@ -61,7 +61,7 @@
 ### Workflows
 
 #### `workflows/scheduler.ts` — `schedulerWorkflow`
-Daily entry point. Fetches today's schedule via `fetchScheduleStep`, then iterates games and `sleep`s until 5 minutes before each first pitch. At each wake, calls `startWatcherStep` (which wraps `start(gameWatcherWorkflow, ...)` because `start()` cannot run inside a workflow context). Persists `{gamePk: runId}` to Redis under `nrsi:runs:{date}` for ops visibility. After spawning all watchers, sleeps 12h and exits.
+Daily entry point. Fetches today's schedule via `fetchScheduleStep`, immediately calls `seedSnapshotStep(games)` to write a `Pre` stub `GameState` for every scheduled game so the dashboard's Upcoming section is populated before any watcher starts. Then iterates games and `sleep`s until 5 minutes before each first pitch. At each wake, calls `startWatcherStep` (which wraps `start(gameWatcherWorkflow, ...)` because `start()` cannot run inside a workflow context). Persists `{gamePk: runId}` to Redis under `nrsi:runs:{date}` for ops visibility. After spawning all watchers, sleeps 12h and exits.
 
 #### `workflows/game-watcher.ts` — `gameWatcherWorkflow`
 The durable per-game poller. Receives `{ gamePk, ownerId, awayTeamName, homeTeamName }`.
@@ -82,6 +82,7 @@ Each step is a `"use step"` function — full Node.js access, automatic retry on
 | Step | Purpose | Retries |
 |---|---|---|
 | `fetch-schedule.ts` | Pull MLB daily schedule | yes |
+| `seed-snapshot.ts` | Write `Pre` stub GameStates for every scheduled game via `hsetnx` (never overwrites a real watcher state) | yes |
 | `fetch-live-diff.ts` | Pull live feed (full or diff-patch), apply patches | yes |
 | `load-lineup-splits.ts` | Resolve pitcher + 9 batters with cached splits | yes |
 | `load-park-factor.ts` | Baseball Savant runs index for home park | yes (degrades to 1.0) |
@@ -142,7 +143,7 @@ The canonical `GameState` type that flows from watcher → Redis → SSE → Rea
 Server component. Suspense-wraps `<GameBoardLoader />` which calls `getInitialGames()` (cached read of `nrsi:snapshot`). Renders header + grid. Skeleton fallback during initial paint.
 
 #### `components/game-board.tsx`
-Client. Uses `useGameStream(initial)` to maintain a live `Map<gamePk, GameState>`. Sorts: decision-moments first, then by status order, then by inning desc. Renders `<GameCard>` per game.
+Client. Uses `useGameStream(initial)` to maintain a live `Map<gamePk, GameState>`. Partitions games into four sections — **Highlighted** (`isDecisionMoment === true`), **Active** (Live/Delayed/Suspended and not in a decision moment), **Upcoming** (Pre / Other, sorted by `startTime`), **Finished** (Final). Empty sections are hidden. Each section's grid is wrapped in `motion`'s `<AnimatePresence mode="popLayout">`; each card is a `<motion.div layout layoutId={`card-${gamePk}`}>` so a card moving between sections (e.g. when `isDecisionMoment` flips) cross-fades smoothly without remounting `<GameCard>`. Live SSE updates flow through unaffected since the inner `<GameCard key={gamePk}>` keeps reconciling.
 
 #### `components/game-card.tsx`
 Per-game card. Two team rows (mono-spaced score, small-caps name), `<InningState>` block (top/bottom indicator, outs as filled circles), pitcher line, upcoming-batter chips with per-batter `pReach`%, env chips, and a footer `<ProbabilityPill>` with `P(NRSI)` + break-even American odds. Decision moments add `ring-2 ring-amber-400/60` and a brief flash animation on update.

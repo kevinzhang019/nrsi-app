@@ -188,3 +188,16 @@ curl -s -X POST -H "Content-Type: application/json" \
 - The `KV_REST_API_*` fallback in `lib/cache/redis.ts` (bug #2)
 - The single-poller lock semantics — refresh TTL every tick, never do `await sleep(...)` longer than the lock TTL minus a margin
 - The `season || season-1` fallback in `loadBatterProfile` / `loadPitcherProfile` — early-season splits are empty and prior-season is the only useful proxy
+- The `hsetnx` (NOT `hset`) call in `workflows/steps/seed-snapshot.ts` — `hset` would clobber any watcher that already published a real state, replacing live data with a `Pre` stub
+- The `layoutId={`card-${gamePk}`}` on the `motion.div` wrapper in `components/game-board.tsx` — without a stable `layoutId`, cards moving between the four section `<AnimatePresence>` parents would unmount/remount and lose their cross-section fade
+
+## Dashboard sectioning + motion (added in this PR)
+
+The dashboard groups today's games into four sections in fixed order: **Highlighted → Active → Upcoming → Finished**. Each is a separate `<AnimatePresence mode="popLayout">` parent, and each card is a `<motion.div layout layoutId={`card-${gamePk}`}>` so a card animates smoothly when `isDecisionMoment` flips (Active ↔ Highlighted) or when status changes (Pre → Live → Final).
+
+Two things make this work end-to-end:
+
+1. **`workflows/steps/seed-snapshot.ts`** runs at the top of the daily scheduler and writes a `Pre` stub `GameState` into `nrsi:snapshot` for every scheduled game via `hsetnx`. This is what populates the Upcoming section before any per-game watcher starts (~5 min pre-game). When a watcher's first `publishGameState` lands, the `hset` overwrites the stub atomically — same `gamePk` → same `layoutId` → card stays mounted, fields fill in.
+2. **`useGameStream` keeps a stable `Map<gamePk, GameState>`.** SSE updates merge into the map; `<GameBoard>` re-derives sections via `useMemo`; cards already in flight finish their layout animation while still receiving fresh props. Don't add a section-name suffix to the `key` or `layoutId` — that would force remounts on section changes.
+
+If you ever need to suppress the fade for a specific case (e.g. initial paint), use `<AnimatePresence initial={false}>` (already set in `game-board.tsx`).
