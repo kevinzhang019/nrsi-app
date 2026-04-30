@@ -73,6 +73,19 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
       upcoming.pitcherId !== null &&
       (inningKey !== lastInningKey || lh !== lastLineupHash);
 
+    console.log(
+      "[watcher] tick",
+      JSON.stringify({
+        gamePk: input.gamePk,
+        status,
+        inningKey,
+        upcoming: upcoming
+          ? { pitcherId: upcoming.pitcherId, batters: upcoming.upcomingBatterIds.length }
+          : null,
+        shouldRecompute,
+      }),
+    );
+
     let nrsi: Awaited<ReturnType<typeof computeNrsiStep>> | null = null;
     let env: { parkRunFactor: number; weatherRunFactor: number; weather?: Record<string, unknown> } | null = null;
 

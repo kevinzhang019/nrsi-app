@@ -13,15 +13,20 @@ export async function publishGameState(state: GameState) {
 
 export async function getSnapshot(): Promise<GameState[]> {
   const r = redis();
-  const all = await r.hgetall<Record<string, string>>(k.snapshot());
+  const all = await r.hgetall<Record<string, unknown>>(k.snapshot());
   if (!all) return [];
   return Object.values(all)
-    .map((v) => {
-      try {
-        return JSON.parse(v) as GameState;
-      } catch {
-        return null;
+    .map((v): GameState | null => {
+      // Upstash auto-parses JSON strings → objects on read; tolerate both.
+      if (v && typeof v === "object") return v as GameState;
+      if (typeof v === "string") {
+        try {
+          return JSON.parse(v) as GameState;
+        } catch {
+          return null;
+        }
       }
+      return null;
     })
     .filter((x): x is GameState => x !== null);
 }

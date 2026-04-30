@@ -8,14 +8,18 @@ import { notFound } from "next/navigation";
 async function getGame(pk: number): Promise<GameState | null> {
   await connection();
   const r = redis();
-  const all = await r.hgetall<Record<string, string>>(k.snapshot());
-  const json = all?.[String(pk)];
-  if (!json) return null;
-  try {
-    return JSON.parse(json) as GameState;
-  } catch {
-    return null;
+  const all = await r.hgetall<Record<string, unknown>>(k.snapshot());
+  const raw = all?.[String(pk)];
+  if (!raw) return null;
+  if (typeof raw === "object") return raw as GameState;
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw) as GameState;
+    } catch {
+      return null;
+    }
   }
+  return null;
 }
 
 async function GameDetail({ params }: { params: Promise<{ pk: string }> }) {

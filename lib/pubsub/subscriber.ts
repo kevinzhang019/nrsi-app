@@ -14,18 +14,28 @@ export async function* iterateSnapshotChanges(
   intervalMs = 2000,
   abort: AbortSignal,
 ): AsyncIterable<GameState> {
-  let lastSeen = new Map<number, string>();
+  const lastSeen = new Map<number, string>();
   while (!abort.aborted) {
-    const all = await redisClient.hgetall<Record<string, string>>(k.snapshot());
+    const all = await redisClient.hgetall<Record<string, unknown>>(k.snapshot());
     if (all) {
-      for (const [pk, json] of Object.entries(all)) {
-        if (lastSeen.get(Number(pk)) === json) continue;
-        lastSeen.set(Number(pk), json);
-        try {
-          yield JSON.parse(json) as GameState;
-        } catch {
-          // skip malformed
+      for (const [pk, raw] of Object.entries(all)) {
+        let state: GameState | null = null;
+        let signature = "";
+        if (raw && typeof raw === "object") {
+          state = raw as GameState;
+          signature = JSON.stringify(raw);
+        } else if (typeof raw === "string") {
+          signature = raw;
+          try {
+            state = JSON.parse(raw) as GameState;
+          } catch {
+            state = null;
+          }
         }
+        if (!state) continue;
+        if (lastSeen.get(Number(pk)) === signature) continue;
+        lastSeen.set(Number(pk), signature);
+        yield state;
       }
     }
     await sleep(intervalMs);
