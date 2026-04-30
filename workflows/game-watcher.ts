@@ -39,6 +39,11 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
   let prevDoc: LiveFeed | null = null;
   let lastInningKey = "";
   let lastLineupHash = "";
+  let lastNrsi: Awaited<ReturnType<typeof computeNrsiStep>> | null = null;
+  let lastEnv: { parkRunFactor: number; weatherRunFactor: number; weather?: Record<string, unknown> } | null = null;
+  let lastPitcherId: number | null = null;
+  let lastPitcherName = "";
+  let lastPitcherThrows: "L" | "R" = "R";
 
   for (let loop = 0; loop < MAX_LOOPS; loop++) {
     const tick = await fetchLiveDiffStep({
@@ -86,9 +91,6 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
       }),
     );
 
-    let nrsi: Awaited<ReturnType<typeof computeNrsiStep>> | null = null;
-    let env: { parkRunFactor: number; weatherRunFactor: number; weather?: Record<string, unknown> } | null = null;
-
     if (shouldRecompute && upcoming) {
       const [splits, parkFactor, weather] = await Promise.all([
         loadLineupSplitsStep({
@@ -107,21 +109,27 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
           homeTeam: input.homeTeamName,
         }),
       ]);
-      nrsi = await computeNrsiStep({
+      lastNrsi = await computeNrsiStep({
         gamePk: input.gamePk,
         pitcher: splits.pitcher,
         batters: splits.batters,
         parkRunFactor: parkFactor,
         weatherRunFactor: weather.factor,
       });
-      env = {
+      lastEnv = {
         parkRunFactor: parkFactor,
         weatherRunFactor: weather.factor,
         weather: weather.info as unknown as Record<string, unknown>,
       };
+      lastPitcherId = splits.pitcher.id;
+      lastPitcherName = splits.pitcher.fullName;
+      lastPitcherThrows = splits.pitcher.throws;
       lastInningKey = inningKey;
       lastLineupHash = lh;
     }
+
+    const nrsi = lastNrsi;
+    const env = lastEnv;
 
     const decision = isDecisionMoment({ status, inning, half, outs, inningState });
 
@@ -146,15 +154,10 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
       venue: tick.feed.gameData.venue
         ? { id: tick.feed.gameData.venue.id, name: tick.feed.gameData.venue.name }
         : null,
-      pitcher: nrsi
-        ? {
-            id: nrsi.perBatter[0]
-              ? upcoming?.pitcherId ?? 0
-              : 0,
-            name: "",
-            throws: "R",
-          }
-        : null,
+      pitcher:
+        lastPitcherId !== null
+          ? { id: lastPitcherId, name: lastPitcherName, throws: lastPitcherThrows }
+          : null,
       upcomingBatters: nrsi?.perBatter ?? [],
       pHitEvent: nrsi?.pHitEvent ?? null,
       pNoHitEvent: nrsi?.pNoHitEvent ?? null,
