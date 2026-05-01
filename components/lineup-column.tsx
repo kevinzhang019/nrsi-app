@@ -81,7 +81,7 @@ export function LineupColumn({
                     )}
                   >
                     <span className="w-4 font-mono text-[10px] uppercase tabular-nums text-[var(--color-muted)]">
-                      {slot.starter.bats}
+                      {slot.starter.bats ?? "—"}
                     </span>
                     <span
                       className={cn(
@@ -107,7 +107,7 @@ export function LineupColumn({
                         )}
                       >
                         <span className="w-4 font-mono text-[10px] uppercase tabular-nums text-[var(--color-muted)]/70">
-                          {sub.bats}
+                          {sub.bats ?? "—"}
                         </span>
                         <span
                           className={cn(

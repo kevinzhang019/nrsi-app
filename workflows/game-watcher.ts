@@ -7,6 +7,7 @@ import { loadWeatherStep } from "./steps/load-weather";
 import { loadDefenseStep } from "./steps/load-defense";
 import { computeNrXiStep } from "./steps/compute-nrXi";
 import { publishUpdateStep } from "./steps/publish-update";
+import { enrichLineupHandsStep } from "./steps/enrich-lineup-hands";
 import { getUpcomingForCurrentInning, lineupHash } from "@/lib/mlb/lineup";
 import { extractLineups, extractLinescore, extractBatterFocus } from "@/lib/mlb/extract";
 import { isDecisionMoment, type GameState } from "@/lib/state/game-state";
@@ -110,6 +111,12 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
   let lastInningKey = "";
   let lastLineupHash = "";
   let lastDefenseKey = "";
+  // Cached enriched lineups + the lineup hash they were enriched from. We
+  // hydrate batter handedness from /people/{id} (via loadHand, 30d Redis TTL)
+  // because the live-feed boxscore omits batSide for most players. Recomputed
+  // only when the boxscore battingOrder changes (sub or starter swap).
+  let lastEnrichedHash = "";
+  let lastLineups: Awaited<ReturnType<typeof enrichLineupHandsStep>> | null = null;
   let lastNrXi: Awaited<ReturnType<typeof computeNrXiStep>> | null = null;
   let lastEnv: { parkRunFactor: number; weatherRunFactor: number; weather?: Record<string, unknown> } | null = null;
   let lastPitcherId: number | null = null;
@@ -219,6 +226,18 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
     const nrXi = lastNrXi;
     const env = lastEnv;
 
+    // Hydrate lineup batter handedness from /people/{id} when the boxscore
+    // battingOrder changes. Independent of shouldRecompute so Pre-game
+    // lineups (status !== "Live") still get hydrated as soon as they post.
+    if (lh !== lastEnrichedHash) {
+      const rawLineups = extractLineups(tick.feed);
+      lastLineups = await enrichLineupHandsStep({
+        gamePk: input.gamePk,
+        lineups: rawLineups,
+      });
+      lastEnrichedHash = lh;
+    }
+
     const decision = isDecisionMoment({ status, inning, half, outs, inningState });
 
     const state: GameState = {
@@ -257,7 +276,7 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
       pNoHitEvent: nrXi?.pNoHitEvent ?? null,
       breakEvenAmerican: nrXi?.breakEvenAmerican ?? null,
       env,
-      lineups: extractLineups(tick.feed),
+      lineups: lastLineups ?? extractLineups(tick.feed),
       linescore: extractLinescore(tick.feed),
       ...extractBatterFocus(tick.feed),
       updatedAt: new Date().toISOString(),

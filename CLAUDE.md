@@ -126,6 +126,28 @@ curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/keys/wea
   | xargs -I{} curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/{}"
 ```
 
+### 7. Boxscore omits `batSide` — every batter renders as a righty
+
+**Symptom:** the lineup column on every game card shows `R` next to all 9 batters (and any subs). The actively-on-deck `upcomingBatters` array — populated through a different path — has correct handedness, but the full lineup rendered by `<LineupColumn>` is uniformly right-handed.
+
+**Root cause:** `lib/mlb/extract.ts:entryFrom` previously did `bats: (p.batSide?.code as HandCode | undefined) ?? "R"`. The MLB live feed boxscore (`liveData.boxscore.teams.*.players[ID*]`) populates positions, batting-order codes, and per-game stats reliably — but **routinely omits `batSide`** for most or all players. The default-to-R then silently lied for 18 batters per game. The canonical source for handedness is `/api/v1/people/{id}` (already cached 30d in `hand:{playerId}` via `loadHand` in `lib/mlb/splits.ts`), but that lookup was only being made for the ~3 upcoming batters going through `loadBatterPaProfile`, never for the full lineup roster.
+
+**Fix:**
+1. `LineupEntry.bats` is now `HandCode | null` and `entryFrom` returns `null` when `batSide` is absent — no more silent lie.
+2. New step `workflows/steps/enrich-lineup-hands.ts` fans out `loadHand()` over every starter+sub id (deduped via `Set`) and overwrites `bats` with the canonical code. Per-id failures degrade to whatever extract produced rather than killing the whole tick.
+3. `workflows/game-watcher.ts` hoists `lastLineups` + `lastEnrichedHash` into workflow scope (same pattern as bug #5) and runs enrichment only when the boxscore battingOrder hash (`lh`) changes. Crucially this is **independent of `shouldRecompute`** — Pre-game lineups (status !== "Live") still get hydrated as soon as they post. Steady-state ticks reuse the cached enriched lineups.
+4. UI fallback: `slot.starter.bats ?? "—"` keeps column width stable on the rare case enrichment misses.
+
+**Why pitcher `throws` doesn't have this bug:** `pitcher.throws` flows through `loadHand(pitcherId)` → `splits.pitcher.throws` → `lastPitcherThrows` → published `GameState.pitcher.throws`. `loadHand` itself defaults to `"R"` (`lib/mlb/splits.ts:192-193`) but `/people/{id}` reliably returns `pitchHand.code` for every MLB pitcher, so the fallback never fires.
+
+**Don't change without thinking:**
+- `bats: HandCode | null` typing in `LineupEntry` (`lib/mlb/extract.ts:6`) — narrowing it back to non-null reintroduces the silent lie via the type system
+- The `lh !== lastEnrichedHash` independent-of-`shouldRecompute` check in `workflows/game-watcher.ts` — gating it on `shouldRecompute` would skip Pre-game enrichment because that block requires `status === "Live"`
+- Hoisting `lastLineups` to workflow scope (same reason as bug #5) — keeping it loop-local would cause wasteful re-fetches every tick
+- `loadHand` exported from `lib/mlb/splits.ts` — the watcher's enrichment step depends on it
+
+**No cache flush required.** The bad data lived in `nrxi:snapshot` (24h TTL); the next watcher tick after deploy overwrites it. The `hand:{playerId}` keys were always correct — we just weren't reading them for the lineup. Finished games will be replaced by tomorrow's scheduler at 13:00 UTC, or expire naturally within 24h.
+
 ## MLB Stats API gotchas
 
 - **Live feed lives at `/api/v1.1/...`**, not `/api/v1/...`. v1 returns 404 for the same path.
@@ -231,6 +253,8 @@ curl -s -X POST -H "Content-Type: application/json" \
 - The y-flip in `scripts/build-park-shapes.mjs:ty` (`VIEW_SIZE - (offY + (y - minY) * scale)`) — the GeomMLBStadiums CSV uses +y "into the outfield"; SVG uses +y "down the screen." Without the flip, every park renders upside down (home plate at the top, CF at the bottom). If you ever regenerate with a non-flipped version, every silhouette will look wrong.
 - The `venue: g.venueId != null ? { id: g.venueId, name: "" } : null` line in `workflows/steps/seed-snapshot.ts` — the empty string is intentional. The watcher fills in the real venue name on its first publish. `<ParkOutline>` only needs the id, so empty-string is fine; `null` would hide the outline on Pre-game cards.
 - The team→venueId map in `lib/parks/team-to-venue.ts` — Athletics map to Sutter Health Park (2529) but the polygon is Oakland Coliseum geometry; Rays map to Tropicana (12) regardless of any temporary relocation. These are deliberate compromises so the outline always renders. Don't drop entries — that just hides the silhouette.
+- The `lh !== lastEnrichedHash` enrichment trigger in `workflows/game-watcher.ts` and the hoisted `lastLineups`/`lastEnrichedHash` workflow-scope vars (bug #7) — independent of `shouldRecompute` so Pre-game lineups hydrate the moment they post
+- `LineupEntry.bats: HandCode | null` (`lib/mlb/extract.ts`) — the explicit nullability is the type-system guard against the bug-#7 default-to-R lie
 
 ## Dashboard sectioning + motion (added in this PR)
 
@@ -246,6 +270,8 @@ If you ever need to suppress the fade for a specific case (e.g. initial paint), 
 ## Lineup row contract
 
 Each batter row in `components/lineup-column.tsx` shows exactly four fields, left → right: **bats** (handedness) · **F. Lastname** · **xOBP** · **xSLG**. The marker dot, batting-order spot number, and position abbreviation were intentionally removed — the current-batter signal is conveyed solely by the row-level background highlight (`bg-[var(--color-accent-soft)]/60`). Only the **at-bat** batter is highlighted; the next-half (on-deck) batter gets no row treatment. The lineup column header used to render `AT BAT` / `ON DECK` pills next to the team label — those were removed so the row highlight is the single focus signal.
+
+The **bats** field is `HandCode | null` and gets hydrated from `/people/{id}` (cached 30d via `loadHand`) by `workflows/steps/enrich-lineup-hands.ts` — the live-feed boxscore omits `batSide` for most players, so reading it raw silently produces 18 right-handers per game (see bug #7). The render falls back to `"—"` if enrichment somehow misses, keeping the column width stable.
 
 Each team's `<ol>` is wrapped in `<div className="overflow-x-auto">` with `min-w-max` on the `<ol>` and `whitespace-nowrap` on each row, so the **whole list translates as a unit** when scrolled (not row-by-row). Don't break this by putting overflow on individual rows or by adding `flex-wrap` to the row.
 

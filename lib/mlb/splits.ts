@@ -182,7 +182,7 @@ export function shrinkPa(observed: PaOutcomes, n: number, league: PaOutcomes, n0
 // Raw split fetchers — shared between v1 and v2. Already cached.
 // =========================================================================
 
-async function loadHand(playerId: number) {
+export async function loadHand(playerId: number) {
   return cacheJson(k.hand(playerId), 60 * 60 * 24 * 30, async () => {
     const r = await fetchPerson(playerId);
     const p = r.people[0];

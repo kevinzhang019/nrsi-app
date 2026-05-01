@@ -3,7 +3,9 @@ import type { LiveFeed, BoxscorePlayer, HandCode } from "./types";
 export type LineupEntry = {
   id: number;
   name: string;
-  bats: HandCode;
+  // null when the boxscore omits batSide; the watcher hydrates this from
+  // /people/{id} via enrichLineupHandsStep before publishing.
+  bats: HandCode | null;
   position: string;
 };
 
@@ -32,7 +34,7 @@ function entryFrom(p: BoxscorePlayer): LineupEntry | null {
   return {
     id: p.person.id,
     name: p.person.fullName ?? `#${p.person.id}`,
-    bats: (p.batSide?.code as HandCode | undefined) ?? "R",
+    bats: (p.batSide?.code as HandCode | undefined) ?? null,
     position: p.position?.abbreviation ?? "",
   };
 }
