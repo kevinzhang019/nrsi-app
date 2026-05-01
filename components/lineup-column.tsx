@@ -38,6 +38,7 @@ export function LineupColumn({
 }) {
   const headerAlign = align === "right" ? "text-right" : "text-left";
   const isCurrentColumn = highlightKind === "current";
+  const isNextColumn = highlightKind === "next";
 
   const renderStats = (id: number) => {
     const s = statsById?.get(id);
@@ -72,6 +73,8 @@ export function LineupColumn({
           <ol className="min-w-max divide-y divide-[var(--color-border)]/40">
             {lineup.map((slot) => {
               const starterIsCurrent = isCurrentColumn && slot.starter.id === highlightId;
+              const starterIsNext = isNextColumn && slot.starter.id === highlightId;
+              const starterIsAccent = starterIsCurrent || starterIsNext;
               return (
                 <li key={slot.spot} className="px-1.5">
                   <div
@@ -86,8 +89,8 @@ export function LineupColumn({
                     <span
                       className={cn(
                         "text-[12px]",
-                        starterIsCurrent
-                          ? "text-[var(--color-fg)] font-medium"
+                        starterIsAccent
+                          ? "text-[var(--color-accent)] font-medium"
                           : "text-[var(--color-fg)]/90",
                       )}
                       title={slot.starter.name}
@@ -98,6 +101,8 @@ export function LineupColumn({
                   </div>
                   {slot.subs.map((sub) => {
                     const subIsCurrent = isCurrentColumn && sub.id === highlightId;
+                    const subIsNext = isNextColumn && sub.id === highlightId;
+                    const subIsAccent = subIsCurrent || subIsNext;
                     return (
                       <div
                         key={sub.id}
@@ -112,8 +117,8 @@ export function LineupColumn({
                         <span
                           className={cn(
                             "text-[11px]",
-                            subIsCurrent
-                              ? "text-[var(--color-fg)]"
+                            subIsAccent
+                              ? "text-[var(--color-accent)] font-medium"
                               : "text-[var(--color-muted)]",
                           )}
                           title={sub.name}
