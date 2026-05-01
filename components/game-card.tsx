@@ -121,12 +121,6 @@ export function GameCard({ game }: { game: GameState }) {
                 </span>
               )}
             </div>
-            {game.battingTeam && (
-              <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
-                <span className="text-[var(--color-accent)]">●</span> at bat ·{" "}
-                <span className="text-[var(--color-good)]">●</span> next ½
-              </span>
-            )}
           </div>
         )}
 

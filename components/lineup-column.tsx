@@ -37,6 +37,7 @@ export function LineupColumn({
   align?: "left" | "right";
 }) {
   const headerAlign = align === "right" ? "text-right" : "text-left";
+  const isCurrentColumn = highlightKind === "current";
 
   const renderStats = (id: number) => {
     const s = statsById?.get(id);
@@ -56,23 +57,11 @@ export function LineupColumn({
     <div className="space-y-1">
       <div
         className={cn(
-          "flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-[var(--color-muted)]",
+          "text-[10px] uppercase tracking-[0.18em] text-[var(--color-muted)]",
           headerAlign,
         )}
       >
         <span>{label}</span>
-        {highlightKind && (
-          <span
-            className={cn(
-              "rounded-sm px-1 py-px text-[8px] tracking-[0.2em]",
-              highlightKind === "current"
-                ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
-                : "bg-[color:var(--color-good)]/15 text-[var(--color-good)]",
-            )}
-          >
-            {highlightKind === "current" ? "AT BAT" : "ON DECK"}
-          </span>
-        )}
       </div>
       {lineup === null || lineup.length === 0 ? (
         <div className="rounded border border-dashed border-[var(--color-border)] px-2 py-3 text-center text-[10px] uppercase tracking-wider text-[var(--color-muted)]">
@@ -82,7 +71,7 @@ export function LineupColumn({
         <div className="overflow-x-auto rounded border border-[var(--color-border)]/60 bg-[var(--color-subtle)]/30">
           <ol className="min-w-max divide-y divide-[var(--color-border)]/40">
             {lineup.map((slot) => {
-              const starterIsCurrent = slot.starter.id === highlightId;
+              const starterIsCurrent = isCurrentColumn && slot.starter.id === highlightId;
               return (
                 <li key={slot.spot} className="px-1.5">
                   <div
@@ -108,7 +97,7 @@ export function LineupColumn({
                     {renderStats(slot.starter.id)}
                   </div>
                   {slot.subs.map((sub) => {
-                    const subIsCurrent = sub.id === highlightId;
+                    const subIsCurrent = isCurrentColumn && sub.id === highlightId;
                     return (
                       <div
                         key={sub.id}

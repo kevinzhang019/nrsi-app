@@ -245,7 +245,7 @@ If you ever need to suppress the fade for a specific case (e.g. initial paint), 
 
 ## Lineup row contract
 
-Each batter row in `components/lineup-column.tsx` shows exactly four fields, left → right: **bats** (handedness) · **F. Lastname** · **xOBP** · **xSLG**. The marker dot, batting-order spot number, and position abbreviation were intentionally removed — the current-batter / on-deck signal is conveyed by the row-level background highlight (`bg-[var(--color-accent-soft)]/60`) plus the column header pill (`AT BAT` / `ON DECK`).
+Each batter row in `components/lineup-column.tsx` shows exactly four fields, left → right: **bats** (handedness) · **F. Lastname** · **xOBP** · **xSLG**. The marker dot, batting-order spot number, and position abbreviation were intentionally removed — the current-batter signal is conveyed solely by the row-level background highlight (`bg-[var(--color-accent-soft)]/60`). Only the **at-bat** batter is highlighted; the next-half (on-deck) batter gets no row treatment. The lineup column header used to render `AT BAT` / `ON DECK` pills next to the team label — those were removed so the row highlight is the single focus signal.
 
 Each team's `<ol>` is wrapped in `<div className="overflow-x-auto">` with `min-w-max` on the `<ol>` and `whitespace-nowrap` on each row, so the **whole list translates as a unit** when scrolled (not row-by-row). Don't break this by putting overflow on individual rows or by adding `flex-wrap` to the row.
 
@@ -257,7 +257,7 @@ Display formatting uses `formatBaseballRate(n)`: 3 decimal places, leading `0` s
 
 `<ParkOutline>` (`components/park-outline.tsx`) renders a 28px SVG silhouette of the home park — foul-line wedge + outfield outer wall, single 1.25px hairline stroke, no fill. It sits in the env-chip row of `<GameCard>` where the text label "Park" used to be; the outline literally is the label, with the numeric park run-factor rendered to its right.
 
-Stroke transitions `var(--color-muted) → var(--color-accent)` over 240ms when `highlighted` flips, so the outline goes amber **in lockstep** with the existing decision-moment ring + `flash-fresh` keyframe. One unified amber alert state across the whole card; no competing visual cues.
+Stroke transitions `var(--color-muted) → var(--color-accent)` over 240ms when `highlighted` flips, so the outline lights up **in lockstep** with the existing decision-moment ring + `flash-fresh` keyframe. One unified accent (green — `--color-accent` is now `#22c55e`) alert state across the whole card; no competing visual cues.
 
 Pipeline:
 1. **Source data:** `bdilday/GeomMLBStadiums/inst/extdata/mlb_stadia_paths.csv` — the polygon data Baseball Savant uses for spray charts. ~16k rows × 30 parks, columns `team,x,y,segment`.
