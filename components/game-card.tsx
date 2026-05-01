@@ -4,6 +4,7 @@ import type { GameState } from "@/lib/state/game-state";
 import { cn } from "@/lib/utils";
 import { ProbabilityPill } from "@/components/probability-pill";
 import { InningState } from "@/components/inning-state";
+import { ParkOutline } from "@/components/park-outline";
 
 function teamShort(name: string): string {
   const parts = name.split(" ");
@@ -21,6 +22,26 @@ function envChip(label: string, value: number | null) {
   return (
     <span className={cn("text-[10px] uppercase tracking-wider", tone)}>
       {label} {value.toFixed(2)} {arrow}
+    </span>
+  );
+}
+
+function ParkFactor({ value }: { value: number | null }) {
+  if (value === null || !Number.isFinite(value)) {
+    return (
+      <span className="text-[10px] uppercase tracking-wider text-[var(--color-muted)]">—</span>
+    );
+  }
+  const arrow = value > 1.02 ? "↑" : value < 0.98 ? "↓" : "→";
+  const tone =
+    value > 1.02
+      ? "text-[var(--color-good)]"
+      : value < 0.98
+      ? "text-[var(--color-bad)]"
+      : "text-[var(--color-muted)]";
+  return (
+    <span className={cn("font-mono tabular-nums text-[10px] uppercase tracking-wider", tone)}>
+      {value.toFixed(2)} {arrow}
     </span>
   );
 }
@@ -88,9 +109,16 @@ export function GameCard({ game }: { game: GameState }) {
           </div>
         )}
 
-        {(game.env || game.pNoHitEvent !== null) && (
+        {(game.venue?.id || game.env || game.pNoHitEvent !== null) && (
           <div className="flex items-center gap-3 pt-1">
-            {envChip("Park", game.env?.parkRunFactor ?? null)}
+            <span className="inline-flex items-center gap-1.5">
+              <ParkOutline
+                venueId={game.venue?.id ?? null}
+                highlighted={game.isDecisionMoment}
+                size={28}
+              />
+              <ParkFactor value={game.env?.parkRunFactor ?? null} />
+            </span>
             {envChip("Wx", game.env?.weatherRunFactor ?? null)}
           </div>
         )}

@@ -1,35 +1,94 @@
-import { pAtLeastTwoReach } from "@/lib/prob/inning-dp";
-import { pReach } from "@/lib/prob/reach-prob";
+import { pAtLeastOneRun, type Bases, type GameState } from "@/lib/prob/markov";
+import { matchupPa, applyEnv } from "@/lib/prob/log5";
+import { applyTtop } from "@/lib/prob/ttop";
+import { LEAGUE_PA, type BatterPaProfile, type PaOutcomes, type PitcherPaProfile } from "@/lib/mlb/splits";
+import type { ParkComponentFactors } from "@/lib/env/park";
+import type { WeatherComponentFactors } from "@/lib/env/weather";
+import { effectiveBatterStance } from "@/lib/prob/log5";
+import { calibrate } from "@/lib/prob/calibration";
 import { americanBreakEven, roundOdds } from "@/lib/prob/odds";
 import { log } from "@/lib/log";
-import type { BatterProfile, PitcherProfile } from "@/lib/mlb/splits";
+import type { HandCode } from "@/lib/mlb/types";
+
+export type NrsiPerBatter = {
+  id: number;
+  name: string;
+  bats: HandCode;
+  /** OBP-equivalent for display continuity with v1: 1 - k - ipOut. */
+  pReach: number;
+  /** Per-PA outcome distribution after Log5 + env + TTOP. Optional in result for size. */
+  pa: PaOutcomes;
+};
 
 export type NrsiResult = {
-  pHitEvent: number;
-  pNoHitEvent: number;
+  pHitEvent: number; // P(≥1 run) — name kept for back-compat
+  pNoHitEvent: number; // P(NRSI)
   breakEvenAmerican: number;
-  perBatter: Array<{ id: number; name: string; bats: "L" | "R" | "S"; pReach: number }>;
+  startState: GameState;
+  perBatter: NrsiPerBatter[];
 };
 
 export async function computeNrsiStep(opts: {
   gamePk: number;
-  pitcher: PitcherProfile;
-  batters: BatterProfile[];
-  parkRunFactor: number;
-  weatherRunFactor: number;
+  pitcher: PitcherPaProfile;
+  batters: BatterPaProfile[];
+  park: ParkComponentFactors;
+  weather: WeatherComponentFactors;
+  startState: GameState;
+  paInGameForPitcher: number;
 }): Promise<NrsiResult> {
   "use step";
-  const { gamePk, pitcher, batters, parkRunFactor, weatherRunFactor } = opts;
-  const env = { parkRunFactor, weatherRunFactor };
-  const probs = batters.map((b) => pReach(b, pitcher, env));
-  const pHit = pAtLeastTwoReach(probs);
+  const { gamePk, pitcher, batters, park, weather, startState, paInGameForPitcher } = opts;
+
+  log.info("step", "computeNrsi:start", {
+    gamePk,
+    pitcherId: pitcher.id,
+    n: batters.length,
+    startOuts: startState.outs,
+    startBases: startState.bases,
+    ttoStart: paInGameForPitcher,
+  });
+
+  const perBatter: NrsiPerBatter[] = [];
+  const lineup: PaOutcomes[] = [];
+
+  for (let i = 0; i < batters.length; i++) {
+    const b = batters[i];
+    const stance = effectiveBatterStance(b.bats, pitcher.throws);
+    const matchup = matchupPa(b, pitcher, LEAGUE_PA);
+    const enved = applyEnv(matchup, park, weather, stance);
+    const ttoAdjusted = applyTtop(enved, paInGameForPitcher + i);
+    lineup.push(ttoAdjusted);
+    perBatter.push({
+      id: b.id,
+      name: b.fullName,
+      bats: b.bats,
+      pReach: 1 - ttoAdjusted.k - ttoAdjusted.ipOut,
+      pa: ttoAdjusted,
+    });
+  }
+
+  const rawPHit = pAtLeastOneRun(startState, lineup);
+  const pHit = calibrate(rawPHit);
   const pNo = 1 - pHit;
+
   const result: NrsiResult = {
     pHitEvent: pHit,
     pNoHitEvent: pNo,
     breakEvenAmerican: roundOdds(americanBreakEven(pNo)),
-    perBatter: batters.map((b, i) => ({ id: b.id, name: b.fullName, bats: b.bats, pReach: probs[i] })),
+    startState,
+    perBatter,
   };
-  log.info("step", "computeNrsi:ok", { gamePk, pHit, pNo, odds: result.breakEvenAmerican });
+
+  log.info("step", "computeNrsi:ok", {
+    gamePk,
+    pHit,
+    pNo,
+    odds: result.breakEvenAmerican,
+    startOuts: startState.outs,
+    startBases: startState.bases,
+    ttoStart: paInGameForPitcher,
+  });
+
   return result;
 }

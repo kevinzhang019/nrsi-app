@@ -13,7 +13,8 @@
     "test:watch": "vitest",
     "workflow:web": "workflow web",
     "workflow:health": "workflow health",
-    "workflow:inspect": "workflow inspect runs"
+    "workflow:inspect": "workflow inspect runs",
+    "build:park-shapes": "node scripts/build-park-shapes.mjs"
   },
   "dependencies": {
     "@upstash/redis": "^1.37.0",

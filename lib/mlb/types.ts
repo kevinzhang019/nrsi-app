@@ -94,14 +94,30 @@ export type LiveFeed = {
       outs?: number;
       balls?: number;
       strikes?: number;
-      offense?: { batter?: { id: number }; onDeck?: { id: number }; inHole?: { id: number }; battingOrder?: number };
+      offense?: {
+        batter?: { id: number };
+        onDeck?: { id: number };
+        inHole?: { id: number };
+        battingOrder?: number;
+        first?: { id: number };
+        second?: { id: number };
+        third?: { id: number };
+      };
       defense?: { pitcher?: { id: number } };
       teams?: { home: { runs: number }; away: { runs: number } };
     };
     boxscore?: {
       teams: {
-        away: { battingOrder?: number[]; pitchers?: number[] };
-        home: { battingOrder?: number[]; pitchers?: number[] };
+        away: {
+          battingOrder?: number[];
+          pitchers?: number[];
+          players?: Record<string, { stats?: { pitching?: { battersFaced?: number } } }>;
+        };
+        home: {
+          battingOrder?: number[];
+          pitchers?: number[];
+          players?: Record<string, { stats?: { pitching?: { battersFaced?: number } } }>;
+        };
       };
     };
     plays?: {

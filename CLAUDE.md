@@ -6,7 +6,7 @@
 
 - **What:** live MLB no-run-scoring-inning probability dashboard
 - **Stack:** Next.js 16 App Router (Cache Components on) + Vercel Workflow DevKit + Upstash Redis (Vercel Marketplace) + Tailwind v4 + Vitest
-- **Status:** deployed to https://nrsi-app.vercel.app, scheduler workflow runs daily at 13:00 UTC, 24/24 unit tests passing, build green
+- **Status:** deployed to https://nrsi-app.vercel.app, scheduler workflow runs daily at 13:00 UTC, 72/72 unit tests passing, build green
 
 ## Bugs we already hit — do NOT re-introduce
 
@@ -97,6 +97,34 @@ let lastPitcherThrows: "L" | "R" = "R";
 ```
 
 These get **updated only when** `shouldRecompute && upcoming` (line 94) and read every tick (line 131). Don't move these back into the loop body.
+
+### 6. Park / weather scrapers silently fall back to neutral 1.0
+
+**Symptom:** every game shows `parkRunFactor: 1.0` and `weather.source: "fallback"`. NRSI math runs as if every park is neutral and every game is calm 70°F. No errors logged at error level — only `log.warn("park", "scrape:failed", …)` and `log.warn("weather", "scrape:failed", …)` which are easy to miss in noisy logs.
+
+**Root causes:**
+1. **Savant park factors:** the live JSON's team key is `name_display_club` (short forms like `"Red Sox"`, `"D-backs"`). The old parser only checked `team_name` / `name` / `team`, so every row got filtered out and `loadParkFactors` returned `[]`. Fixed in `lib/env/park.ts:parseSavantData` — the team-field fallback chain now starts with `name_display_club`. Also added `D-backs` → `Diamondbacks` and `A's` → `Athletics` aliases via `canonicalizeSavantTeam` so `findRow`'s substring matcher resolves them.
+2. **covers.com weather:** the URL `https://contests.covers.com/weather/MLB` is a hard 404. Real URL is `https://www.covers.com/sport/mlb/weather`. Selectors changed too — the cheerio walk now iterates `.covers-CoversWeather-brick`, matches by city-form label OR MLB abbr (`COVERS_TEAM` map), and pulls wind direction from the `.covers-coversweather-windDirectionIcon`'s `src` (e.g. `wind_icons/nw.png`). Wind compass codes are translated to "out/in/cross" via `lib/env/park-orientation.ts` — a new module with home-plate→CF bearings for all 30 parks.
+
+**Why the fallback hides the failure:** `cacheJson` in `lib/cache/redis.ts` caches whatever the inner function returns, including `[]` for park (24 h TTL) and `DEFAULT` for weather (30 min TTL). Both `getParkRunFactor` and `weatherRunFactor` interpret those as "no signal" and return `1.0`. Net effect: the model thinks Coors Field and Oracle Park play identically.
+
+**Don't change without thinking:**
+- `parseSavantData` team-field order (`name_display_club` first; live JSON's actual key)
+- `SAVANT_NAME_ALIAS` (`d-backs` → `Diamondbacks`, `a's` → `Athletics`)
+- `COVERS_URL` — the contests subdomain is gone; only `www.covers.com/sport/mlb/weather` works
+- `COVERS_TEAM` labels — covers.com disambiguates shared cities as `NY Yankees`, `Chi. Cubs`, `LA Dodgers`, etc. Don't simplify to nicknames-only
+- Wind direction is **FROM** convention (meteorological). `classifyWind` flips that to outfield-relative via park orientation
+
+**How to detect regression:** the fixture-driven tests in `lib/env/park.test.ts` and `lib/env/weather.test.ts` parse captured HTML from `lib/env/__fixtures__/`. If covers.com or Savant change their structure, those tests fail loud in CI instead of the production scrape silently going neutral. To refresh fixtures after an upstream change: re-run the curl commands in the runbook section, paste into the fixture files, and update the test assertions.
+
+**One-time cache flush after deploy** (the bad `[]` / `DEFAULT` is cached under the working keys):
+```bash
+set -a; source .env.local; set +a
+curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/park:factors:2026"
+curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/keys/weather:*" \
+  | python3 -c 'import sys,json; [print(k) for k in json.load(sys.stdin).get("result",[])]' \
+  | xargs -I{} curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/{}"
+```
 
 ## MLB Stats API gotchas
 

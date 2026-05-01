@@ -1,88 +1,222 @@
-# Probability model
+# Probability model — v2 (Log5 + 24-state Markov)
 
 The model that drives `P(NRSI)` and the break-even American odds shown on every card.
 
 ## Definitions
 
-- **Reach base** — a batter ends his plate appearance on base (hit, walk, HBP, error). Operationalized as the batter's on-base percentage (OBP).
-- **Hit event** — at least 2 batters reach base in the half-inning being modeled. *User-specified definition.* (A "no run" bet typically wins if no run scores; here we proxy that with "fewer than 2 reach.")
-- **NRSI** — No-Run-Scoring-Inning. We compute `P(NRSI) = 1 − P(hit event)`.
+- **Plate appearance (PA) outcome** — one of `{single, double, triple, hr, bb, hbp, k, ipOut}`. The eight outcomes are mutually exclusive and exhaustive; rates sum to 1. `ipOut` (in-play out) is the residual covering ground outs, fly outs, sac flies, double plays, etc.
+- **NRSI** — No-Run-Scoring-Inning. We compute `P(NRSI) = 1 − P(≥1 run scores)`.
 - **Break-even American odds** — the American odds at which a "no run" bet has zero expected value, given the model's `q = P(NRSI)`. Quoted lines better than break-even are positive-EV; worse are negative-EV.
 
-## Per-batter reach probability — `lib/prob/reach-prob.ts`
+## Two-stage pipeline
 
 ```
-pitcherPseudoObp(whip)      = clamp(whip / 3.5, 0.18, 0.55)
-
-pReach(batter, pitcher, env) =
-   batterObp:    if batter.bats === "S": max(batter.obpVs.L, batter.obpVs.R)
-                 else:                   batter.obpVs[pitcher.throws]
-   pitcherWhip:  if batter.bats === "S": max(pitcher.whipVs.L, pitcher.whipVs.R)
-                 else:                   pitcher.whipVs[batter.bats]
-   raw          = (batterObp + pitcherPseudoObp(pitcherWhip)) / 2
-   adjusted     = raw * env.parkRunFactor * env.weatherRunFactor
-   clamped      = clamp(adjusted, 0.05, 0.85)
+   batter splits   pitcher splits   league rates
+        ▼               ▼                ▼
+   ┌──────────────────────────────────────────┐
+   │  Stage 1: per-PA outcome distribution    │
+   │  (generalized multinomial Log5)          │
+   │  → 8-vector summing to 1                 │
+   └──────────────────────────────────────────┘
+        ▼ park (per-component)   ▼ weather (per-component)
+   ┌──────────────────────────────────────────┐
+   │  applyEnv: scale each outcome rate, then │
+   │  renormalize so total stays 1            │
+   └──────────────────────────────────────────┘
+        ▼ paInGameForPitcher
+   ┌──────────────────────────────────────────┐
+   │  applyTtop: weaken K, strengthen BB/HR   │
+   │  per times-through-the-order bucket      │
+   └──────────────────────────────────────────┘
+        ▼ live (outs, bases) from MLB feed
+   ┌──────────────────────────────────────────┐
+   │  Stage 2: 24-state base-out Markov chain │
+   │  iterated PA-by-PA through upcoming order│
+   │  → P(≥1 run scores)                      │
+   └──────────────────────────────────────────┘
+        ▼
+   ┌──────────────────────────────────────────┐
+   │  calibrate(): identity in v1, isotonic   │
+   │  once we have production (pred,actual)   │
+   └──────────────────────────────────────────┘
+        ▼
+     pNoHitEvent = 1 - pHit  →  break-even odds
 ```
 
-Implementation: `lib/prob/reach-prob.ts:13-33`. The `pitcherPseudoObp` helper at `:9-11` is the rough "convert WHIP to OBP-equivalent" hack the user specified.
+## Stage 1 — per-PA outcome distribution (`lib/prob/log5.ts`)
 
-### Why this shape
+### Generalized multinomial Log5 (Hong, *SABR Journal*)
 
-- **Average of two estimates.** The batter's OBP-against-handedness gives one signal; the pitcher's WHIP-against-handedness (converted to a pseudo-OBP) gives another. Averaging hedges against each player's small-sample noise.
-- **WHIP / 3.5.** WHIP counts walks + hits per inning (3 outs). Most outs come from at-bats where the batter doesn't reach. A rough conversion: if WHIP is 1.4, the pitcher allows ~1.4 baserunners per ~3.5 PAs, so reach rate ≈ 1.4/3.5 = 0.4. The 3.5 is empirical-ish — assumes some BB are unintentional and PAs per inning skew slightly above 3 for high-WHIP pitchers. **Don't change this without a calibration study.**
-- **Clamps.** `[0.05, 0.85]` prevents degenerate values from bad split data (e.g. early-season splits with N=3). The pseudo-OBP `[0.18, 0.55]` clamp is a separate safety on the pitcher input.
+For each outcome category `i`:
 
-### Switch hitter rule (user-specified, NOT standard)
+```
+P(E_i | matchup) = (b_i × p_i / l_i) / Σ_j (b_j × p_j / l_j)
+```
 
-When `batter.bats === "S"`:
-- `batterObp = max(batter.obpVs.L, batter.obpVs.R)`
-- `pitcherWhip = max(pitcher.whipVs.L, pitcher.whipVs.R)`
+where `b_i` is the batter's rate, `p_i` is the pitcher's rate, `l_i` is the league rate (vs the pitcher's hand), all per-PA. The numerator is computed independently per outcome; the denominator renormalizes so the result sums to 1.
 
-Standard MLB convention is that switch hitters always face pitchers from the *opposite* side, so you'd use the batter's OBP vs the pitcher's hand directly. The user explicitly chose to use **max** of both sides, which is intentionally generous toward "batter reaches" — it assumes the pitcher's worse split applies because switch hitters have the optionality to wait for the matchup that suits them.
+This is the canonical sabermetric matchup formula — it respects the asymmetry around league mean that a simple arithmetic average does not. Tango binary worked example: a `.400` OBP hitter vs a `.250` OBP-allowed pitcher in a `.333` league → `.308` (a naive average would say `.325`).
 
-This rule is in `lib/prob/reach-prob.ts:21-28` and unit-tested in `lib/prob/reach-prob.test.ts`. **Don't replace with the opposite-hand convention** without explicit user approval.
+Implementation: `lib/prob/log5.ts:log5Matchup`.
 
-### Environment factors
+### Profile inputs (`lib/mlb/splits.ts`)
 
-- `env.parkRunFactor` — Baseball Savant runs index for the home park (e.g. 1.15 at Coors, 0.92 at Oracle). `lib/env/park.ts:getParkRunFactor`.
-- `env.weatherRunFactor` — derived from covers.com weather scrape. `lib/env/weather.ts:weatherRunFactor`. Multiplicative chain: temp delta from 70°F (±10% cap), wind out/in (±8% cap by mph), precip > 60% (×0.95). Domes bypass everything → 1.0. Final factor clamped to `[0.85, 1.15]`.
+`loadBatterPaProfile(playerId)` and `loadPitcherPaProfile(playerId)` return:
 
-Both factors default to `1.0` if the scrape fails. The combined `parkRunFactor * weatherRunFactor` mildly double-counts temperature/wind (the park factor was computed from games played in actual weather), but the bias is modest. Not worth correcting until we backtest.
+```ts
+{
+  paVs: { L: PaOutcomes, R: PaOutcomes },   // hitter splits keyed by pitcher hand;
+                                             // pitcher splits keyed by batter hand
+  paCounts: { L: number, R: number },
+  bats / throws: HandCode,
+}
+```
 
-## Inning DP — `lib/prob/inning-dp.ts`
+Each side is built by:
+1. Pulling raw counts from the MLB Stats API splits payload (cached 12h).
+2. Converting to per-PA rates: `single = (H − 2B − 3B − HR) / PA`, `bb = BB / PA`, etc. The `ipOut` rate is `1 − Σ(other rates)` so the multinomial sums to 1 by construction.
+3. **Empirical-Bayes shrinkage** to `LEAGUE_PA[handedness]` with prior strength `n0 = 200` PA: `shrunken = (n × observed + n0 × league) / (n + n0)`. Stabilizes early-season and small-sample players.
+4. **Recent-form blend** (last 30 days, weight 0.30 if there is material recent data): `(1 − w) × season_shrunk + w × recent_shrunk`. Falls back gracefully to season-only if the date-range fetch is empty.
 
-A small Bayesian dynamic program walks the upcoming order forward, tracking the joint distribution over `(outs, reaches_so_far)` at each batter index.
+`LEAGUE_PA` constants are 2024–2025 MLB averages by pitcher hand, sourced from FanGraphs splits leaderboards. They drift very slowly year-over-year; refresh annually or when calibration starts to drift.
+
+### Switch-hitter rule
+
+`effectiveBatterStance(batter.bats, pitcher.throws)` and `batterSideVs(batter, pitcher, rule)` resolve which split to read:
+
+- **`actual` (default)** — switch hitters always face from the side opposite the pitcher's throwing hand (canonical platoon advantage). For a non-switch hitter, the rule degenerates to `batterSide = pitcher.throws`, `pitcherSide = batter.bats`.
+- **`max` (legacy v1)** — pick the side with the highest non-out rate for the batter and the most permissive side for the pitcher. Reachable via `NRSI_SWITCH_HITTER_RULE=max`.
+
+### Park factors (`lib/env/park.ts`)
+
+`getParkComponentFactors(homeTeamName, season)` returns per-outcome multipliers `{hr, triple, double, single, k, bb}` keyed by batter handedness (L/R).
+
+When the Statcast scrape returns full per-component fields (`index_hr`, `index_2b`, etc.), those are used directly. When it returns only `index_runs`, components are derived:
+
+| Component | Derivation | Rationale |
+|---|---|---|
+| `hr` | `runs^1.5` | Most park-sensitive — batted-ball physics |
+| `triple` | `runs^1.0` | Field dimensions modestly sensitive |
+| `double` | `runs^0.7` | Moderate |
+| `single` | `runs^0.4` | Mostly batter-pitcher interaction |
+| `k`, `bb` | `1.0` | Park-independent |
+
+All factors clamped to `[0.5, 1.8]`; failures degrade to neutral (all 1.0).
+
+### Weather factors (`lib/env/weather.ts`)
+
+`weatherComponentFactors(WeatherInfo)` returns per-outcome multipliers. The HR delta is the active dimension; everything else is a damped fraction:
+
+```
+hrDelta = clamp((tempF - 70) × 0.011, ±0.18)            ← Hampson 2013
+        + (windOut ? +clamp(mph × 0.005, 0, 0.10) : 0)
+        − (windIn  ? +clamp(mph × 0.005, 0, 0.10) : 0)
+        + clamp((humidityPct - 50) × 0.001, ±0.04)      ← humid air = less dense
+        + clamp((30.0 - pressureInHg) × 0.005, ±0.03)   ← lower pressure = less dense
+        + (precip > 60% ? -0.05 : 0)
+        clamped to ±0.25 total
+
+hr     = 1 + hrDelta
+triple = 1 + 0.30 × hrDelta
+double = 1 + 0.30 × hrDelta
+single = 1 + 0.10 × hrDelta
+k, bb  = 1 (literature reports no significant weather signal)
+```
+
+Domes return `NEUTRAL_WEATHER`. Coefficient sources cited inline in `weather.ts`.
+
+### `applyEnv`
+
+Multiplies each outcome rate of the matchup multinomial by the corresponding park × weather factor, then **renormalizes**. So a 1.10× HR boost steals mass proportionally from the other outcomes (mostly `ipOut`) rather than inflating the absolute outcome sum. This is the principled way to apply multipliers on a multinomial.
+
+The batter handedness chooses which side of the park-component table to read (parks favor LHB/RHB asymmetrically — Yankees' short porch in RF, Fenway's Green Monster, etc.).
+
+## Stage 1.5 — Times-Through-the-Order Penalty (`lib/prob/ttop.ts`)
+
+Tango (*The Book*, Ch 9) and Carleton (*Baseball Prospectus*) document a progressive degradation each time a starting pitcher cycles through the lineup — more contact, harder contact, slightly more walks, slightly fewer strikeouts. Approximate published deltas vs the 1st time through:
+
+| TTO bucket | PA range | K factor | BB factor | HR factor |
+|---|---|---|---|---|
+| 1st | 1–9 | 1.000 | 1.000 | 1.000 |
+| 2nd | 10–18 | 0.956 | 1.036 | 1.133 |
+| 3rd | 19–27 | 0.911 | 1.060 | 1.233 |
+| 4th+ | 28+ | 0.889 | 1.096 | 1.333 |
+
+`applyTtop(pa, paInGameForPitcher)` multiplies `k`, `bb`, `hr` by the bucket's factor and renormalizes. For relievers, `paInGameForPitcher` resets to 0 when they enter (handled in the watcher by reading `boxscore.players.ID{pitcherId}.stats.pitching.battersFaced`).
+
+This is negligible for first-inning probabilities but materially shifts late-game numbers when the starter is still in.
+
+## Stage 2 — 24-state base-out Markov chain (`lib/prob/markov.ts`)
 
 ### State space
 
-`dp: Map<outs, [pReach0, pReach1]>` where `outs ∈ {0,1,2,3}` and `pReach0`/`pReach1` are probability masses for `reaches_so_far ∈ {0,1}`.
+`(outs ∈ {0,1,2}) × (bases ∈ {0..7})` = 24 active states + 1 absorbing 3-out state.
 
-We don't track `reaches >= 2` as a state — instead it's an absorbing event. As soon as mass would transition into `reaches=2`, it's added to a running scalar `pHitEvent` and removed from the working `dp`.
+Bases use a 3-bit encoding:
+- bit 0 (value 1) = runner on 1st
+- bit 1 (value 2) = runner on 2nd
+- bit 2 (value 4) = runner on 3rd
 
-### Transitions
+So `0` = empty, `1` = 1st only, `4` = 3rd only, `7` = loaded, etc.
 
-For each upcoming batter `i` with `p_i = pReach`:
-- With prob `p_i`: batter reaches. State `(o, 0) → (o, 1)`, or `(o, 1) → absorbed into pHitEvent`.
-- With prob `1 - p_i`: batter is out. State `(o, r) → (o+1, r)`. If `o+1 == 3`, that mass is dead (no further transitions, no contribution to `pHitEvent`).
+### Transition rules (Tango defaults)
 
-### Termination
+For each PA, the outcome (sampled from the Stage-1 multinomial) determines a deterministic-or-branching transition. Advance probabilities are tunable constants at the top of `markov.ts`.
 
-- `o >= 3`: that mass is inert (inning ended without a hit event from this branch).
-- All remaining mass at `o == 3`: loop exits.
-- We only iterate `min(p.length, until_dead)` batters. We pass at least 9 (one full lineup turn) so the DP terminates naturally at 3 outs.
+| Outcome | Transition |
+|---|---|
+| `K` | outs+1, bases unchanged, 0 runs |
+| `BB` / `HBP` | Forced advance only. Lead runner scores **only** if loaded. New 1st always set; chain force from 1st→2nd→3rd. |
+| `1B` | Batter to 1st; runner on 3rd scores; runner on 2nd scores w/ prob `[0.30, 0.45, 0.55]` by 0/1/2 outs (else stops at 3rd); runner on 1st advances to 2nd. |
+| `2B` | Batter to 2nd; runners on 2nd and 3rd score; runner on 1st scores w/ prob `[0.40, 0.60, 0.70]` (else stops at 3rd). |
+| `3B` | Batter to 3rd; all other runners score. |
+| `HR` | All runners + batter score; bases empty; runs = `1 + popcount(bases)`. |
+| `ipOut` | At 2 outs: outs+1, no advancement. At <2 outs with 1st occupied: 10% GIDP (outs+2, clear 1st). At <2 outs with 3rd occupied: 20% sac fly (outs+1, clear 3rd, 1 run). Else: outs+1, bases unchanged. |
 
-### Output
+Each transition emits `{next: GameState, runs: number, weight: number}`. Weights for branching outcomes (1B/2B/ipOut) sum to 1 within that outcome.
+
+### Forward iteration
+
+`pAtLeastOneRun(start, lineup)` runs a forward chain:
 
 ```
-pAtLeastTwoReach(p[]) → P(hit event)         // p_HitEvent
-pNoHitEvent(p[])      → 1 - pAtLeastTwoReach(p)
+alive: Map<stateKey, mass>           // all mass that has not yet absorbed
+pHasRun: scalar                       // absorbing state for "≥1 run scored"
+
+for each upcoming batter:
+  for each (state, mass) in alive:
+    for each outcome in 8-vector:
+      for each transition emitted:
+        m = mass × outcomeProb × transitionWeight
+        if transition.runs > 0:        pHasRun += m       // absorbed
+        else if next.outs >= 3:        // absorbed silently (no runs, inning ended)
+        else:                           alive[next] += m
+
+return pHasRun
 ```
 
-Implementation at `lib/prob/inning-dp.ts:10-44`. The helper `addMass` at `:46-51` does the in-place accumulation.
+The chain is **non-stationary**: each PA uses the *current* batter's Log5+env+ttop multinomial as its kernel. The `alive` map collapses to empty as the inning absorbs into either "scored" or "3 outs without scoring" — typically within 5–8 PAs. Iteration cap is the lineup length (we always pass at least 9).
 
-### Verified by simulation
+### Live state from the MLB feed
 
-`lib/prob/inning-dp.test.ts` includes a Monte Carlo sanity check: for `p=[0.3]*9` and a varied 9-vector, the DP value matches a 200K-trial simulation within `5e-3`. Matches by construction at `[0,0,...] → 0` and `[1,1,1] → 1`.
+The watcher reads:
+
+```ts
+function readMarkovStartState(feed): { outs, bases }
+function readPaInGameForPitcher(feed, pitcherId): number
+```
+
+`outs` from `linescore.outs`, `bases` bitmap from `linescore.offense.{first,second,third}` ids, and `paInGameForPitcher` from the boxscore's `stats.pitching.battersFaced` for the current pitcher (resets when a reliever enters).
+
+This means the model uses the actual mid-inning state — runner on 3rd with 0 outs gets the ~85% run probability it deserves, not the ~27% league-average start-of-inning value.
+
+## Calibration shim (`lib/prob/calibration.ts`)
+
+A monotone post-hoc transform applied to the model's final probability. **V1 ships as identity** (no-op) — there is no production data yet. Once we have ≥ 1k `(predicted, actual)` pairs from live games, fit isotonic regression on the residuals and load the resulting JSON table via `loadCalibrator(table)`.
+
+The shim does piecewise-linear interpolation between sorted `{pred, actual}` points (binary search; O(log n)). It is monotone and idempotent — never inverts the model's ordering, and applying it twice equals applying it once.
+
+Reference: Niculescu-Mizil & Caruana, *Predicting Good Probabilities with Supervised Learning* (ICML 2005). Isotonic > Platt for tree-shaped / simulator-style errors.
 
 ## American odds break-even — `lib/prob/odds.ts`
 
@@ -90,56 +224,62 @@ Given `q = P(NRSI)` (probability the bet wins):
 
 ```
 americanBreakEven(q) =
-   q ≥ 0.5  →  -100 * q / (1 - q)         // negative odds
-   q < 0.5  →  +100 * (1 - q) / q         // positive odds
+   q ≥ 0.5  →  -100 · q / (1 - q)         // negative odds
+   q < 0.5  →  +100 · (1 - q) / q         // positive odds
 ```
 
-Implementation at `lib/prob/odds.ts:1-5`. Round-trips through `impliedProb`:
+Round-trips through `impliedProb(american)`. A quoted line `A` is **positive-EV** iff `impliedProb(A) < q`. Display value uses `roundOdds(...)` rounded to nearest 5; the raw unrounded value is used for any actual EV comparison.
 
-```
-impliedProb(american) =
-   american < 0  →  -american / (-american + 100)
-   american > 0  →  100 / (american + 100)
-   american = 0  →  0.5
-```
+## End-to-end (`workflows/steps/compute-nrsi.ts`)
 
-(`lib/prob/odds.ts:7-11`.)
+```ts
+for each upcoming batter b at index i:
+  matchup = log5Matchup(b.paVs[batterSide], pitcher.paVs[pitcherSide], LEAGUE_PA[pitcher.throws])
+  enved   = applyEnv(matchup, park, weather, batterStance)
+  pa_i    = applyTtop(enved, paInGameForPitcher + i)
 
-A quoted line `A` is **positive-EV** iff `impliedProb(A) < q`. The display value uses `roundOdds(americanBreakEven(q))` rounded to nearest 5 (`:13-17`). The raw unrounded value should be used for any actual EV comparison.
-
-Tests at `lib/prob/odds.test.ts` include the `americanBreakEven(0.5) === -100` boundary and round-trip checks for `q ∈ {0.2, 0.35, 0.5, 0.65, 0.8}`.
-
-## End-to-end
-
-The pipeline lives in `workflows/steps/compute-nrsi.ts`:
-
-```
-probs        = batters.map(b => pReach(b, pitcher, env))
-pHitEvent    = pAtLeastTwoReach(probs)
-pNoHitEvent  = 1 - pHitEvent
-breakEven    = roundOdds(americanBreakEven(pNoHitEvent))
+pHit  = calibrate(pAtLeastOneRun(startState, [pa_1, ..., pa_n]))
+pNo   = 1 - pHit
+odds  = roundOdds(americanBreakEven(pNo))
 ```
 
-The step returns `{ pHitEvent, pNoHitEvent, breakEvenAmerican, perBatter: [{id, name, bats, pReach}] }` which the watcher publishes verbatim into `GameState`.
+Result shape (`NrsiResult`):
 
-## Calibration notes
+```ts
+{
+  pHitEvent: number,            // P(≥1 run) — name kept for UI back-compat
+  pNoHitEvent: number,          // P(NRSI)
+  breakEvenAmerican: number,
+  startState: { outs, bases },
+  perBatter: Array<{
+    id, name, bats,
+    pReach: number,             // OBP-equivalent for UI: 1 - k - ipOut
+    pa: PaOutcomes,             // full multinomial after Log5+env+ttop
+  }>,
+}
+```
 
-The model is deliberately rough and not validated against historical results. Specific weak points:
+The watcher publishes this verbatim into `GameState`, which the SSE stream pushes to clients.
 
-- **Pseudo-OBP from WHIP.** The `WHIP / 3.5` heuristic is an estimator of a different quantity (baserunners per inning vs. on-base rate per PA). It correlates strongly but isn't equivalent. A proper conversion would model PA → OBP from a regression on historical pitcher seasons.
-- **Independence assumption.** The DP treats each batter's reach event as independent given the pitcher. In reality, pitchers fatigue, get pulled, and face platoon advantages within the same inning. The DP doesn't model substitutions mid-inning.
-- **Park × weather double-count.** Statcast park factors include average weather, so multiplying both is slight over-correction. Bias is small but non-zero.
-- **Switch hitter "max" generosity.** Documented above. Will push P(NRSI) lower (more pessimistic for the bettor) than the standard convention.
-- **No bullpen modeling.** Once a pitcher change happens (high-leverage situation, mid-inning swap), the watcher recomputes with the new pitcher's splits, but doesn't anticipate the swap. A real model would weight in expected reliever WHIP for late innings.
-- **Splits sample size.** Early-season splits can be N=10 or fewer. The fallback to prior season helps but doesn't fully address regression-to-the-mean. A Bayesian shrinkage toward league average would be more honest.
+## Verification
 
-## How to validate against reality
+- **Unit tests** in `lib/prob/{log5,markov,ttop}.test.ts` and `lib/env/{park,weather}.test.ts`.
+- **Tango league-mean run-frequency anchor**: 9 league-average batters from `(0 outs, empty)` → `P(≥1 run) ∈ [0.22, 0.32]` (Tango's published value 2010–2015 is 0.268; Albert 2022 confirms 0.266).
+- **Monte Carlo cross-check**: 50k inning simulations using the same per-PA distribution agree with the closed-form chain to within 1pp.
+- **Renormalization invariants**: Log5, applyEnv, applyTtop all preserve sum-to-1 across every outcome shape.
+- **Switch-hitter routing**: LHB/RHB/Switch all route through the correct platoon splits (tested in `log5.test.ts`).
+- **Per-transition rules**: K, BB, HR, Triple, IPout transitions tested individually for correct base-state and run output across the 8 base configurations.
 
-Not implemented, but the shape:
+## Calibration caveats (open work)
 
-1. Backfill historical `nrsi:snapshot` states from completed games (publish phase only, no UI).
-2. For each Live half-inning where we logged `(pHitEvent, breakEvenAmerican)`, look up the actual outcome via `statsapi.mlb.com/api/v1.1/game/{pk}/feed/live` historical data: did 2+ reach base in that half?
-3. Compute calibration: bin predictions into deciles, compare predicted vs. actual frequency. Plot. If well-calibrated, the line is `y = x`.
-4. Compute log-loss against actual outcomes vs. a baseline (e.g. constant 60% NRSI rate, the empirical league average).
+- **League-rate constants** are approximate. Refresh annually from FanGraphs vs LHP / vs RHP leaderboards.
+- **Advance probabilities** are Tango defaults — not team-specific. Future work: pull team baserunning rate (BsR) and scale.
+- **GIDP / SF probabilities** within `ipOut` are league-mean approximations. Could be situational.
+- **Bullpen modeling absent.** When a reliever enters, the watcher recomputes with the new pitcher's profile and resets `paInGameForPitcher`, but the model does not anticipate the swap.
+- **Park-factor scrape returns combined indices** (not per-handedness) for now. The L/R split in `ParkComponentFactors` is a placeholder — same factor applied to both sides until the per-handedness scrape lands.
+- **Date-range splits** (last-30) depend on `byDateRangeSplits` honoring `sitCodes`. If the API doesn't, the loader silently falls back to season-only. Verify in production logs.
+- **Calibration shim is identity** — fit it from production `(predicted, actual)` pairs once ~1k inning outcomes have accumulated.
 
-A win is: outperforming the constant baseline by ≥ 5% on log-loss across ≥ 5,000 inning observations. That would justify the complexity over a sportsbook's posted line.
+## Legacy v1 model (deprecated)
+
+The earlier `pReach` (single-blend OBP) + `pAtLeastTwoReach` (2-state DP) + flat `weatherRunFactor` model is retained in the codebase for back-compat (`lib/prob/reach-prob.ts`, `lib/prob/inning-dp.ts`) but no longer used by the watcher. Cleanup pass after v2 is the default for two weeks with no rollback. The v1 weaknesses that motivated the rewrite are documented in `/Users/kevin/.claude/plans/how-is-run-probability-nifty-pony.md`.

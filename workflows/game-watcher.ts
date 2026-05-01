@@ -10,6 +10,30 @@ import { getUpcomingForCurrentInning, lineupHash } from "@/lib/mlb/lineup";
 import { isDecisionMoment, type GameState } from "@/lib/state/game-state";
 import { classifyStatus } from "@/lib/mlb/types";
 import type { LiveFeed } from "@/lib/mlb/types";
+import type { Bases, GameState as MarkovState } from "@/lib/prob/markov";
+
+// Read live (outs, bases) from the MLB feed. Bases use the canonical 3-bit
+// encoding shared with the Markov chain (bit0=1st, bit1=2nd, bit2=3rd).
+function readMarkovStartState(feed: LiveFeed): MarkovState {
+  const ls = feed.liveData.linescore;
+  const o = ls.outs ?? 0;
+  const outs = (o >= 3 ? 0 : o) as 0 | 1 | 2; // mid-change-of-innings: outs may briefly hit 3
+  const off = ls.offense ?? {};
+  const b1 = off.first?.id ? 1 : 0;
+  const b2 = off.second?.id ? 2 : 0;
+  const b3 = off.third?.id ? 4 : 0;
+  return { outs, bases: ((b1 | b2 | b3) as Bases) };
+}
+
+// Read this pitcher's cumulative batters-faced from the boxscore for TTOP.
+function readPaInGameForPitcher(feed: LiveFeed, pitcherId: number): number {
+  const teams = feed.liveData.boxscore?.teams;
+  if (!teams) return 0;
+  const key = `ID${pitcherId}`;
+  const fromHome = teams.home.players?.[key]?.stats?.pitching?.battersFaced;
+  const fromAway = teams.away.players?.[key]?.stats?.pitching?.battersFaced;
+  return fromHome ?? fromAway ?? 0;
+}
 
 export type WatcherInput = {
   gamePk: number;
@@ -92,7 +116,7 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
     );
 
     if (shouldRecompute && upcoming) {
-      const [splits, parkFactor, weather] = await Promise.all([
+      const [splits, park, weather] = await Promise.all([
         loadLineupSplitsStep({
           gamePk: input.gamePk,
           pitcherId: upcoming.pitcherId!,
@@ -109,15 +133,19 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
           homeTeam: input.homeTeamName,
         }),
       ]);
+      const startState = readMarkovStartState(tick.feed);
+      const paInGameForPitcher = readPaInGameForPitcher(tick.feed, upcoming.pitcherId!);
       lastNrsi = await computeNrsiStep({
         gamePk: input.gamePk,
         pitcher: splits.pitcher,
         batters: splits.batters,
-        parkRunFactor: parkFactor,
-        weatherRunFactor: weather.factor,
+        park: park.components,
+        weather: weather.components,
+        startState,
+        paInGameForPitcher,
       });
       lastEnv = {
-        parkRunFactor: parkFactor,
+        parkRunFactor: park.runFactor,
         weatherRunFactor: weather.factor,
         weather: weather.info as unknown as Record<string, unknown>,
       };
