@@ -98,6 +98,7 @@ export function GameCard({ game }: { game: GameState }) {
           inning={game.inning}
           half={game.half}
           outs={game.outs}
+          bases={game.bases}
           detailed={game.detailedState}
         />
       </header>

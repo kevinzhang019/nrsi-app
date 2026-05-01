@@ -369,3 +369,19 @@ Pipeline:
 4. **Pre-game cards:** `seedSnapshotStep` populates `venue.id` from the schedule so the outline appears in the Upcoming section before any watcher starts. Park run-factor renders as `—` until the watcher's first publish.
 
 Refresh path: `npm run build:park-shapes` whenever a team relocates or a new park opens. Output is committed; deterministic re-runs produce byte-identical JSON.
+
+## Bases diamond
+
+`<BasesDiamond>` (`components/bases-diamond.tsx`) is the live base-occupancy glyph in the header right column of `<GameCard>`, sitting **below** the inning indicator + outs dots. Three squares rotated 45° in a diamond formation: 2B at top, 1B at right, 3B at left, home plate implied below the bottom edge (not drawn). Filled square = runner on base (`var(--color-accent)` fill + stroke); empty square = 1.25px hairline stroke against `var(--color-border)`, fill transparent. Both states share a 240ms `fill/stroke` transition so the diamond animates smoothly when a runner reaches or scores. Same hairline weight + accent palette as `<ParkOutline>` so the card has one unified CAD-blueprint visual language.
+
+**Data source:** `GameState.bases` is a 3-bit bitmask — `bit0=1B, bit1=2B, bit2=3B` — populated by `readDisplayBases(feed, status)` in `workflows/game-watcher.ts` straight from `liveData.linescore.offense.{first,second,third}`. **NOT** the same as `readMarkovStartState`'s output: that function force-zeros bases when the half is over (so the next-half Markov compute doesn't see phantom stranded runners), but for display we want the actual current bases even when outs flicker to 3 mid-tick before the half flips. Two separate readers, two different invariants — don't unify them.
+
+**Null semantics:** `bases === null` when `status !== "Live"` (Pre / Final / Delayed / Suspended) and `<BasesDiamond>` returns `null` in that case so layout collapses cleanly. Pre-game stubs from `seedSnapshotStep` set `bases: null`. Don't fall back to `0` (empty diamond) — the absence of the glyph IS the signal that the game isn't live, matching how the outs dots only render in the Live branch of `<InningState>`.
+
+**SVG layout:** `viewBox="0 0 28 22"` with squares centered at `(14, 7)`, `(23, 13)`, `(5, 13)` and a half-diagonal of `4.6` (~6.5px sides at 45°). The viewBox has ~3px top-padding above the 2B square's rotated extent — earlier versions used `viewBox="0 0 28 18"` and clipped the top corner of 2B. Don't shrink the viewBox vertical extent without also moving the squares down. `overflow-visible` on the SVG is a belt-and-suspenders for sub-pixel rounding.
+
+**Don't change without thinking:**
+- `readDisplayBases` vs `readMarkovStartState` — they diverge intentionally at half-boundaries. Folding them would either show empty bases mid-tick at end-of-half (display bug) or pollute the next-half Markov compute (probability bug).
+- `bases: null` for non-Live states — keeps the diamond from rendering a misleading "empty" state for finished/scheduled games.
+- The viewBox top-padding (`y=7` for 2B, viewBox height 22) — reverting to a tighter viewBox clips the 2B square.
+- Square fill class swaps `fill-[var(--color-accent)]` ↔ `fill-transparent` (NOT `fill-none` or removing the prop). Without `fill-transparent`, hovering or focus events on parent elements can surface the SVG default fill = black.

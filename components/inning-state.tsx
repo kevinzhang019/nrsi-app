@@ -1,18 +1,21 @@
 "use client";
 
 import type { GameStatus } from "@/lib/mlb/types";
+import { BasesDiamond } from "@/components/bases-diamond";
 
 export function InningState({
   status,
   inning,
   half,
   outs,
+  bases,
   detailed,
 }: {
   status: GameStatus;
   inning: number | null;
   half: "Top" | "Bottom" | null;
   outs: number | null;
+  bases: number | null;
   detailed?: string;
 }) {
   if (status === "Pre") {
@@ -53,6 +56,9 @@ export function InningState({
             }`}
           />
         ))}
+      </div>
+      <div className="mt-1.5 flex justify-end">
+        <BasesDiamond bases={bases} />
       </div>
     </div>
   );

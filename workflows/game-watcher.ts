@@ -38,6 +38,20 @@ function readPitcherPitchCount(feed: LiveFeed, pitcherId: number): number | null
 // already flips `upcoming` to the next half-inning, so the Markov startState
 // must agree (no phantom stranded runners from `ls.offense` polluting the
 // next-half compute).
+// Read the live base occupancy as a 3-bit bitmask straight from the feed
+// (bit0=1B, bit1=2B, bit2=3B). Unlike `readMarkovStartState`, this is for the
+// header diamond display — we want the actual current bases even when outs
+// have flickered to 3 mid-tick before the half flips. Returns null when the
+// game isn't live so the UI hides the diamond.
+function readDisplayBases(feed: LiveFeed, status: string): number | null {
+  if (status !== "Live") return null;
+  const off = feed.liveData.linescore.offense ?? {};
+  const b1 = off.first?.id ? 1 : 0;
+  const b2 = off.second?.id ? 2 : 0;
+  const b3 = off.third?.id ? 4 : 0;
+  return b1 | b2 | b3;
+}
+
 function readMarkovStartState(feed: LiveFeed): MarkovState {
   const ls = feed.liveData.linescore;
   const o = ls.outs ?? 0;
@@ -517,6 +531,7 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
       inning,
       half,
       outs,
+      bases: readDisplayBases(tick.feed, status),
       isDecisionMoment: decision,
       away: {
         id: tick.feed.gameData.teams.away.id,

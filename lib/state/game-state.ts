@@ -27,6 +27,12 @@ export type GameState = {
   inning: number | null;
   half: "Top" | "Bottom" | null;
   outs: number | null;
+  // Live base occupancy as a 3-bit bitmask: bit0=1B, bit1=2B, bit2=3B.
+  // Sourced from `liveData.linescore.offense` raw — NOT the half-over-zeroed
+  // Markov startState, since the display shows the actual current bases even
+  // mid-tick when outs flicker to 3 before the half flips. Null when status is
+  // not Live (Pre / Final / Delayed) so the diamond doesn't render at all.
+  bases: number | null;
   isDecisionMoment: boolean;
   away: { id: number; name: string; runs: number };
   home: { id: number; name: string; runs: number };
