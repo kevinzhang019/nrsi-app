@@ -51,7 +51,7 @@ Full write-ups in `docs/BUGS.md`. Each line: bug # · symptom · primary file.
 - **`start()` cannot be called from inside a workflow.** Wrap it in a step. See `workflows/scheduler.ts:startWatcherStep`.
 - **Single-instance lock pattern:** every watcher acquires `nrxi:lock:{gamePk}` with a 90s TTL via `acquireWatcherLockStep`. The watcher refreshes it every loop iteration via `refreshWatcherLockStep`. If a second watcher spawns for the same game, it sees the lock and exits with `{ reason: "lock-held" }` — no double-polling.
 - **No `console.log` from inside the workflow function.** It works in steps, but the workflow function itself can't access Node APIs (sandbox). Most logging happens in steps via `lib/log.ts`.
-- **Adaptive sleep:** Live games sleep `metaData.wait` (~7-10s); Pre/Final sleep 30s; Delayed/Suspended sleep 5min.
+- **Adaptive sleep:** Live games sleep `metaData.wait`, capped per-context by `chooseRecommendedWaitSeconds` (`workflows/steps/fetch-live-diff.ts`) — **5s** during active PAs (Live + `inningState ∉ {Middle, End}` + `outs < 3`) so outs surface within ~5s, **15s** otherwise (inning breaks, pitching changes, replay reviews — MLB's high `wait` reflects reality there). Pre/Final sleep 30s; Delayed/Suspended sleep 5min.
 
 ## Caching keys
 

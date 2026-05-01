@@ -74,7 +74,7 @@ The durable per-game poller. Receives `{ gamePk, ownerId, awayTeamName, homeTeam
    - If recompute: parallel fetch `loadLineupSplitsStep`, `loadParkFactorStep`, `loadWeatherStep`. Then `computeNrXiStep`. Persist results into hoisted `lastNrXi`, `lastEnv`, `lastPitcher*` (workflow scope, not loop scope — see CLAUDE.md bug #5).
    - Build `GameState` from current feed + last computed nrXi. `publishUpdateStep` writes to `nrxi:snapshot` hash.
    - If `status === "Final"`, return `{ reason: "final" }`.
-   - Refresh lock TTL, then `sleep(waitSec)` adaptive: Live→`metaData.wait` (~7-10s), Pre→30s, Delayed/Suspended→300s.
+   - Refresh lock TTL, then `sleep(waitSec)` adaptive via `chooseRecommendedWaitSeconds`: Live + active PA → 5s cap (so outs surface within ~5s); Live + inning break / pitching change / 3-out flicker → 15s cap; Pre→30s; Delayed/Suspended→300s. Floor 5s; honor MLB `metaData.wait` only when smaller.
 
 #### `workflows/steps/*`
 Each step is a `"use step"` function — full Node.js access, automatic retry on throw, durable result caching.
