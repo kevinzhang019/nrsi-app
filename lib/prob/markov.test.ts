@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { pAtLeastOneRun, transitionsForOutcome, type Bases, type GameState } from "./markov";
+import { applyFraming } from "./framing";
+import { applyDefense } from "./defense";
 import type { PaOutcomes } from "../mlb/splits";
 import { LEAGUE_PA } from "../mlb/splits";
 
@@ -125,6 +127,30 @@ describe("pAtLeastOneRun — Monte Carlo cross-check", () => {
     const exact = pAtLeastOneRun({ outs: 0, bases: 0 }, lineup);
     const sim = simulateInning(lineup, 50_000);
     expect(Math.abs(exact - sim)).toBeLessThan(0.01);
+  });
+});
+
+// v2.1 — verify league-mean anchor still holds when applyFraming + applyDefense
+// are in the pipeline with neutral inputs. Guards against any regression that
+// would bias the league-average behavior.
+describe("v2.1 pipeline neutrality", () => {
+  it("neutral framing + neutral defense preserves Tango anchor", () => {
+    const pa: PaOutcomes = { ...LEAGUE_PA.R };
+    const framed = applyFraming(pa, { k: 1, bb: 1 });
+    const defended = applyDefense(framed, 1);
+    const lineup = Array(9).fill(defended);
+    const p = pAtLeastOneRun({ outs: 0, bases: 0 }, lineup);
+    expect(p).toBeGreaterThan(0.22);
+    expect(p).toBeLessThan(0.32);
+  });
+
+  it("top framer + elite defense pulls P(>=1 run) below the neutral baseline", () => {
+    const pa: PaOutcomes = { ...LEAGUE_PA.R };
+    const baseline = pAtLeastOneRun({ outs: 0, bases: 0 }, Array(9).fill(pa));
+    const framed = applyFraming(pa, { k: 1.04, bb: 0.96 });
+    const defended = applyDefense(framed, 0.93);
+    const adjusted = pAtLeastOneRun({ outs: 0, bases: 0 }, Array(9).fill(defended));
+    expect(adjusted).toBeLessThan(baseline);
   });
 });
 

@@ -176,6 +176,9 @@ All keys come from `lib/cache/keys.ts`. Source of truth — don't hardcode key s
 - **Empirical-Bayes shrinkage** prior strength `n0 = 200` PA. Don't change without a calibration study.
 - **TTOP factors** (`lib/prob/ttop.ts`) come from Tango / Lichtman / Carleton published values. Don't tune without backtest data.
 - **Calibration shim is identity in v1.** Fit isotonic regression from production `(predicted, actual)` pairs once ≥1k inning outcomes accumulate, then load via `loadCalibrator(table)`.
+- **v2.1: catcher framing + fielder OAA** (`lib/env/{framing,defense}.ts`, `lib/prob/{framing,defense}.ts`). Framing acts on K and BB cells, OAA on the in-play block. EB shrinkage priors: `n0 = 2000` called pitches for framing, `n0 = 200` opportunities for OAA. Factor clamps: framing `[0.95, 1.05]`, defense `[0.90, 1.10]`. Both default to identity when scrape fails or live alignment is missing — pipeline degrades gracefully to v2.
+- **Robo-ump kill switch:** `NRSI_DISABLE_FRAMING=1` zeroes the framing effect. Flip when MLB's ABS challenge system goes full-season; framing's value collapses overnight.
+- **Live defensive alignment** read from `liveData.linescore.defense.{catcher, first, second, third, shortstop, left, center, right}` ids each tick. The watcher's `defenseAlignmentKey` is part of the recompute trigger so defensive subs auto-invalidate the cache.
 
 ## Validator hook quirks (advisory only)
 

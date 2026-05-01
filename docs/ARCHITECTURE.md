@@ -87,7 +87,8 @@ Each step is a `"use step"` function — full Node.js access, automatic retry on
 | `load-lineup-splits.ts` | Resolve pitcher + 9 batters with cached PA-multinomial profiles | yes |
 | `load-park-factor.ts` | Baseball Savant scrape: runs index + per-component factors | yes (degrades to 1.0) |
 | `load-weather.ts` | covers.com scrape: WeatherInfo + per-component factors | yes (degrades to 1.0) |
-| `compute-nrsi.ts` | Log5 + applyEnv + applyTtop + Markov chain | n/a |
+| `load-defense.ts` | Statcast scrapes: OAA + framing tables (parallel, 24h cache) | yes (degrades to neutral) |
+| `compute-nrsi.ts` | Log5 + applyEnv + applyTtop + applyFraming + applyDefense + Markov chain | n/a |
 | `publish-update.ts` | Write `GameState` to Redis snapshot + publish | yes |
 | `lock.ts` | `acquire`/`refresh` watcher lock via Redis SETNX | yes |
 
@@ -119,6 +120,8 @@ POST handlers for manual operational triggers — useful for restarting a watche
 - `park.ts` — Baseball Savant scraper. `getParkRunFactor` returns the legacy single runs index. `getParkComponentFactors` returns per-outcome handedness-keyed factors `{hr, triple, double, single, k, bb}`, derived from `index_runs` when component fields aren't published in the scrape. `parseSavantHtml` is the testable seam.
 - `park-orientation.ts` — outfield bearing (degrees from home plate to dead center) for each park, used to classify `windFromDeg` → `out`/`in`/`cross`. Lookup by team name.
 - `weather.ts` — covers.com HTML scraper. `parseCoversHtml(html, awayTeam, homeTeam)` is the testable seam (matches game brick by team city/abbr label, extracts temp/wind/precip/humidity/pressure via regex, classifies wind via the icon's `wind_icons/{compass}.png` filename + park orientation). Returns `WeatherInfo`. Two consumers: `weatherRunFactor` (legacy single scalar, deprecated) and `weatherComponentFactors` (per-outcome multipliers — HR-heavy, K/BB unaffected).
+- `defense.ts` — Statcast OAA leaderboard scraper (`parseOaaHtml`). `loadOaaTable(season)` returns `Map<playerId, OaaRow>` (cached 24h). `defenseFactor(fielderIds, table)` sums shrunken OAA across the seven non-battery fielders to produce a multiplier in `[0.90, 1.10]` for the in-play block.
+- `framing.ts` — Statcast catcher framing leaderboard scraper (`parseFramingHtml`). `loadFramingTable(season)` returns `Map<catcherId, FramingRow>` (cached 24h). `framingFactors(catcherId, table)` returns `{k, bb}` factors clamped to `[0.95, 1.05]`. `NRSI_DISABLE_FRAMING=1` is the robo-ump kill switch.
 - `venues.ts` — venue metadata cache, used for ops display only.
 - `__fixtures__/` — captured HTML from Savant + covers.com, used by parse tests so we don't hit the live sites in CI.
 
@@ -127,6 +130,8 @@ Pure, fully unit-tested math.
 - `log5.ts` — Generalized multinomial Log5 (`log5Matchup`), switch-hitter routing (`effectiveBatterStance`, `batterSideVs`), full matchup builder (`matchupPa`), and post-matchup environment scaling (`applyEnv`).
 - `markov.ts` — 24-state base-out Markov chain. `transitionsForOutcome(outcome, state)` for the 8 PA outcomes; `pAtLeastOneRun(start, lineup)` runs the chain forward through the upcoming order.
 - `ttop.ts` — Times-Through-the-Order Penalty: K weakens, BB and HR strengthen each pass through the lineup. `ttoIndex(paInGameForPitcher)`, `applyTtop(pa, paInGameForPitcher)`.
+- `framing.ts` — `applyFraming(pa, {k, bb})` reweights the K and BB cells of the multinomial using the live catcher's framing factors.
+- `defense.ts` — `applyDefense(pa, factor)` reweights the in-play block (1B/2B/3B/ipOut) using the seven non-battery fielders' aggregated OAA.
 - `calibration.ts` — Identity calibrator + isotonic interpolation table loader. Ships as no-op until production `(predicted, actual)` pairs accumulate.
 - `odds.ts` — `americanBreakEven`, `impliedProb`, `roundOdds`.
 - **Legacy v1** — `reach-prob.ts:pReach`, `inning-dp.ts:pAtLeastTwoReach`. Retained for back-compat; not used by the watcher.

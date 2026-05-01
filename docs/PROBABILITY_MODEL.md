@@ -28,6 +28,16 @@ The model that drives `P(NRSI)` and the break-even American odds shown on every 
    │  applyTtop: weaken K, strengthen BB/HR   │
    │  per times-through-the-order bucket      │
    └──────────────────────────────────────────┘
+        ▼ live catcherId (Statcast framing)
+   ┌──────────────────────────────────────────┐
+   │  applyFraming: K up, BB down (or vice    │
+   │  versa). Renormalize.                    │
+   └──────────────────────────────────────────┘
+        ▼ live fielderIds (Statcast OAA, sum of 7)
+   ┌──────────────────────────────────────────┐
+   │  applyDefense: reweight in-play block —  │
+   │  better defense → more ipOut, fewer hits │
+   └──────────────────────────────────────────┘
         ▼ live (outs, bases) from MLB feed
    ┌──────────────────────────────────────────┐
    │  Stage 2: 24-state base-out Markov chain │
@@ -146,6 +156,41 @@ Tango (*The Book*, Ch 9) and Carleton (*Baseball Prospectus*) document a progres
 
 This is negligible for first-inning probabilities but materially shifts late-game numbers when the starter is still in.
 
+## Stage 1.6 — Catcher framing (`lib/env/framing.ts`, `lib/prob/framing.ts`)
+
+Catcher framing is the skill of receiving borderline pitches in a way that makes umpires more likely to call them strikes. Top framers add ~+15 to +25 called strikes per season vs an average receiver; the worst lose ~−15 to −20.
+
+**Source**: per-catcher framing leaderboard at `https://baseballsavant.mlb.com/leaderboard/catcher_framing` (cached 24h, scraped from the embedded JSON).
+
+**Empirical-Bayes shrinkage** to league mean (≈ 0 strikes added) with prior strength `n0 = 2000` called pitches: `shrunk_strikes_per_pitch = strikesAdded / (calledPitches + n0)`. A catcher with 9000 called pitches sees ~80% of their observed rate; a backup with 200 sees ~10%.
+
+**Multiplier construction**: `k = 1 + strikesPerPitch × 10`, `bb = 1 − strikesPerPitch × 8`, both clamped to `[0.95, 1.05]`. A top framer pushes K up ~3% and BB down ~3%; a bottom framer the reverse. Calibrated so the spread between best and worst matches the published K-rate / BB-rate impact (~±1.5pp K, ~±1pp BB).
+
+**Apply step** (`applyFraming` in `lib/prob/framing.ts`): multiplies the K and BB cells of the multinomial, then renormalizes. Mass that flows out of K and BB redistributes proportionally across the other six cells (mostly into `ipOut`). 1B/2B/3B/HR/HBP unchanged at the multiplier level.
+
+**Robo-ump kill switch**: `NRSI_DISABLE_FRAMING=1` returns identity factors. Wire it in once MLB's ABS challenge system goes full-season — framing's value collapses overnight.
+
+## Stage 1.7 — Fielder defense / OAA (`lib/env/defense.ts`, `lib/prob/defense.ts`)
+
+Outs Above Average (OAA) measures how many outs a fielder makes vs an average fielder facing the same plays. Top team-aggregate: ~+50; bottom: ~−40. Translates to roughly ±2pp BABIP — small per PA, compounding across the inning's worth of contact.
+
+**Source**: per-player OAA leaderboard at `https://baseballsavant.mlb.com/leaderboard/outs_above_average` (cached 24h).
+
+**Live alignment**: the watcher reads the seven non-battery fielders from `liveData.linescore.defense.{first, second, third, shortstop, left, center, right}` ids on every tick and adds a `defenseAlignmentKey` to the recompute trigger. Defensive subs late in the game (defensive replacements, position swaps) are picked up automatically — no need to reason about lineups.
+
+**Empirical-Bayes shrinkage** toward the position mean (≈ 0 OAA) with prior strength `n0 = 200` opportunities: `shrunkOaa = (n × oaa) / (n + n0)`. Stabilizes backups with low samples without dropping signal from regular starters.
+
+**Factor construction**: `factor = 1 − Σ shrunkOaa / 1200`, clamped to `[0.90, 1.10]`. The scale is calibrated so a `±60` team-aggregate OAA maps to a `±5%` swing on the in-play hit rate.
+
+**Apply step** (`applyDefense` in `lib/prob/defense.ts`): reweights only the in-play block.
+- `inPlayHits = 1B + 2B + 3B`
+- `newHits = inPlayHits × factor`
+- `newIpOut = ipOut + (inPlayHits − newHits)` — mass moves between hits and outs
+- 1B/2B/3B reapportioned in proportion to their original ratios (doubles don't disappear when the factor shrinks)
+- K, BB, HBP, HR untouched (battery outcomes; defense doesn't affect them)
+
+**Catcher excluded from OAA**: catcher defense is captured by framing (acts on K/BB) and pop time / blocking (Tier 3, not modeled). Including catcher OAA would risk double-counting with framing.
+
 ## Stage 2 — 24-state base-out Markov chain (`lib/prob/markov.ts`)
 
 ### State space
@@ -236,7 +281,9 @@ Round-trips through `impliedProb(american)`. A quoted line `A` is **positive-EV*
 for each upcoming batter b at index i:
   matchup = log5Matchup(b.paVs[batterSide], pitcher.paVs[pitcherSide], LEAGUE_PA[pitcher.throws])
   enved   = applyEnv(matchup, park, weather, batterStance)
-  pa_i    = applyTtop(enved, paInGameForPitcher + i)
+  ttoAdj  = applyTtop(enved, paInGameForPitcher + i)
+  framed  = applyFraming(ttoAdj, framingFactors(catcherId, framingTable))
+  pa_i    = applyDefense(framed, defenseFactor(fielderIds, oaaTable))
 
 pHit  = calibrate(pAtLeastOneRun(startState, [pa_1, ..., pa_n]))
 pNo   = 1 - pHit
@@ -266,7 +313,8 @@ The watcher publishes this verbatim into `GameState`, which the SSE stream pushe
 - **Unit tests** in `lib/prob/{log5,markov,ttop}.test.ts` and `lib/env/{park,weather}.test.ts`.
 - **Tango league-mean run-frequency anchor**: 9 league-average batters from `(0 outs, empty)` → `P(≥1 run) ∈ [0.22, 0.32]` (Tango's published value 2010–2015 is 0.268; Albert 2022 confirms 0.266).
 - **Monte Carlo cross-check**: 50k inning simulations using the same per-PA distribution agree with the closed-form chain to within 1pp.
-- **Renormalization invariants**: Log5, applyEnv, applyTtop all preserve sum-to-1 across every outcome shape.
+- **Renormalization invariants**: Log5, applyEnv, applyTtop, applyFraming, applyDefense all preserve sum-to-1 across every outcome shape.
+- **v2.1 pipeline neutrality**: applying `applyFraming({k:1, bb:1})` and `applyDefense(_, 1)` to the league-mean multinomial leaves the Tango anchor unchanged. Tested in `markov.test.ts`.
 - **Switch-hitter routing**: LHB/RHB/Switch all route through the correct platoon splits (tested in `log5.test.ts`).
 - **Per-transition rules**: K, BB, HR, Triple, IPout transitions tested individually for correct base-state and run output across the 8 base configurations.
 
