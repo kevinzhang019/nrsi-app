@@ -7,12 +7,73 @@ type Weather = {
   tempF?: number | null;
   windMph?: number | null;
   windDir?: string | null;
+  windCardinal?: string | null;
   precipPct?: number | null;
   humidityPct?: number | null;
   pressureInHg?: number | null;
   isDome?: boolean;
   source?: string;
 };
+
+const COMPASS_TO_DEG: Record<string, number> = {
+  n: 0, nne: 22.5, ne: 45, ene: 67.5,
+  e: 90, ese: 112.5, se: 135, sse: 157.5,
+  s: 180, ssw: 202.5, sw: 225, wsw: 247.5,
+  w: 270, wnw: 292.5, nw: 315, nnw: 337.5,
+};
+
+function formatWindMph(mph: number): string {
+  // Match covers.com: keep one decimal if present, drop trailing .0
+  const rounded = Math.round(mph * 10) / 10;
+  return Number.isInteger(rounded) ? rounded.toString() : rounded.toFixed(1);
+}
+
+function WindStat({ mph, cardinal }: { mph: number | null | undefined; cardinal: string | null | undefined }) {
+  const hasSpeed = mph != null && Number.isFinite(mph);
+  const isCalm = cardinal === "calm" || mph === 0;
+  const fromDeg = cardinal && cardinal in COMPASS_TO_DEG ? COMPASS_TO_DEG[cardinal] : null;
+  // Arrow points the direction wind is going (FROM + 180°). Asset points up (north) by default.
+  const rotateDeg = fromDeg != null ? (fromDeg + 180) % 360 : null;
+
+  return (
+    <div className="flex flex-col">
+      <span className="text-[9px] uppercase tracking-[0.18em] text-[var(--color-muted)]/70">Wind</span>
+      {hasSpeed ? (
+        <span className="flex items-center gap-1.5 font-mono tabular-nums text-[12px] text-[var(--color-fg)]">
+          {isCalm ? (
+            <span aria-hidden className="inline-block h-3 w-3 rounded-full border border-[var(--color-muted)]/60" />
+          ) : rotateDeg != null ? (
+            <svg
+              aria-hidden
+              viewBox="0 0 12 12"
+              className="h-3 w-3 shrink-0 text-[var(--color-fg)]"
+              style={{ transform: `rotate(${rotateDeg}deg)` }}
+            >
+              <path
+                d="M6 1 L6 11 M6 1 L3 4 M6 1 L9 4"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          ) : (
+            <span aria-hidden className="inline-block h-3 w-3" />
+          )}
+          <span>{formatWindMph(mph)} mph</span>
+          {!isCalm && cardinal && cardinal in COMPASS_TO_DEG && (
+            <span className="text-[10px] uppercase tracking-wider text-[var(--color-muted)]/80">
+              {cardinal}
+            </span>
+          )}
+        </span>
+      ) : (
+        <span className="font-mono tabular-nums text-[12px] text-[var(--color-muted)]/50">—</span>
+      )}
+    </div>
+  );
+}
 
 function FactorBadge({ label, value }: { label: string; value: number | null }) {
   if (value === null || !Number.isFinite(value)) {
@@ -74,9 +135,6 @@ export function ParkSection({
 }) {
   const w = weather ?? {};
   const dome = w.isDome === true;
-  const wind = w.windMph != null
-    ? `${w.windDir && w.windDir !== "calm" ? w.windDir.toUpperCase() : ""} ${w.windMph}`.trim()
-    : null;
 
   return (
     <div className="rounded border border-[var(--color-border)] bg-[var(--color-subtle)]/40">
@@ -105,7 +163,7 @@ export function ParkSection({
           </div>
           <div className="grid grid-cols-2 gap-x-3 gap-y-2">
             <Stat label="Temp" value={w.tempF != null ? `${Math.round(w.tempF)} °F` : null} />
-            <Stat label="Wind" value={wind ? `${wind} mph` : null} />
+            <WindStat mph={w.windMph} cardinal={w.windCardinal} />
             <Stat
               label="Hum"
               value={w.humidityPct != null ? `${Math.round(w.humidityPct)}%` : null}

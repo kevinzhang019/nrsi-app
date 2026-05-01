@@ -13,6 +13,12 @@ export type WeatherInfo = {
   tempF: number | null;
   windMph: number | null;
   windDir: "out" | "in" | "cross" | "calm" | null;
+  /**
+   * Compass direction the wind is coming FROM (meteorological convention),
+   * lowercase code like "n", "nne", "ne", ..., or "calm". Used by the UI to
+   * render a directional arrow; the model uses outfield-relative `windDir`.
+   */
+  windCardinal: string | null;
   precipPct: number | null;
   humidityPct: number | null;
   pressureInHg: number | null;
@@ -24,6 +30,7 @@ const DEFAULT: WeatherInfo = {
   tempF: null,
   windMph: null,
   windDir: null,
+  windCardinal: null,
   precipPct: null,
   humidityPct: null,
   pressureInHg: null,
@@ -106,17 +113,26 @@ function parseBrick(
   const iconSrc = brick.find(".covers-coversweather-windDirectionIcon").attr("src") || "";
   const iconCode = iconSrc.match(/wind_icons\/([a-z]+)\.png/i)?.[1]?.toLowerCase() ?? null;
   const windFromDeg = iconCode && iconCode in COMPASS_TO_DEG ? COMPASS_TO_DEG[iconCode] : null;
-  const windMph = windM ? Math.round(parseFloat(windM[1])) : null;
+  const windMph = windM ? parseFloat(windM[1]) : null;
 
   let windDir: WeatherInfo["windDir"] = null;
-  if (isDome) windDir = null;
-  else if (windMph === 0 || iconCode === "calm") windDir = "calm";
-  else windDir = classifyWind(windFromDeg, outfieldDeg);
+  let windCardinal: string | null = null;
+  if (isDome) {
+    windDir = null;
+    windCardinal = null;
+  } else if (windMph === 0 || iconCode === "calm") {
+    windDir = "calm";
+    windCardinal = "calm";
+  } else {
+    windDir = classifyWind(windFromDeg, outfieldDeg);
+    windCardinal = iconCode && iconCode in COMPASS_TO_DEG ? iconCode : null;
+  }
 
   return {
     tempF: tempM ? Math.round(parseFloat(tempM[1])) : null,
     windMph,
     windDir,
+    windCardinal,
     precipPct: precipM ? Math.round(parseFloat(precipM[1])) : null,
     humidityPct: humM ? Math.round(parseFloat(humM[1])) : null,
     pressureInHg: presM ? parseFloat(presM[1]) : null,

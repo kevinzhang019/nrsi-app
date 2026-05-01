@@ -18,6 +18,7 @@ const base: WeatherInfo = {
   tempF: null,
   windMph: null,
   windDir: null,
+  windCardinal: null,
   precipPct: null,
   humidityPct: null,
   pressureInHg: null,
