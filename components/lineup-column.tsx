@@ -38,6 +38,7 @@ export function LineupColumn({
 }) {
   const headerAlign = align === "right" ? "text-right" : "text-left";
   const isCurrentColumn = highlightKind === "current";
+  const isNextColumn = highlightKind === "next";
 
   const renderStats = (id: number) => {
     const s = statsById?.get(id);
@@ -72,12 +73,15 @@ export function LineupColumn({
           <ol className="min-w-max divide-y divide-[var(--color-border)]/40">
             {lineup.map((slot) => {
               const starterIsCurrent = isCurrentColumn && slot.starter.id === highlightId;
+              const starterIsNext = isNextColumn && slot.starter.id === highlightId;
+              const starterHighlighted = starterIsCurrent || starterIsNext;
               return (
                 <li key={slot.spot} className="px-1.5">
                   <div
                     className={cn(
-                      "flex items-center gap-2 whitespace-nowrap py-1",
-                      starterIsCurrent && "rounded bg-[var(--color-accent-soft)]/60",
+                      "flex items-center gap-2 whitespace-nowrap rounded border border-transparent py-1",
+                      starterIsCurrent && "bg-[var(--color-accent-soft)]/60",
+                      starterIsNext && "border-[var(--color-accent)]",
                     )}
                   >
                     <span className="w-4 font-mono text-[10px] uppercase tabular-nums text-[var(--color-muted)]">
@@ -86,7 +90,7 @@ export function LineupColumn({
                     <span
                       className={cn(
                         "text-[12px]",
-                        starterIsCurrent
+                        starterHighlighted
                           ? "text-[var(--color-fg)] font-medium"
                           : "text-[var(--color-fg)]/90",
                       )}
@@ -98,12 +102,15 @@ export function LineupColumn({
                   </div>
                   {slot.subs.map((sub) => {
                     const subIsCurrent = isCurrentColumn && sub.id === highlightId;
+                    const subIsNext = isNextColumn && sub.id === highlightId;
+                    const subHighlighted = subIsCurrent || subIsNext;
                     return (
                       <div
                         key={sub.id}
                         className={cn(
-                          "flex items-center gap-2 whitespace-nowrap py-0.5 pl-4",
-                          subIsCurrent && "rounded bg-[var(--color-accent-soft)]/60",
+                          "flex items-center gap-2 whitespace-nowrap rounded border border-transparent py-0.5 pl-4",
+                          subIsCurrent && "bg-[var(--color-accent-soft)]/60",
+                          subIsNext && "border-[var(--color-accent)]",
                         )}
                       >
                         <span className="w-4 font-mono text-[10px] uppercase tabular-nums text-[var(--color-muted)]/70">
@@ -112,7 +119,7 @@ export function LineupColumn({
                         <span
                           className={cn(
                             "text-[11px]",
-                            subIsCurrent
+                            subHighlighted
                               ? "text-[var(--color-fg)]"
                               : "text-[var(--color-muted)]",
                           )}
