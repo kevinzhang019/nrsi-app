@@ -1,9 +1,13 @@
 import { pAtLeastOneRun, type Bases, type GameState } from "@/lib/prob/markov";
 import { matchupPa, applyEnv } from "@/lib/prob/log5";
 import { applyTtop } from "@/lib/prob/ttop";
+import { applyDefense } from "@/lib/prob/defense";
+import { applyFraming } from "@/lib/prob/framing";
 import { LEAGUE_PA, type BatterPaProfile, type PaOutcomes, type PitcherPaProfile } from "@/lib/mlb/splits";
 import type { ParkComponentFactors } from "@/lib/env/park";
 import type { WeatherComponentFactors } from "@/lib/env/weather";
+import { defenseFactor, type OaaTable } from "@/lib/env/defense";
+import { framingFactors, type FramingTable } from "@/lib/env/framing";
 import { effectiveBatterStance } from "@/lib/prob/log5";
 import { calibrate } from "@/lib/prob/calibration";
 import { americanBreakEven, roundOdds } from "@/lib/prob/odds";
@@ -16,7 +20,7 @@ export type NrsiPerBatter = {
   bats: HandCode;
   /** OBP-equivalent for display continuity with v1: 1 - k - ipOut. */
   pReach: number;
-  /** Per-PA outcome distribution after Log5 + env + TTOP. Optional in result for size. */
+  /** Per-PA outcome distribution after Log5 + env + TTOP + framing + defense. */
   pa: PaOutcomes;
 };
 
@@ -36,9 +40,26 @@ export async function computeNrsiStep(opts: {
   weather: WeatherComponentFactors;
   startState: GameState;
   paInGameForPitcher: number;
+  // v2.1 — optional. When tables/ids are missing the step degrades to v2 behavior.
+  oaaTable?: OaaTable;
+  framingTable?: FramingTable;
+  catcherId?: number | null;
+  fielderIds?: number[]; // 7 non-battery fielders
 }): Promise<NrsiResult> {
   "use step";
-  const { gamePk, pitcher, batters, park, weather, startState, paInGameForPitcher } = opts;
+  const {
+    gamePk,
+    pitcher,
+    batters,
+    park,
+    weather,
+    startState,
+    paInGameForPitcher,
+    oaaTable,
+    framingTable,
+    catcherId,
+    fielderIds,
+  } = opts;
 
   log.info("step", "computeNrsi:start", {
     gamePk,
@@ -47,7 +68,16 @@ export async function computeNrsiStep(opts: {
     startOuts: startState.outs,
     startBases: startState.bases,
     ttoStart: paInGameForPitcher,
+    catcherId: catcherId ?? null,
+    nFielders: fielderIds?.length ?? 0,
   });
+
+  // Pre-compute the two v2.1 factors once per inning recompute (constant across batters).
+  const framingF = framingTable ? framingFactors(catcherId ?? null, framingTable) : { k: 1, bb: 1 };
+  const defenseF =
+    oaaTable && fielderIds && fielderIds.length > 0
+      ? defenseFactor(fielderIds, oaaTable)
+      : 1.0;
 
   const perBatter: NrsiPerBatter[] = [];
   const lineup: PaOutcomes[] = [];
@@ -58,13 +88,15 @@ export async function computeNrsiStep(opts: {
     const matchup = matchupPa(b, pitcher, LEAGUE_PA);
     const enved = applyEnv(matchup, park, weather, stance);
     const ttoAdjusted = applyTtop(enved, paInGameForPitcher + i);
-    lineup.push(ttoAdjusted);
+    const framed = applyFraming(ttoAdjusted, framingF);
+    const defended = applyDefense(framed, defenseF);
+    lineup.push(defended);
     perBatter.push({
       id: b.id,
       name: b.fullName,
       bats: b.bats,
-      pReach: 1 - ttoAdjusted.k - ttoAdjusted.ipOut,
-      pa: ttoAdjusted,
+      pReach: 1 - defended.k - defended.ipOut,
+      pa: defended,
     });
   }
 
@@ -88,6 +120,9 @@ export async function computeNrsiStep(opts: {
     startOuts: startState.outs,
     startBases: startState.bases,
     ttoStart: paInGameForPitcher,
+    framingK: framingF.k,
+    framingBB: framingF.bb,
+    defenseFactor: defenseF,
   });
 
   return result;

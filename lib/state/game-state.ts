@@ -1,4 +1,5 @@
 import type { GameStatus } from "../mlb/types";
+import type { TeamLineup, Linescore } from "../mlb/extract";
 
 export type PerBatter = {
   id: number;
@@ -24,6 +25,11 @@ export type GameState = {
   pNoHitEvent: number | null;
   breakEvenAmerican: number | null;
   env: { parkRunFactor: number; weatherRunFactor: number; weather?: Record<string, unknown> } | null;
+  lineups: { away: TeamLineup | null; home: TeamLineup | null } | null;
+  linescore: Linescore | null;
+  battingTeam: "home" | "away" | null;
+  currentBatterId: number | null;
+  nextHalfLeadoffId: number | null;
   updatedAt: string;
   startTime?: string;
 };

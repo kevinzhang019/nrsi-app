@@ -156,6 +156,8 @@ All keys come from `lib/cache/keys.ts`. Source of truth — don't hardcode key s
 | `pit:splitsraw:{playerId}:{season}` | `lib/mlb/splits.ts` | raw `SplitsResponse` JSON | 12h |
 | `hand:{playerId}` | `lib/mlb/splits.ts:loadHand` | `{ id, fullName, bats, throws }` | 30d |
 | `park:factors:{season}` | `lib/env/park.ts` | `ParkRow[]` from Baseball Savant | 24h |
+| `oaa:{season}` | `lib/env/defense.ts` | `OaaTable` (per-fielder Outs Above Average) | 24h |
+| `framing:{season}` | `lib/env/framing.ts` | `FramingTable` (per-catcher framing runs) | 24h |
 | `venue:{venueId}` | `lib/env/venues.ts` | `VenueInfo` | 30d |
 | `weather:{gamePk}` | `lib/env/weather.ts` | `WeatherInfo` from covers.com | 30 min |
 | `nrsi:lock:{gamePk}` | `workflows/steps/lock.ts` | watcher `ownerId` | 90s |

@@ -4,9 +4,11 @@ import { fetchLiveDiffStep } from "./steps/fetch-live-diff";
 import { loadLineupSplitsStep } from "./steps/load-lineup-splits";
 import { loadParkFactorStep } from "./steps/load-park-factor";
 import { loadWeatherStep } from "./steps/load-weather";
+import { loadDefenseStep } from "./steps/load-defense";
 import { computeNrsiStep } from "./steps/compute-nrsi";
 import { publishUpdateStep } from "./steps/publish-update";
 import { getUpcomingForCurrentInning, lineupHash } from "@/lib/mlb/lineup";
+import { extractLineups, extractLinescore, extractBatterFocus } from "@/lib/mlb/extract";
 import { isDecisionMoment, type GameState } from "@/lib/state/game-state";
 import { classifyStatus } from "@/lib/mlb/types";
 import type { LiveFeed } from "@/lib/mlb/types";
@@ -33,6 +35,28 @@ function readPaInGameForPitcher(feed: LiveFeed, pitcherId: number): number {
   const fromHome = teams.home.players?.[key]?.stats?.pitching?.battersFaced;
   const fromAway = teams.away.players?.[key]?.stats?.pitching?.battersFaced;
   return fromHome ?? fromAway ?? 0;
+}
+
+// Read the live defensive alignment for v2.1 (catcher framing + fielder OAA).
+// Returns null catcher / empty fielders if the feed hasn't populated yet —
+// computeNrsiStep degrades gracefully to v2 behavior in that case.
+function readDefenseAlignment(feed: LiveFeed): {
+  catcherId: number | null;
+  fielderIds: number[];
+} {
+  const d = feed.liveData.linescore.defense;
+  if (!d) return { catcherId: null, fielderIds: [] };
+  const catcherId = d.catcher?.id ?? null;
+  const fielderIds: number[] = [];
+  for (const k of ["first", "second", "third", "shortstop", "left", "center", "right"] as const) {
+    const id = d[k]?.id;
+    if (id) fielderIds.push(id);
+  }
+  return { catcherId, fielderIds };
+}
+
+function defenseAlignmentKey(catcherId: number | null, fielderIds: number[]): string {
+  return `${catcherId ?? "_"}-${fielderIds.join(",")}`;
 }
 
 export type WatcherInput = {
@@ -63,6 +87,7 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
   let prevDoc: LiveFeed | null = null;
   let lastInningKey = "";
   let lastLineupHash = "";
+  let lastDefenseKey = "";
   let lastNrsi: Awaited<ReturnType<typeof computeNrsiStep>> | null = null;
   let lastEnv: { parkRunFactor: number; weatherRunFactor: number; weather?: Record<string, unknown> } | null = null;
   let lastPitcherId: number | null = null;
@@ -94,13 +119,15 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
       tick.feed.liveData.boxscore?.teams.home.battingOrder,
       tick.feed.liveData.boxscore?.teams.away.battingOrder,
     );
+    const alignment = readDefenseAlignment(tick.feed);
+    const dk = defenseAlignmentKey(alignment.catcherId, alignment.fielderIds);
     const upcoming = getUpcomingForCurrentInning(tick.feed);
 
     const shouldRecompute =
       status === "Live" &&
       upcoming !== null &&
       upcoming.pitcherId !== null &&
-      (inningKey !== lastInningKey || lh !== lastLineupHash);
+      (inningKey !== lastInningKey || lh !== lastLineupHash || dk !== lastDefenseKey);
 
     console.log(
       "[watcher] tick",
@@ -116,7 +143,7 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
     );
 
     if (shouldRecompute && upcoming) {
-      const [splits, park, weather] = await Promise.all([
+      const [splits, park, weather, defense] = await Promise.all([
         loadLineupSplitsStep({
           gamePk: input.gamePk,
           pitcherId: upcoming.pitcherId!,
@@ -132,6 +159,7 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
           awayTeam: input.awayTeamName,
           homeTeam: input.homeTeamName,
         }),
+        loadDefenseStep({ gamePk: input.gamePk, season: SEASON }),
       ]);
       const startState = readMarkovStartState(tick.feed);
       const paInGameForPitcher = readPaInGameForPitcher(tick.feed, upcoming.pitcherId!);
@@ -143,6 +171,10 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
         weather: weather.components,
         startState,
         paInGameForPitcher,
+        oaaTable: defense.oaaTable,
+        framingTable: defense.framingTable,
+        catcherId: alignment.catcherId,
+        fielderIds: alignment.fielderIds,
       });
       lastEnv = {
         parkRunFactor: park.runFactor,
@@ -154,6 +186,7 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
       lastPitcherThrows = splits.pitcher.throws;
       lastInningKey = inningKey;
       lastLineupHash = lh;
+      lastDefenseKey = dk;
     }
 
     const nrsi = lastNrsi;
@@ -191,6 +224,9 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
       pNoHitEvent: nrsi?.pNoHitEvent ?? null,
       breakEvenAmerican: nrsi?.breakEvenAmerican ?? null,
       env,
+      lineups: extractLineups(tick.feed),
+      linescore: extractLinescore(tick.feed),
+      ...extractBatterFocus(tick.feed),
       updatedAt: new Date().toISOString(),
     };
 

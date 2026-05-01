@@ -78,6 +78,18 @@ export const SplitsResponse = z.object({
     .default([]),
 });
 
+export type BoxscorePlayer = {
+  person?: { id: number; fullName?: string };
+  position?: { abbreviation?: string; code?: string };
+  // String like "100" (starter at slot 1), "101" (first sub at slot 1),
+  // "102" (second sub at slot 1), "200" (starter at slot 2), etc.
+  // Players who never batted may have it omitted.
+  battingOrder?: string;
+  battingOrderSlot?: number;
+  batSide?: { code?: HandCode };
+  stats?: { pitching?: { battersFaced?: number } };
+};
+
 export type LiveFeed = {
   metaData: { timeStamp: string; wait?: number };
   gameData: {
@@ -103,20 +115,39 @@ export type LiveFeed = {
         second?: { id: number };
         third?: { id: number };
       };
-      defense?: { pitcher?: { id: number } };
-      teams?: { home: { runs: number }; away: { runs: number } };
+      defense?: {
+        pitcher?: { id: number };
+        catcher?: { id: number };
+        first?: { id: number };
+        second?: { id: number };
+        third?: { id: number };
+        shortstop?: { id: number };
+        left?: { id: number };
+        center?: { id: number };
+        right?: { id: number };
+      };
+      teams?: {
+        home: { runs?: number; hits?: number; errors?: number; leftOnBase?: number };
+        away: { runs?: number; hits?: number; errors?: number; leftOnBase?: number };
+      };
+      innings?: Array<{
+        num?: number;
+        ordinalNum?: string;
+        home?: { runs?: number; hits?: number; errors?: number };
+        away?: { runs?: number; hits?: number; errors?: number };
+      }>;
     };
     boxscore?: {
       teams: {
         away: {
           battingOrder?: number[];
           pitchers?: number[];
-          players?: Record<string, { stats?: { pitching?: { battersFaced?: number } } }>;
+          players?: Record<string, BoxscorePlayer>;
         };
         home: {
           battingOrder?: number[];
           pitchers?: number[];
-          players?: Record<string, { stats?: { pitching?: { battersFaced?: number } } }>;
+          players?: Record<string, BoxscorePlayer>;
         };
       };
     };

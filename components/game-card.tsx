@@ -1,10 +1,13 @@
 "use client";
 
+import { useMemo } from "react";
 import type { GameState } from "@/lib/state/game-state";
 import { cn } from "@/lib/utils";
 import { ProbabilityPill } from "@/components/probability-pill";
 import { InningState } from "@/components/inning-state";
-import { ParkOutline } from "@/components/park-outline";
+import { LineScore } from "@/components/line-score";
+import { LineupColumn } from "@/components/lineup-column";
+import { ParkSection } from "@/components/park-section";
 
 function teamShort(name: string): string {
   const parts = name.split(" ");
@@ -14,46 +17,43 @@ function teamShort(name: string): string {
   return last;
 }
 
-function envChip(label: string, value: number | null) {
-  if (value === null || !Number.isFinite(value)) return null;
-  const arrow = value > 1.02 ? "↑" : value < 0.98 ? "↓" : "→";
-  const tone =
-    value > 1.02 ? "text-[var(--color-good)]" : value < 0.98 ? "text-[var(--color-bad)]" : "text-[var(--color-muted)]";
-  return (
-    <span className={cn("text-[10px] uppercase tracking-wider", tone)}>
-      {label} {value.toFixed(2)} {arrow}
-    </span>
-  );
-}
-
-function ParkFactor({ value }: { value: number | null }) {
-  if (value === null || !Number.isFinite(value)) {
-    return (
-      <span className="text-[10px] uppercase tracking-wider text-[var(--color-muted)]">—</span>
-    );
-  }
-  const arrow = value > 1.02 ? "↑" : value < 0.98 ? "↓" : "→";
-  const tone =
-    value > 1.02
-      ? "text-[var(--color-good)]"
-      : value < 0.98
-      ? "text-[var(--color-bad)]"
-      : "text-[var(--color-muted)]";
-  return (
-    <span className={cn("font-mono tabular-nums text-[10px] uppercase tracking-wider", tone)}>
-      {value.toFixed(2)} {arrow}
-    </span>
-  );
-}
-
 export function GameCard({ game }: { game: GameState }) {
   const decision = game.isDecisionMoment;
+
+  // Map upcoming-batter pReach values onto their player ids so the lineup
+  // rows can show probabilities inline for batters in the upcoming sequence.
+  const pReachById = useMemo(() => {
+    const m = new Map<number, number>();
+    for (const b of game.upcomingBatters) m.set(b.id, b.pReach);
+    return m;
+  }, [game.upcomingBatters]);
+
+  // Per the user spec: highlight current batter for the team currently batting,
+  // and next-half leadoff for the team coming up. The watcher resolved which
+  // team is which via extractBatterFocus.
+  const awayHighlightId =
+    game.battingTeam === "away"
+      ? game.currentBatterId
+      : game.battingTeam === "home"
+      ? game.nextHalfLeadoffId
+      : null;
+  const homeHighlightId =
+    game.battingTeam === "home"
+      ? game.currentBatterId
+      : game.battingTeam === "away"
+      ? game.nextHalfLeadoffId
+      : null;
+
+  const awayMarker: "current" | "next" | null =
+    game.battingTeam === "away" ? "current" : game.battingTeam === "home" ? "next" : null;
+  const homeMarker: "current" | "next" | null =
+    game.battingTeam === "home" ? "current" : game.battingTeam === "away" ? "next" : null;
 
   return (
     <article
       data-fresh={decision ? "true" : "false"}
       className={cn(
-        "group relative overflow-hidden rounded-md border bg-[var(--color-card)] transition",
+        "group relative overflow-hidden rounded-lg border bg-[var(--color-card)] transition",
         "border-[var(--color-border)]",
         decision && "ring-2 ring-[var(--color-accent)]/60 border-[var(--color-accent)]/40",
       )}
@@ -82,46 +82,61 @@ export function GameCard({ game }: { game: GameState }) {
         />
       </header>
 
+      {game.linescore && (
+        <section className="border-b border-[var(--color-border)] bg-[var(--color-subtle)]/30 px-4 py-2.5">
+          <LineScore
+            linescore={game.linescore}
+            awayName={game.away.name}
+            homeName={game.home.name}
+            currentInning={game.inning}
+            half={game.half}
+          />
+        </section>
+      )}
+
       <section className="space-y-3 px-4 py-4">
         {game.pitcher && (
-          <div className="text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
-            Next half ·{" "}
-            <span className="text-[var(--color-fg)]">
-              vs {game.pitcher.throws}HP
-            </span>
-          </div>
-        )}
-
-        {game.upcomingBatters.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
-            {game.upcomingBatters.slice(0, 6).map((b) => (
-              <span
-                key={b.id}
-                className="inline-flex items-center gap-1.5 rounded border border-[var(--color-border)] bg-[var(--color-subtle)] px-2 py-0.5 text-[11px]"
-                title={`${b.name} (${b.bats}HB)`}
-              >
-                <span className="font-mono tabular-nums text-[var(--color-fg)]">
-                  {(b.pReach * 100).toFixed(0)}%
-                </span>
-                <span className="text-[var(--color-muted)]">{lastName(b.name)}</span>
+          <div className="flex items-center justify-between text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
+            <span>
+              On the bump ·{" "}
+              <span className="text-[var(--color-fg)]">
+                {game.pitcher.name} <span className="text-[var(--color-muted)]">({game.pitcher.throws}HP)</span>
               </span>
-            ))}
+            </span>
+            {game.battingTeam && (
+              <span className="text-[10px]">
+                <span className="text-[var(--color-accent)]">●</span> at bat ·{" "}
+                <span className="text-[var(--color-good)]">●</span> next ½
+              </span>
+            )}
           </div>
         )}
 
-        {(game.venue?.id || game.env || game.pNoHitEvent !== null) && (
-          <div className="flex items-center gap-3 pt-1">
-            <span className="inline-flex items-center gap-1.5">
-              <ParkOutline
-                venueId={game.venue?.id ?? null}
-                highlighted={game.isDecisionMoment}
-                size={28}
-              />
-              <ParkFactor value={game.env?.parkRunFactor ?? null} />
-            </span>
-            {envChip("Wx", game.env?.weatherRunFactor ?? null)}
-          </div>
-        )}
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <LineupColumn
+            label={teamShort(game.away.name)}
+            lineup={game.lineups?.away ?? null}
+            highlightId={awayHighlightId}
+            highlightKind={awayMarker}
+            pReachById={pReachById}
+          />
+          <LineupColumn
+            label={teamShort(game.home.name)}
+            lineup={game.lineups?.home ?? null}
+            highlightId={homeHighlightId}
+            highlightKind={homeMarker}
+            pReachById={pReachById}
+          />
+        </div>
+
+        <ParkSection
+          venueId={game.venue?.id ?? null}
+          venueName={game.venue?.name ?? null}
+          highlighted={decision}
+          parkRunFactor={game.env?.parkRunFactor ?? null}
+          weatherRunFactor={game.env?.weatherRunFactor ?? null}
+          weather={(game.env?.weather as Record<string, unknown> | undefined) ?? null}
+        />
       </section>
 
       <footer className="border-t border-[var(--color-border)] bg-[var(--color-subtle)]/40 px-4 py-3">
@@ -132,9 +147,4 @@ export function GameCard({ game }: { game: GameState }) {
       </footer>
     </article>
   );
-}
-
-function lastName(name: string): string {
-  const parts = name.split(" ");
-  return parts[parts.length - 1] || name;
 }

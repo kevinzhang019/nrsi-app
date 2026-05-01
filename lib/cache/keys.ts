@@ -5,6 +5,8 @@ export const k = {
     `pit:split:${id}:${season}:${sit}`,
   hand: (id: number) => `hand:${id}`,
   parkFactors: (season: number) => `park:factors:${season}`,
+  oaa: (season: number) => `oaa:${season}`,
+  framing: (season: number) => `framing:${season}`,
   venue: (id: number) => `venue:${id}`,
   weather: (gamePk: number) => `weather:${gamePk}`,
   schedule: (date: string) => `schedule:${date}`,

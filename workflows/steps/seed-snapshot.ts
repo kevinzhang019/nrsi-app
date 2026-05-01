@@ -28,6 +28,11 @@ export async function seedSnapshotStep(games: ScheduledGame[]): Promise<{ seeded
       pNoHitEvent: null,
       breakEvenAmerican: null,
       env: null,
+      lineups: null,
+      linescore: null,
+      battingTeam: null,
+      currentBatterId: null,
+      nextHalfLeadoffId: null,
       updatedAt: now,
       startTime: g.gameDate,
     };
