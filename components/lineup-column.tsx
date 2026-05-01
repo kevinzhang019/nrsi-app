@@ -21,6 +21,8 @@ function formatBaseballRate(n: number): string {
   return fixed.startsWith("0") ? fixed.slice(1) : fixed;
 }
 
+const mlbPlayerUrl = (id: number) => `https://www.mlb.com/player/${id}`;
+
 export function LineupColumn({
   label,
   lineup,
@@ -95,9 +97,12 @@ export function LineupColumn({
                     <span className="w-4 font-mono text-[10px] uppercase tabular-nums text-[var(--color-muted)]">
                       {slot.starter.bats ?? "—"}
                     </span>
-                    <span
+                    <a
+                      href={mlbPlayerUrl(slot.starter.id)}
+                      target="_blank"
+                      rel="noopener noreferrer"
                       className={cn(
-                        "text-[12px]",
+                        "text-[12px] hover:underline underline-offset-2",
                         starterIsAccent
                           ? "text-[var(--color-accent)] font-medium"
                           : "text-[var(--color-fg)]/90",
@@ -105,7 +110,7 @@ export function LineupColumn({
                       title={slot.starter.name}
                     >
                       {formatBatterDisplayName(slot.starter.name)}
-                    </span>
+                    </a>
                     {renderStats(slot.starter.id)}
                   </div>
                   {slot.subs.map((sub) => {
@@ -123,9 +128,12 @@ export function LineupColumn({
                         <span className="w-4 font-mono text-[10px] uppercase tabular-nums text-[var(--color-muted)]/70">
                           {sub.bats ?? "—"}
                         </span>
-                        <span
+                        <a
+                          href={mlbPlayerUrl(sub.id)}
+                          target="_blank"
+                          rel="noopener noreferrer"
                           className={cn(
-                            "text-[11px]",
+                            "text-[11px] hover:underline underline-offset-2",
                             subIsAccent
                               ? "text-[var(--color-accent)] font-medium"
                               : "text-[var(--color-fg)]/90",
@@ -134,7 +142,7 @@ export function LineupColumn({
                         >
                           <span className="mr-1 text-[var(--color-muted)]/60">↳</span>
                           {formatBatterDisplayName(sub.name)}
-                        </span>
+                        </a>
                         {renderStats(sub.id)}
                       </div>
                     );

@@ -313,6 +313,8 @@ The displayed numbers come from `statsById: Map<id, { pReach, xSlg }>` built in 
 
 Display formatting uses `formatBaseballRate(n)`: 3 decimal places, leading `0` stripped only when present (so xOBP renders `.345` and xSLG renders `.412` or `1.234` if it ever exceeds 1).
 
+**Player-name links.** The batter name (starter and sub `↳` rows) is an `<a target="_blank" rel="noopener noreferrer" href="https://www.mlb.com/player/{id}">` — clicking opens the canonical MLB.com player page in a new tab (mlb.com resolves the bare id to the slugged URL server-side, so we don't need a name slug). The pitcher row at the top of `components/game-card.tsx` is wrapped the same way around `game.pitcher.name`. The accent classes (`text-[var(--color-accent)] font-medium`) and the sub `↳` glyph live INSIDE the anchor so the visible name string is the click target and the at-bat/on-deck focus signal still applies. Hover affordance is `hover:underline underline-offset-2` only — no color change on hover, since the accent color is reserved for the at-bat / next-half-leadoff signal.
+
 ## Park outline (CAD-blueprint glyph)
 
 `<ParkOutline>` (`components/park-outline.tsx`) renders a 28px SVG silhouette of the home park — foul-line wedge + outfield outer wall, single 1.25px hairline stroke, no fill. It sits in the env-chip row of `<GameCard>` where the text label "Park" used to be; the outline literally is the label, with the numeric park run-factor rendered to its right.

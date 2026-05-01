@@ -102,7 +102,14 @@ export function GameCard({ game }: { game: GameState }) {
           <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
             <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
               <span className="text-[13px] text-[var(--color-fg)]">
-                {game.pitcher.name}{" "}
+                <a
+                  href={`https://www.mlb.com/player/${game.pitcher.id}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:underline underline-offset-2"
+                >
+                  {game.pitcher.name}
+                </a>{" "}
                 <span className="text-[11px] text-[var(--color-muted)]">
                   ({game.pitcher.throws}HP)
                 </span>
