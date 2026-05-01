@@ -17,6 +17,7 @@
     "build:park-shapes": "node scripts/build-park-shapes.mjs"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.105.1",
     "@upstash/redis": "^1.37.0",
     "@vercel/config": "^0.2.1",
     "@workflow/ai": "^4.1.2",
@@ -43,6 +44,7 @@
     "eslint": "^9.0.0",
     "eslint-config-next": "^16.2.4",
     "postcss": "^8.4.49",
+    "postgres": "^3.4.9",
     "tailwindcss": "^4.2.4",
     "typescript": "^5.7.2",
     "vitest": "^4.1.5"

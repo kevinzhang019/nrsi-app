@@ -5,8 +5,8 @@
 ## At a glance
 
 - **What:** live MLB no-run-scoring-inning probability dashboard
-- **Stack:** Next.js 16 App Router (Cache Components on) + Vercel Workflow DevKit + Upstash Redis (Vercel Marketplace) + Tailwind v4 + Vitest
-- **Status:** deployed to https://nrsi-app.vercel.app, scheduler workflow runs daily at 13:00 UTC, 72/72 unit tests passing, build green
+- **Stack:** Next.js 16 App Router (Cache Components on) + Vercel Workflow DevKit + Upstash Redis (Vercel Marketplace) + Supabase Postgres (Vercel Marketplace, history archive) + Tailwind v4 + Vitest
+- **Status:** deployed to https://nrsi-app.vercel.app, scheduler workflow runs daily at 13:00 UTC, 138/138 unit tests passing, build green
 
 ## Detailed docs
 
@@ -57,6 +57,16 @@ Full write-ups in `docs/BUGS.md`. Each line: bug # · symptom · primary file.
 
 All Redis keys live in `lib/cache/keys.ts` — full table of shapes/owners/TTLs in `docs/ARCHITECTURE.md#caching-layout`. Don't hardcode key strings elsewhere.
 
+## Persistence (Supabase)
+
+Permanent archive of finished games + per-inning predictions lives in Supabase Postgres (free tier via Vercel Marketplace). Two tables: `games` (one row per Final game, JSONB blobs for linescore/lineups/final_snapshot) and `inning_predictions` (one row per (game_pk, inning, half) capturing the model's prediction at the start of that half-inning, plus actual_runs backfilled from the linescore).
+
+- **Schema:** `supabase/migrations/0001_history.sql` — apply via Supabase dashboard SQL editor or `node --env-file=.env.local scripts/migrate.mjs` (postgres-js, idempotent — every statement is `if not exists`). Service role is the only writer; RLS stays off.
+- **Client:** `lib/db/supabase.ts` follows the `redisRestConfig()` / `redis()` split — `supabaseConfig()` for env-var lookup, `supabaseAdmin()` lazy singleton (service role).
+- **Capture point:** `workflows/capture-inning.ts:buildInningCapture` is a pure helper called from `workflows/game-watcher.ts` after `state` is built and before `publishUpdateStep`. The **load-bearing guard** is `nrXi.startState.outs === 0 && nrXi.startState.bases === 0` — that's true exactly at half-inning boundaries (matches `readMarkovStartState`'s zeroing on `inningState=middle/end` / `outs >= 3`), which means we record the model's pre-pitch prediction for that half. The once-per-`${inning}-${half}` map guard prevents subsequent ticks from overwriting.
+- **Persist point:** `persistFinishedGameStep` runs on the Final exit branch only (`workflows/game-watcher.ts:585`). It no-ops if Supabase env vars aren't set, so the watcher's existing behavior is unaffected on dev boxes without DB credentials.
+- **History UI:** `/history` (date strip + calendar popover, only data-days enabled) and `/history/[pk]` (inning tabs 1–9, frozen-state `<GameCard>` reuse via `<HistoricalGameView>`). Both pages put `connection()` + `await params/searchParams` inside the `<Suspense>` body — never at the page level — to keep Cache Components happy.
+
 ## Default decisions worth preserving
 
 - **v2 model is the default.** Probability pipeline is `Log5 → applyEnv → applyTtop → applyFraming → applyDefense → 24-state Markov → calibrate`. The legacy `pReach` + 2-state DP path in `lib/prob/{reach-prob,inning-dp}.ts` is retained for back-compat but is **not invoked by the watcher**. See `docs/PROBABILITY_MODEL.md`.
@@ -85,6 +95,7 @@ Each line is a load-bearing invariant. Where there's deeper context, the parenth
 
 **Workflow scope (bug #5/#7 trap):**
 - Hoisted `lastNrXi` / `lastEnv` / `lastPitcher*` vars in `workflows/game-watcher.ts:42-46` (BUGS.md bug #5)
+- Hoisted `capturedInnings: Record<string, InningCapture>` in workflow scope and the `outs===0 && bases===0` clean-state guard in `buildInningCapture` — folding either back into loop scope or relaxing the guard turns the per-inning archive into a stream of mid-PA snapshots
 - Hoisted `lastLineups` / `lastEnrichedHash` and the `lh !== lastEnrichedHash` enrichment trigger — independent of `shouldRecompute` so Pre-game lineups hydrate immediately (BUGS.md bug #7)
 - Hoisted `lastFullInning` / `lastLineupStats` / `lastOppPitcherHash` (UI.md → Settings panel)
 - Hoisted `lastAwayPitcher` / `lastHomePitcher` carrying each team's last-used pitcher (UI.md → Pitcher row)

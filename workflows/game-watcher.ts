@@ -9,6 +9,9 @@ import { computeNrXiStep } from "./steps/compute-nrXi";
 import { computeLineupStatsStep } from "./steps/compute-lineup-stats";
 import { publishUpdateStep } from "./steps/publish-update";
 import { enrichLineupHandsStep } from "./steps/enrich-lineup-hands";
+import { persistFinishedGameStep } from "./steps/persist-finished-game";
+import { buildInningCapture } from "./capture-inning";
+import type { InningCapture } from "@/lib/types/history";
 import { getUpcomingForCurrentInning, lineupHash } from "@/lib/mlb/lineup";
 import { extractLineups, extractLinescore, extractBatterFocus } from "@/lib/mlb/extract";
 import { isDecisionMoment, isDecisionMomentFullInning, type GameState, type LineupBatterStat } from "@/lib/state/game-state";
@@ -216,6 +219,13 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
   // either team. Hoisted to workflow scope (bug #5/#7 pattern) so it persists
   // across non-recompute ticks.
   let lastLineupStats: GameState["lineupStats"] = null;
+  // Per-inning prediction snapshots, keyed "${inning}-${half}". Captured
+  // exactly once per half-inning at the FIRST tick where lastNrXi was computed
+  // from a clean Markov start state ({outs:0, bases:0}) — i.e. before the
+  // first pitch of that half. Flushed to Supabase by persistFinishedGameStep
+  // when the game goes Final. Hoisted across sleep() so the map survives the
+  // entire watcher lifetime (bug #5 pattern).
+  let capturedInnings: Record<string, InningCapture> = {};
 
   for (let loop = 0; loop < MAX_LOOPS; loop++) {
     const tick = await fetchLiveDiffStep({
@@ -580,10 +590,32 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
       updatedAt: new Date().toISOString(),
     };
 
+    // Per-inning capture. Records the prediction for (inning, half) on the
+    // FIRST tick where lastNrXi was computed against {outs:0, bases:0} — that
+    // tick lands at the half-inning boundary, before the first pitch.
+    // Subsequent ticks for the same half are skipped by the existence guard.
+    const captureCandidate = buildInningCapture({
+      inning,
+      half,
+      nrXi: lastNrXi,
+      pitcher: state.pitcher,
+      awayPitcher: state.awayPitcher,
+      homePitcher: state.homePitcher,
+      env: state.env,
+      lineupStats: state.lineupStats,
+      defenseKey: dk,
+    });
+    if (captureCandidate && !capturedInnings[captureCandidate.key]) {
+      capturedInnings[captureCandidate.key] = captureCandidate.capture;
+    }
+
     await publishUpdateStep(state);
 
     if (status === "Final") {
-      console.log("[watcher] final, exit", input.gamePk);
+      console.log("[watcher] final, exit", input.gamePk, {
+        innings: Object.keys(capturedInnings).length,
+      });
+      await persistFinishedGameStep({ finalState: state, capturedInnings });
       return { reason: "final" };
     }
 

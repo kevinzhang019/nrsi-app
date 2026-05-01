@@ -1,6 +1,7 @@
 import { Suspense } from "react";
 import { connection } from "next/server";
 import { GameBoard } from "@/components/game-board";
+import { HistoryButton } from "@/components/history-button";
 import { SettingsButton } from "@/components/settings-button";
 import { SettingsProvider } from "@/lib/hooks/use-settings";
 import { getSnapshot } from "@/lib/pubsub/publisher";
@@ -31,7 +32,10 @@ export default function Page() {
               live MLB per-inning scoring probabilities
             </p>
           </div>
-          <SettingsButton />
+          <div className="flex items-center gap-1">
+            <HistoryButton />
+            <SettingsButton />
+          </div>
         </header>
         <Suspense fallback={<BoardSkeleton />}>
           <GameBoardLoader />
