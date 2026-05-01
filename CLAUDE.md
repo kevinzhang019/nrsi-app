@@ -307,6 +307,8 @@ The **bats** field is `HandCode | null` and gets hydrated from `/people/{id}` (c
 
 Each team's `<ol>` is wrapped in `<div className="overflow-x-auto">` with `min-w-max` on the `<ol>` and `whitespace-nowrap` on each row, so the **whole list translates as a unit** when scrolled (not row-by-row). Don't break this by putting overflow on individual rows or by adding `flex-wrap` to the row.
 
+The **xOBP and xSLG stat spans** (both header and data cells) carry `shrink-0` in addition to `w-10`. Without it, flex can compress them when the name column is long — the row scrolls as a unit anyway so there's no reason to ever compress the stat columns. Both header `<span className="w-10 shrink-0 ...">` and data `<span className="w-10 shrink-0 ...">` must keep `shrink-0` or the columns narrow under long names.
+
 The displayed numbers come from `statsById: Map<id, { pReach, xSlg }>` built in `components/game-card.tsx` from `game.upcomingBatters`. Both values are computed server-side in `workflows/steps/compute-nrXi.ts` via `xSlgFromPa` (`lib/prob/expected-stats.ts`) and threaded through `NrXiPerBatter → PerBatter`. `pReach` and `xObp` are the same number — different name, identical value (`1 - k - ipOut`).
 
 Display formatting uses `formatBaseballRate(n)`: 3 decimal places, leading `0` stripped only when present (so xOBP renders `.345` and xSLG renders `.412` or `1.234` if it ever exceeds 1).

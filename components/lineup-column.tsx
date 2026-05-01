@@ -44,10 +44,10 @@ export function LineupColumn({
     const s = statsById?.get(id);
     return (
       <>
-        <span className="ml-auto w-10 text-right font-mono tabular-nums text-[10px] text-[var(--color-fg)]/85">
+        <span className="ml-auto w-10 shrink-0 text-right font-mono tabular-nums text-[10px] text-[var(--color-fg)]/85">
           {s ? formatBaseballRate(s.pReach) : "—"}
         </span>
-        <span className="w-10 text-right font-mono tabular-nums text-[10px] text-[var(--color-fg)]/85">
+        <span className="w-10 shrink-0 text-right font-mono tabular-nums text-[10px] text-[var(--color-fg)]/85">
           {s ? formatBaseballRate(s.xSlg) : "—"}
         </span>
       </>
@@ -76,8 +76,8 @@ export function LineupColumn({
           <div className="flex items-center gap-2 whitespace-nowrap border-b border-[var(--color-border)]/40 px-1.5 py-1 text-[10px] tracking-[0.18em] text-[var(--color-muted)]">
             <span className="w-4" aria-hidden />
             <span className="mr-auto">Batter</span>
-            <span className="w-10 text-right">xOBP</span>
-            <span className="w-10 text-right">xSLG</span>
+            <span className="w-10 shrink-0 text-right">xOBP</span>
+            <span className="w-10 shrink-0 text-right">xSLG</span>
           </div>
           <ol className="divide-y divide-[var(--color-border)]/40">
             {lineup.map((slot) => {
@@ -128,7 +128,7 @@ export function LineupColumn({
                             "text-[11px]",
                             subIsAccent
                               ? "text-[var(--color-accent)] font-medium"
-                              : "text-[var(--color-muted)]",
+                              : "text-[var(--color-fg)]/90",
                           )}
                           title={sub.name}
                         >
