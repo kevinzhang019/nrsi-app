@@ -5,6 +5,9 @@ import { AnimatePresence, motion } from "motion/react";
 import { useGameStream } from "@/lib/hooks/use-game-stream";
 import { GameCard } from "@/components/game-card";
 import type { GameState } from "@/lib/state/game-state";
+import { decisionMomentFor } from "@/lib/state/decision-moment";
+import { useSettings } from "@/lib/hooks/use-settings";
+import type { PredictMode } from "@/lib/hooks/use-settings";
 
 const STATUS_ORDER: Record<string, number> = {
   Live: 0,
@@ -15,13 +18,17 @@ const STATUS_ORDER: Record<string, number> = {
   Other: 5,
 };
 
-function sortGames(a: GameState, b: GameState): number {
-  if (a.isDecisionMoment !== b.isDecisionMoment) return a.isDecisionMoment ? -1 : 1;
-  const oa = STATUS_ORDER[a.status] ?? 5;
-  const ob = STATUS_ORDER[b.status] ?? 5;
-  if (oa !== ob) return oa - ob;
-  if (a.status === "Live" && b.status === "Live") return (b.inning ?? 0) - (a.inning ?? 0);
-  return 0;
+function makeSortGames(mode: PredictMode) {
+  return function sortGames(a: GameState, b: GameState): number {
+    const da = decisionMomentFor(a, mode);
+    const db = decisionMomentFor(b, mode);
+    if (da !== db) return da ? -1 : 1;
+    const oa = STATUS_ORDER[a.status] ?? 5;
+    const ob = STATUS_ORDER[b.status] ?? 5;
+    if (oa !== ob) return oa - ob;
+    if (a.status === "Live" && b.status === "Live") return (b.inning ?? 0) - (a.inning ?? 0);
+    return 0;
+  };
 }
 
 function sortByStartTime(a: GameState, b: GameState): number {
@@ -32,14 +39,17 @@ type Section = { id: string; label: string; games: GameState[] };
 
 export function GameBoard({ initial }: { initial: GameState[] }) {
   const games = useGameStream(initial);
+  const { settings } = useSettings();
+  const mode = settings.predictMode;
 
   const sections = useMemo<Section[]>(() => {
+    const sortGames = makeSortGames(mode);
     const hi: GameState[] = [];
     const ac: GameState[] = [];
     const up: GameState[] = [];
     const fi: GameState[] = [];
     for (const g of games) {
-      if (g.isDecisionMoment) hi.push(g);
+      if (decisionMomentFor(g, mode)) hi.push(g);
       else if (g.status === "Live" || g.status === "Delayed" || g.status === "Suspended") ac.push(g);
       else if (g.status === "Final") fi.push(g);
       else up.push(g);
@@ -54,7 +64,7 @@ export function GameBoard({ initial }: { initial: GameState[] }) {
       { id: "upcoming", label: "Upcoming", games: up },
       { id: "finished", label: "Finished", games: fi },
     ].filter((s) => s.games.length > 0);
-  }, [games]);
+  }, [games, mode]);
 
   if (sections.length === 0) {
     return (

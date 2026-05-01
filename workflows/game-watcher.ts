@@ -11,7 +11,7 @@ import { publishUpdateStep } from "./steps/publish-update";
 import { enrichLineupHandsStep } from "./steps/enrich-lineup-hands";
 import { getUpcomingForCurrentInning, lineupHash } from "@/lib/mlb/lineup";
 import { extractLineups, extractLinescore, extractBatterFocus } from "@/lib/mlb/extract";
-import { isDecisionMoment, type GameState, type LineupBatterStat } from "@/lib/state/game-state";
+import { isDecisionMoment, isDecisionMomentFullInning, type GameState, type LineupBatterStat } from "@/lib/state/game-state";
 import { classifyStatus } from "@/lib/mlb/types";
 import { americanBreakEven, roundOdds } from "@/lib/prob/odds";
 import type { LiveFeed } from "@/lib/mlb/types";
@@ -523,6 +523,7 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
     const env = lastEnv;
 
     const decision = isDecisionMoment({ status, inning, half, outs, inningState });
+    const decisionFull = isDecisionMomentFullInning({ status, inning, half, outs, inningState });
 
     const state: GameState = {
       gamePk: input.gamePk,
@@ -533,6 +534,7 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
       outs,
       bases: readDisplayBases(tick.feed, status),
       isDecisionMoment: decision,
+      isDecisionMomentFullInning: decisionFull,
       away: {
         id: tick.feed.gameData.teams.away.id,
         name: tick.feed.gameData.teams.away.name,

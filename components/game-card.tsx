@@ -11,6 +11,7 @@ import { LineupSinglePane } from "@/components/lineup-single-pane";
 import { ParkSection } from "@/components/park-section";
 import { PitcherRow } from "@/components/pitcher-row";
 import { useSettings } from "@/lib/hooks/use-settings";
+import { decisionMomentFor } from "@/lib/state/decision-moment";
 
 type Side = "away" | "home";
 
@@ -23,8 +24,8 @@ function teamShort(name: string): string {
 }
 
 export function GameCard({ game }: { game: GameState }) {
-  const decision = game.isDecisionMoment;
   const { settings } = useSettings();
+  const decision = decisionMomentFor(game, settings.predictMode);
 
   // Single-pane lineup selection. Lifted here so the pitcher row above the
   // pane can render the OPPOSING pitcher to the selected lineup. Auto-snaps

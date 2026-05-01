@@ -153,6 +153,25 @@ See **[PROBABILITY_MODEL.md](PROBABILITY_MODEL.md)** for the full math and assum
 - `redis.ts` — singleton Upstash `Redis` instance with lazy init. Reads `KV_REST_API_*` first, falls back to `UPSTASH_REDIS_REST_*`. `cacheJson(key, ttl, loader)` is a small read-through helper.
 - `keys.ts` — every Redis key shape lives here. Don't hardcode key strings elsewhere.
 
+##### Caching layout
+
+All keys come from `lib/cache/keys.ts`. Source of truth — don't hardcode key strings elsewhere.
+
+| Key shape | Owner | Value | TTL |
+|---|---|---|---|
+| `bat:splitsraw:{playerId}:{season}` | `lib/mlb/splits.ts` | raw `SplitsResponse` JSON | 12h |
+| `pit:splitsraw:{playerId}:{season}` | `lib/mlb/splits.ts` | raw `SplitsResponse` JSON | 12h |
+| `hand:{playerId}` | `lib/mlb/splits.ts:loadHand` | `{ id, fullName, bats, throws }` | 30d |
+| `park:factors:{season}` | `lib/env/park.ts` | `ParkRow[]` from Baseball Savant | 24h |
+| `oaa:{season}` | `lib/env/defense.ts` | `OaaTable` (per-fielder Outs Above Average) | 24h |
+| `framing:{season}` | `lib/env/framing.ts` | `FramingTable` (per-catcher framing runs) | 24h |
+| `venue:{venueId}` | `lib/env/venues.ts` | `VenueInfo` | 30d |
+| `weather:{gamePk}` | `lib/env/weather.ts` | `WeatherInfo` from covers.com | 30 min |
+| `nrxi:lock:{gamePk}` | `workflows/steps/lock.ts` | watcher `ownerId` | 90s |
+| `nrxi:runs:{YYYY-MM-DD}` | `workflows/scheduler.ts` | hash `{gamePk: runId}` | 36h |
+| `nrxi:snapshot` | `lib/pubsub/publisher.ts` | hash `{gamePk: GameState JSON}` | 24h |
+| `nrxi:games` (channel) | `lib/pubsub/publisher.ts` | published `GameState` JSON | n/a |
+
 #### `lib/state/game-state.ts`
 The canonical `GameState` type that flows from watcher → Redis → SSE → React. Also exports `isDecisionMoment({status, inning, half, outs, inningState})` used both server-side (when constructing state) and conceptually mirrored in the client-side decision-card highlight rule.
 

@@ -34,6 +34,11 @@ export type GameState = {
   // not Live (Pre / Final / Delayed) so the diamond doesn't render at all.
   bases: number | null;
   isDecisionMoment: boolean;
+  // Full-inning variant: only true at full-inning boundaries (end of Bottom,
+  // start of new inning, between innings). False at Top→Bottom mid-inning
+  // transitions where the half-inning value `isDecisionMoment` does fire.
+  // Both flags ship on every snapshot; client picks one based on predictMode.
+  isDecisionMomentFullInning: boolean;
   away: { id: number; name: string; runs: number };
   home: { id: number; name: string; runs: number };
   venue: { id: number; name: string } | null;
@@ -87,4 +92,23 @@ export function isDecisionMoment(state: {
   if (state.outs >= 3) return true;
   if (state.half === "Top" && state.outs === 0) return true;
   return false;
+}
+
+// Full-inning variant. NOTE: depends on `state.half` being the RAW
+// `ls.isTopInning`-derived value (NOT `upcoming.half`). The watcher publishes
+// raw half (game-watcher.ts ~line 235), so during inningState === "middle"
+// raw half is still "Top" — that's how we distinguish a Top→Bottom mid-inning
+// flip (skip) from a Bottom→Top-of-next inter-inning flip (highlight).
+export function isDecisionMomentFullInning(state: {
+  status: GameStatus;
+  inning: number | null;
+  half: GameState["half"];
+  outs: number | null;
+  inningState?: string;
+}): boolean {
+  if (!isDecisionMoment(state)) return false;
+  const s = (state.inningState || "").toLowerCase();
+  if (s === "middle") return false;
+  if (state.half === "Top" && state.outs !== null && state.outs >= 3) return false;
+  return true;
 }

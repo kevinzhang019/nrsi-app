@@ -57,7 +57,7 @@ export function InningState({
           />
         ))}
       </div>
-      <div className="mt-1.5 flex justify-end">
+      <div className="mt-2.5 flex justify-end">
         <BasesDiamond bases={bases} />
       </div>
     </div>

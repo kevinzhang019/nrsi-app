@@ -13,19 +13,20 @@ export function BasesDiamond({ bases }: { bases: number | null }) {
   const on2 = (bases & 2) !== 0;
   const on3 = (bases & 4) !== 0;
 
-  // 28x18 viewBox so the diamond reads as wider-than-tall (home plate is
-  // implied below the bottom edge — we don't draw it, the InningState dots
-  // sit there). Each base square is rotated 45° around its center.
+  // Baseball-field diamond geometry: 2B at top (14, 7), 1B at right (21, 14),
+  // 3B at left (7, 14). Adjacent bases are ~9.9 units apart so the ~8-unit-wide
+  // rotated squares have ~2 units of clear space between them — half the gap
+  // of the prior 6-unit spacing for a denser, more readable diamond.
   return (
     <svg
-      viewBox="0 0 28 22"
-      className="block h-[18px] w-7 overflow-visible"
+      viewBox="0 0 28 20"
+      className="block h-[20px] w-7 overflow-visible"
       aria-hidden
       focusable="false"
     >
-      <Base x={14} y={7} filled={on2} />
-      <Base x={23} y={13} filled={on1} />
-      <Base x={5} y={13} filled={on3} />
+      <Base x={14} y={8} filled={on2} />
+      <Base x={21} y={15} filled={on1} />
+      <Base x={7} y={15} filled={on3} />
     </svg>
   );
 }

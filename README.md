@@ -75,7 +75,7 @@ lib/
   parks/              Pre-built ballpark SVG path data (shapes.json + team→venueId map)
 workflows/            Vercel Workflow DevKit: scheduler, game-watcher, steps
 scripts/              One-off build scripts (build-park-shapes.mjs)
-docs/                 Architecture + probability model deep dives
+docs/                 Architecture, probability model, historical bugs, UI contracts, runbook
 ```
 
 ## Useful commands
