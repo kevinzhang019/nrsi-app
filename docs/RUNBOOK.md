@@ -1,91 +1,172 @@
 # Operational runbook
 
-Everyday inspection, recovery, and cache-management commands. Most assume `.env.local` is loaded for the Redis token (`set -a; source .env.local; set +a`).
+Everyday inspection, recovery, and cache-management commands. Most local commands assume `.env.local` is loaded for the Redis + Supabase tokens (`bin/*` scripts auto-load it via `services/lib/load-env.ts`; raw `curl` against Upstash needs `set -a; source .env.local; set +a`).
+
+The watcher lives on **Railway**; the frontend on **Vercel**; data in **Upstash Redis** + **Supabase**. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system picture.
 
 ---
 
-## Inspecting workflow runs
+## Inspecting Railway runs
 
-```bash
-# List recent runs
-npx workflow inspect runs --backend vercel --project nrxi-app --team kevinzhang019s-projects | head
+The supervisor service runs at:
+- **Project:** `dee88e6b-6ae3-4e44-a0f8-eb3987216457`
+- **Service:** `f6828c0b-45f9-4c4f-b3b1-edb2421ade20`
+- **Cron:** `0 12 * * *` (declared in `railway.toml`)
 
-# Drill into a specific run
-npx workflow inspect run <runId> --backend vercel --project nrxi-app --team kevinzhang019s-projects --json
-```
+Tail logs from the Railway dashboard → service → Logs. Logs are structured JSON, one line per event. Useful filter terms:
+- `scope:supervisor` — supervisor lifecycle (`start`, `schedule`, `seeded`, `idle-deadline`, `idle-exit`, `aborted`).
+- `scope:watcher` — per-game watcher events (`start`, `tick`, `final`, `lock-held-by-other`, `max-loops`, `max-runtime`).
+- `scope:step` — individual step calls (`fetchSchedule:ok`, `seedSnapshot:ok`, `publishUpdate:ok`, `persistFinishedGame:ok`, etc.).
+- `scope:retry` — `withRetry` exponential-backoff events.
+- `scope:lock` — acquire / refresh / failure events.
+- `scope:prune` — snapshot prune step output.
 
-Open the runs UI in a browser:
-
-```bash
-npx workflow web --backend vercel --project nrxi-app --team kevinzhang019s-projects
-```
+JSON shape: `{t, level, scope, msg, ...payload}`. `gamePk` is in payload for per-game events.
 
 ---
 
 ## Reading current state
 
 ```bash
-# Snapshot via the API (requires Vercel SSO)
-vercel curl /api/snapshot | python3 -m json.tool
+# Field-key dump of nrxi:snapshot (read-only, no writes)
+npx tsx bin/inspect-snapshot.ts
+
+# Snapshot via the public API (requires Vercel SSO if project is restricted)
+curl -s https://nrsi-app.vercel.app/api/snapshot | python3 -m json.tool
 
 # Raw Redis (load env first)
 set -a; source .env.local; set +a
-curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/keys/*"
 curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/hgetall/nrxi:snapshot"
-```
-
----
-
-## Tailing logs
-
-```bash
-vercel logs <deployment-url>
+curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/get/nrxi:lock:<gamePk>"
+curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/get/nrxi:watcher-state:<gamePk>"
 ```
 
 Common log signatures to watch for:
-- `park:scrape:failed` / `weather:scrape:failed` — fixture-driven tests should also be failing in CI; see BUGS.md bug #6.
-- `lock-held` — a second watcher tried to spawn for a `gamePk` that already had one. Expected during deploys.
+- `park:scrape:failed` / `weather:scrape:failed` — fixture-driven tests should also be failing in CI; see [BUGS.md](BUGS.md) bug #6.
+- `lock-held-by-other` — a second watcher tried to spawn for a `gamePk` that already had one. Expected on manual triggers overlapping with cron.
+- `prune:snapshots {deleted: N}` where `N > 0` — supervisor caught a zombie field-key. Healthy on the first cron firing after a deploy; unhealthy if it keeps reporting `deleted > 0` on subsequent firings (see [BUGS.md](BUGS.md) bug #9).
 
 ---
 
-## Recovering from stuck workflows
+## Recovering from a stuck watcher
+
+The lock TTL is **30 seconds**, so most "stuck" watchers self-heal — wait 30s and the next cycle's spawn will acquire the lock cleanly. If you need faster recovery:
 
 ```bash
-# Cancel a stuck run
-npx workflow cancel <runId> --backend vercel --project nrxi-app --team kevinzhang019s-projects
-
-# Clear the watcher lock so a new run can take over
+# Clear the lock so a new watcher can immediately take over
 set -a; source .env.local; set +a
 curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/nrxi:lock:<gamePk>"
+
+# (optional) wipe the watcher's persisted hoisted state — forces a fresh
+# Phase 1 reload on the next watcher start. Loses captured-innings progress
+# for the half-innings already captured this game; only do this if the
+# state itself is corrupt.
+curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/nrxi:watcher-state:<gamePk>"
 ```
 
-The lock has a 90s TTL, so doing nothing also works — but clearing it speeds recovery if a new watcher needs to spawn immediately.
+Then trigger the supervisor manually from the Railway dashboard (Deployments → ⋮ → Run Now), OR run it locally for a single iteration:
+
+```bash
+npx tsx bin/supervisor.ts
+```
 
 ---
 
-## Restarting a watcher manually
+## Running a single watcher locally for debugging
 
 ```bash
-curl -s -X POST -H "Content-Type: application/json" \
-  -d '{"gamePk":NNNN,"awayTeamName":"...","homeTeamName":"..."}' \
-  https://nrsi-app.vercel.app/api/workflows/game-watcher
+# Pick today's date if you don't pass --date
+npx tsx bin/run-watcher-once.ts <gamePk>
+
+# Or against a specific date's schedule (when ET has rolled past midnight)
+npx tsx bin/run-watcher-once.ts <gamePk> --date 2026-05-01
+
+# Or pass team names directly to skip the schedule lookup
+npx tsx bin/run-watcher-once.ts <gamePk> --away "Cleveland Guardians" --home "Athletics"
 ```
+
+Hits production Upstash + Supabase (the same data plane Railway uses). Loops until the game is Final, lock is held by Railway, or you Ctrl-C.
 
 ---
 
-## Re-triggering the daily scheduler
+## Re-triggering the supervisor outside the natural cron window
 
-The Vercel Cron in `vercel.ts` fires this at 13:00 UTC. To force a run outside the cron window:
+From the Railway dashboard: Deployments → ⋮ → Run Now. Or run locally:
 
 ```bash
-vercel curl /api/cron/start-day
+npx tsx bin/supervisor.ts
 ```
+
+The supervisor will fetch today's schedule, seed snapshots, prune zombies, and idle-loop until tomorrow 06:00 UTC (or until you Ctrl-C). On SIGTERM/SIGINT it drains active watchers up to 30s.
+
+---
+
+## Diagnosing snapshot zombies
+
+The supervisor's `pruneStaleSnapshots` step reconciles the `nrxi:snapshot` hash against today's schedule on every cron firing. If you see games on the dashboard that aren't in today's MLB slate, something has bypassed the prune step.
+
+```bash
+# Read-only field-key dump — should match today's schedule exactly
+npx tsx bin/inspect-snapshot.ts
+
+# One-shot prune (emergency cleanup outside a cron firing)
+npx tsx bin/prune-snapshots.ts                  # uses today's schedule (America/New_York)
+npx tsx bin/prune-snapshots.ts --date 2026-05-01
+
+# Nuclear option — wipe the entire hash (frontend goes blank until next seed)
+npx tsx bin/prune-snapshots.ts --all
+
+# Re-seed today's games as fresh "Pre" stubs (after --all, or when the seed
+# never ran for some reason)
+npx tsx bin/seed-once.ts
+```
+
+If the prune step keeps catching zombies firing after firing, something is writing to `nrxi:snapshot` outside the supervised path. Search for `r.hset(k.snapshot()` in the codebase — currently the only writer is `lib/pubsub/publisher.ts:publishGameState`. See [BUGS.md](BUGS.md) bug #9 for the original incident.
+
+---
+
+## Env var checklist
+
+**Required on Railway:**
+- `KV_REST_API_URL` + `KV_REST_API_TOKEN` — Upstash Redis. **Use the read/write token, NOT `KV_REST_API_READ_ONLY_TOKEN`** — the watcher writes constantly (locks, snapshots, watcher-state, pubsub). `lib/cache/redis.ts:6-7` also accepts the `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` aliases.
+- `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` — from the Supabase dashboard (Settings → API). Persistence silently no-ops when these are unset.
+- `TZ=UTC` — keeps `todayInTz` and log timestamps unambiguous.
+
+**Optional:**
+- `MLB_USER_AGENT` — defaults to `nrxi-app/0.1`. Only set for MLB-side request attribution.
+- `NRXI_DISABLE_FRAMING=1` — robo-ump kill switch (zeroes the framing factor).
+- `NRXI_SWITCH_HITTER_RULE=max` — revives v1's `max(L, R)` switch-hitter rule (default is canonical platoon `actual`).
+
+**Required on Vercel** (after unpause): same `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` + `KV_REST_API_*`. Both providers read from the same data plane.
+
+---
+
+## Supabase key rotation
+
+The Supabase project lives on Supabase's infrastructure regardless of how it was provisioned (Vercel Marketplace install vs. direct Supabase signup). The Marketplace is a convenience layer for env-var injection on Vercel — it does NOT mediate the runtime connection.
+
+**If you rotate the service-role key in the Supabase dashboard:** Vercel Marketplace's auto-injection does not propagate to Railway. Manually update `SUPABASE_SERVICE_ROLE_KEY` on Railway from the Supabase dashboard's new value.
+
+**Don't click "Disconnect" in the Vercel Marketplace UI** without first transferring billing ownership to Supabase directly (Supabase dashboard → Settings → Billing → Transfer ownership). Marketplace disconnect can interpret as "tear down the resource" and delete the `games` and `inning_predictions` tables. For free-tier projects, leaving the Marketplace integration dormant is fine — no need to disconnect.
+
+---
+
+## Railway billing watch
+
+Expected steady state: **$0** inside the $5 Hobby credit. Active CPU should sit near zero outside MLB hours and spike only during the supervisor cron + active watcher ticks (5–15s polls per live game).
+
+Check usage in the Railway dashboard → service → Metrics. If you see:
+- **CPU continuously elevated outside MLB hours** — the idle-exit predicate isn't firing. Check supervisor logs for `idle-deadline` and `idle-exit` events; verify `pending` set is draining.
+- **Memory above ~512 MB** — a watcher leak. Profile per-tick allocations in `services/run-watcher.ts`.
+- **Bandwidth charges** — Upstash REST traffic + MLB live-feed fetches should be small (<1 GB/month). Anomalies usually mean a polling-rate regression.
+
+If costs creep above ~$15/mo for three consecutive months, the migration plan calls for a Fly.io move (Phase A–B code is portable; only the deploy config differs).
 
 ---
 
 ## One-time cache flush after scraper deploys
 
-When fixing a park or weather scraper bug (BUGS.md bug #6), the bad `[]` / `DEFAULT` value is cached under the working keys. Flush so the next watcher tick re-fetches fresh data:
+When fixing a park or weather scraper bug ([BUGS.md](BUGS.md) bug #6), the bad `[]` / `DEFAULT` value is cached under the working keys. Flush so the next watcher tick re-fetches fresh data:
 
 ```bash
 set -a; source .env.local; set +a
@@ -99,7 +180,7 @@ curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/keys/wea
   | xargs -I{} curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/{}"
 ```
 
-Most other caches (`hand:*`, `bat:splitsraw:*`, `pit:splitsraw:*`, `oaa:*`, `framing:*`, `venue:*`) are safe to leave — their data shape didn't change in the bug fix. See `docs/ARCHITECTURE.md#caching-layout` for the full key inventory.
+Most other caches (`hand:*`, `bat:splitsraw:*`, `pit:splitsraw:*`, `oaa:*`, `framing:*`, `venue:*`) are safe to leave — their data shape didn't change in the bug fix. See [ARCHITECTURE.md → caching layout](ARCHITECTURE.md#caching-layout) for the full key inventory.
 
 ---
 

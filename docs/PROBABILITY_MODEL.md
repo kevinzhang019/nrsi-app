@@ -298,7 +298,7 @@ Expected SLG for this PA: total bases per AB. The `(1 − bb − hbp)` denominat
 
 Both stats are computed by `computeNrXiStep` and threaded through `NrXiPerBatter → PerBatter → GameState`, then displayed on each batter row in the dashboard lineup column.
 
-## End-to-end (`workflows/steps/compute-nrXi.ts`)
+## End-to-end (`services/steps/compute-nrXi.ts`)
 
 ```ts
 for each upcoming batter b at index i:
