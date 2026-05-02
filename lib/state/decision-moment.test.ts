@@ -44,16 +44,18 @@ describe("isDecisionMoment (half-inning)", () => {
 });
 
 describe("isDecisionMomentFullInning", () => {
-  it("does NOT fire at end of TOP (mid-inning)", () => {
+  // Spec: cards highlight at every 3-out boundary regardless of predict mode.
+  // The full-inning variant now mirrors the half-inning variant exactly.
+  it("fires at end of TOP (outs=3) — same as half-inning", () => {
     expect(
       isDecisionMomentFullInning(live({ half: "Top", outs: 3, inningState: "Top" })),
-    ).toBe(false);
+    ).toBe(true);
   });
 
-  it("does NOT fire when inningState is middle", () => {
+  it("fires when inningState is middle — same as half-inning", () => {
     expect(
       isDecisionMomentFullInning(live({ half: "Top", outs: 3, inningState: "Middle" })),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("fires at end of BOTTOM (outs=3)", () => {

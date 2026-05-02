@@ -19,11 +19,12 @@ export type CaptureArgs = {
 // instantiating the workflow runtime.
 //
 // Records only when:
-//   - inning is in [1, 9]
+//   - inning >= 1 (regulation 1-9 + extras 10+)
 //   - half is set
-//   - nrXi was computed against a clean state (0 outs, 0 bases) — this is
-//     true exactly at half-inning boundaries because readMarkovStartState in
-//     the watcher zeroes outs/bases on inningState=middle/end / outs>=3.
+//   - nrXi was computed against a clean half-inning start state: 0 outs, and
+//     either 0 bases (regulation) or bases===2 (Manfred runner on 2B in
+//     extras). readMarkovStartState in the watcher injects those exact values
+//     on inningState=middle/end / outs>=3.
 //
 // Caller is responsible for the once-per-(inning,half) guard against the
 // `existing` map; this helper returns the would-be entry whether or not it's
@@ -31,9 +32,11 @@ export type CaptureArgs = {
 export function buildInningCapture(args: CaptureArgs): { key: string; capture: InningCapture } | null {
   const { inning, half, nrXi } = args;
   if (inning == null || half == null) return null;
-  if (inning < 1 || inning > 9) return null;
+  if (inning < 1) return null;
   if (!nrXi) return null;
-  if (nrXi.startState.outs !== 0 || nrXi.startState.bases !== 0) return null;
+  if (nrXi.startState.outs !== 0) return null;
+  const cleanBases = nrXi.startState.bases === 0 || nrXi.startState.bases === 2;
+  if (!cleanBases) return null;
   return {
     key: `${inning}-${half}`,
     capture: {

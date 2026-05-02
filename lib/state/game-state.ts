@@ -94,11 +94,11 @@ export function isDecisionMoment(state: {
   return false;
 }
 
-// Full-inning variant. NOTE: depends on `state.half` being the RAW
-// `ls.isTopInning`-derived value (NOT `upcoming.half`). The watcher publishes
-// raw half (game-watcher.ts ~line 235), so during inningState === "middle"
-// raw half is still "Top" — that's how we distinguish a Top→Bottom mid-inning
-// flip (skip) from a Bottom→Top-of-next inter-inning flip (highlight).
+// Full-inning variant — kept as a named export for back-compat but now mirrors
+// `isDecisionMoment`. Spec: a card highlights at every 3-out boundary (and
+// at start-of-Top, between halves) regardless of predict mode. The displayed
+// probability changes meaning at top-3-outs in full mode (rest_of_top × clean
+// _bottom → clean_bottom), so the highlight should fire there too.
 export function isDecisionMomentFullInning(state: {
   status: GameStatus;
   inning: number | null;
@@ -106,9 +106,5 @@ export function isDecisionMomentFullInning(state: {
   outs: number | null;
   inningState?: string;
 }): boolean {
-  if (!isDecisionMoment(state)) return false;
-  const s = (state.inningState || "").toLowerCase();
-  if (s === "middle") return false;
-  if (state.half === "Top" && state.outs !== null && state.outs >= 3) return false;
-  return true;
+  return isDecisionMoment(state);
 }

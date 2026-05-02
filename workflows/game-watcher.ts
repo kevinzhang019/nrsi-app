@@ -18,7 +18,7 @@ import { isDecisionMoment, isDecisionMomentFullInning, type GameState, type Line
 import { classifyStatus } from "@/lib/mlb/types";
 import { americanBreakEven, roundOdds } from "@/lib/prob/odds";
 import type { LiveFeed } from "@/lib/mlb/types";
-import type { Bases, GameState as MarkovState } from "@/lib/prob/markov";
+import { readMarkovStartState } from "./start-state";
 
 // Read this pitcher's cumulative in-game pitch count from the boxscore. Refreshed
 // every tick (NOT cached in workflow scope) because pitch count changes on every
@@ -53,20 +53,6 @@ function readDisplayBases(feed: LiveFeed, status: string): number | null {
   const b2 = off.second?.id ? 2 : 0;
   const b3 = off.third?.id ? 4 : 0;
   return b1 | b2 | b3;
-}
-
-function readMarkovStartState(feed: LiveFeed): MarkovState {
-  const ls = feed.liveData.linescore;
-  const o = ls.outs ?? 0;
-  const inningState = (ls.inningState || "").toLowerCase();
-  const isHalfOver = inningState === "middle" || inningState === "end" || o >= 3;
-  if (isHalfOver) return { outs: 0, bases: 0 };
-  const outs = o as 0 | 1 | 2;
-  const off = ls.offense ?? {};
-  const b1 = off.first?.id ? 1 : 0;
-  const b2 = off.second?.id ? 2 : 0;
-  const b3 = off.third?.id ? 4 : 0;
-  return { outs, bases: ((b1 | b2 | b3) as Bases) };
 }
 
 // Read this pitcher's cumulative batters-faced from the boxscore for TTOP.
@@ -278,7 +264,7 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
     // PA-boundary changes that don't move outs/bases (e.g., a solo HR with
     // empty bases rotates the next batter without changing the Markov state).
     const atBatIndex = tick.feed.liveData.plays?.currentPlay?.about?.atBatIndex ?? -1;
-    const startStatePeek = readMarkovStartState(tick.feed);
+    const startStatePeek = readMarkovStartState(tick.feed, upcoming?.inning ?? null);
     const playStateKey = `${startStatePeek.outs}-${startStatePeek.bases}-${atBatIndex}`;
 
     const isLive =
@@ -442,17 +428,19 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
       // Pre-compute the clean opposite-half P(no run). Only meaningful when
       // upcoming.half === "Top" (= we're in or starting a top half, so the
       // opposite half is the bottom we'll need to compose into the full
-      // inning). At end of bottom this also fires for the next inning's top
-      // half via upcoming.inning advancing — homeBundle remains the right
-      // bundle (home batters vs away pitcher) regardless of inning number.
-      if (upcoming.half === "Top" && homeBundle) {
+      // inning). Skipped in the 9th — bottom of 9 only plays if home isn't
+      // already winning, so we don't multiply a hypothetical bottom into the
+      // full-inning value (the 9th-top branch below uses lastNrXi directly).
+      // In extras (10th+), the opposite half also starts with the Manfred
+      // runner on 2B, so seed bases:2 for those clean-state computations.
+      if (upcoming.half === "Top" && upcoming.inning !== 9 && homeBundle) {
         const oppHalf = await computeNrXiStep({
           gamePk: input.gamePk,
           pitcher: homeBundle.pitcher,
           batters: homeBundle.batters,
           park: park.components,
           weather: weather.components,
-          startState: { outs: 0, bases: 0 },
+          startState: { outs: 0, bases: upcoming.inning >= 10 ? 2 : 0 },
           paInGameForPitcher: 0,
           oaaTable: defense.oaaTable,
           framingTable: defense.framingTable,
@@ -485,7 +473,7 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
       weatherCache &&
       defenseCache
     ) {
-      const startState = readMarkovStartState(tick.feed);
+      const startState = readMarkovStartState(tick.feed, upcoming.inning);
       const paInGameForPitcher = readPaInGameForPitcher(tick.feed, upcoming.pitcherId!);
       lastNrXi = await computeNrXiStep({
         gamePk: input.gamePk,
@@ -508,7 +496,17 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
       // flips to "Top" of next inning → full = lastNrXi × oppHalfClean of the
       // next full inning. Reverting to raw `half` reintroduces a squared bug
       // at end-of-top and a missing-bottom bug at end-of-bottom.
-      if (upcoming.half === "Top" && oppHalfCleanCache) {
+      //
+      // 9th-inning special case: bottom of 9 plays only if home isn't already
+      // winning, so don't multiply a hypothetical bottom into the full-inning
+      // value. full = rest_of_top (= half-inning value).
+      if (upcoming.inning === 9 && upcoming.half === "Top") {
+        lastFullInning = {
+          pHit: lastNrXi.pHitEvent,
+          pNo: lastNrXi.pNoHitEvent,
+          breakEven: lastNrXi.breakEvenAmerican,
+        };
+      } else if (upcoming.half === "Top" && oppHalfCleanCache) {
         const pNoFull = lastNrXi.pNoHitEvent * oppHalfCleanCache.pNoHitEvent;
         const pHitFull = 1 - pNoFull;
         lastFullInning = {

@@ -15,6 +15,11 @@ const dirtyNrXi: NrXiResult = {
   startState: { outs: 1, bases: 1 },
 };
 
+const manfredNrXi: NrXiResult = {
+  ...cleanNrXi,
+  startState: { outs: 0, bases: 2 },
+};
+
 const baseArgs = {
   pitcher: null,
   awayPitcher: null,
@@ -53,13 +58,28 @@ describe("buildInningCapture", () => {
     ).toBeNull();
   });
 
-  it("returns null for innings outside 1-9", () => {
+  it("returns null for inning < 1", () => {
     expect(
       buildInningCapture({ inning: 0, half: "Top", nrXi: cleanNrXi, ...baseArgs }),
     ).toBeNull();
-    expect(
-      buildInningCapture({ inning: 10, half: "Bottom", nrXi: cleanNrXi, ...baseArgs }),
-    ).toBeNull();
+  });
+
+  it("captures extras with Manfred runner clean state (bases=2)", () => {
+    const out = buildInningCapture({ inning: 10, half: "Top", nrXi: manfredNrXi, ...baseArgs });
+    expect(out).not.toBeNull();
+    expect(out!.key).toBe("10-Top");
+    expect(out!.capture.inning).toBe(10);
+  });
+
+  it("captures regulation clean-bases (bases=0) for inning >= 10 too", () => {
+    const out = buildInningCapture({ inning: 11, half: "Bottom", nrXi: cleanNrXi, ...baseArgs });
+    expect(out).not.toBeNull();
+    expect(out!.key).toBe("11-Bottom");
+  });
+
+  it("returns null when extras start state is mid-PA (outs > 0)", () => {
+    const out = buildInningCapture({ inning: 10, half: "Top", nrXi: dirtyNrXi, ...baseArgs });
+    expect(out).toBeNull();
   });
 
   it("nests both teams' pitchers under the active label", () => {

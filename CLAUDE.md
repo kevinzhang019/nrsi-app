@@ -6,7 +6,7 @@
 
 - **What:** live MLB no-run-scoring-inning probability dashboard
 - **Stack:** Next.js 16 App Router (Cache Components on) + Vercel Workflow DevKit + Upstash Redis (Vercel Marketplace) + Supabase Postgres (Vercel Marketplace, history archive) + Tailwind v4 + Vitest
-- **Status:** deployed to https://nrsi-app.vercel.app, scheduler workflow runs daily at 13:00 UTC, 138/138 unit tests passing, build green
+- **Status:** deployed to https://nrsi-app.vercel.app, scheduler workflow runs daily at 13:00 UTC, 155/155 unit tests passing, build green
 
 ## Detailed docs
 
@@ -61,18 +61,20 @@ All Redis keys live in `lib/cache/keys.ts` — full table of shapes/owners/TTLs 
 
 Permanent archive of finished games + per-inning predictions lives in Supabase Postgres (free tier via Vercel Marketplace). Two tables: `games` (one row per Final game, JSONB blobs for linescore/lineups/final_snapshot) and `inning_predictions` (one row per (game_pk, inning, half) capturing the model's prediction at the start of that half-inning, plus actual_runs backfilled from the linescore).
 
-- **Schema:** `supabase/migrations/0001_history.sql` — apply via Supabase dashboard SQL editor or `node --env-file=.env.local scripts/migrate.mjs` (postgres-js, idempotent — every statement is `if not exists`). Service role is the only writer; RLS stays off.
+- **Schema:** `supabase/migrations/0001_history.sql` (base) + `0002_extras.sql` (relax `inning between 1 and 12` → `inning >= 1` for extras). Apply via Supabase dashboard SQL editor or `node --env-file=.env.local scripts/migrate.mjs` (postgres-js, idempotent — every statement is `if not exists` or guarded). Service role is the only writer; RLS stays off.
 - **Client:** `lib/db/supabase.ts` follows the `redisRestConfig()` / `redis()` split — `supabaseConfig()` for env-var lookup, `supabaseAdmin()` lazy singleton (service role).
-- **Capture point:** `workflows/capture-inning.ts:buildInningCapture` is a pure helper called from `workflows/game-watcher.ts` after `state` is built and before `publishUpdateStep`. The **load-bearing guard** is `nrXi.startState.outs === 0 && nrXi.startState.bases === 0` — that's true exactly at half-inning boundaries (matches `readMarkovStartState`'s zeroing on `inningState=middle/end` / `outs >= 3`), which means we record the model's pre-pitch prediction for that half. The once-per-`${inning}-${half}` map guard prevents subsequent ticks from overwriting.
+- **Capture point:** `workflows/capture-inning.ts:buildInningCapture` is a pure helper called from `workflows/game-watcher.ts` after `state` is built and before `publishUpdateStep`. The **load-bearing guard** is `nrXi.startState.outs === 0 && (bases === 0 || bases === 2)` — that's true exactly at half-inning boundaries: `bases === 0` for regulation (1–9), `bases === 2` for the Manfred runner on 2B in extras (10+). Matches `readMarkovStartState`'s injection on `inningState=middle/end` / `outs >= 3`. The once-per-`${inning}-${half}` map guard prevents subsequent ticks from overwriting.
 - **Persist point:** `persistFinishedGameStep` runs on the Final exit branch only (`workflows/game-watcher.ts:585`). It no-ops if Supabase env vars aren't set, so the watcher's existing behavior is unaffected on dev boxes without DB credentials.
-- **History UI:** `/history` (date strip + calendar popover, only data-days enabled) and `/history/[pk]` (inning tabs 1–9, frozen-state `<GameCard>` reuse via `<HistoricalGameView>`). Both pages put `connection()` + `await params/searchParams` inside the `<Suspense>` body — never at the page level — to keep Cache Components happy.
+- **History UI:** `/history` (date strip + calendar popover, only data-days enabled) and `/history/[pk]` (inning tabs 1–9 + extras when present, frozen-state `<GameCard>` reuse via `<HistoricalGameView>`). Both pages put `connection()` + `await params/searchParams` inside the `<Suspense>` body — never at the page level — to keep Cache Components happy.
 
 ## Default decisions worth preserving
 
 - **v2 model is the default.** Probability pipeline is `Log5 → applyEnv → applyTtop → applyFraming → applyDefense → 24-state Markov → calibrate`. The legacy `pReach` + 2-state DP path in `lib/prob/{reach-prob,inning-dp}.ts` is retained for back-compat but is **not invoked by the watcher**. See `docs/PROBABILITY_MODEL.md`.
 - **Switch-hitter rule:** `actual` (canonical platoon advantage) by default — switch hitters bat opposite the pitcher's throwing hand. Legacy v1 `max(L, R)` reachable via `NRXI_SWITCH_HITTER_RULE=max`.
 - **nrXi definition:** v2 computes `P(nrXi) = 1 − P(≥1 run scores)` directly via the Markov chain — no proxy. The legacy `pHitEvent` field name on `NrXiResult` is preserved for UI back-compat but its semantics are now exact.
-- **Decision moment:** `outs === 3` (end of half-inning) OR `(half === "Top" && outs === 0)` (top of inning, no outs yet).
+- **Decision moment:** `outs === 3` (end of half-inning) OR `inningState ∈ {middle, end}` OR `(half === "Top" && outs === 0)`. Both predict modes use the same predicate — cards highlight at every 3-out boundary regardless of half/full setting. The `isDecisionMomentFullInning` export is a back-compat alias that mirrors `isDecisionMoment`.
+- **Full-inning composition:** `(rest_of_top × clean_bottom)` mid-top → `clean_bottom` at top-end (= half-inning) → `rest_of_bottom` mid-bottom → `clean_top × clean_bottom` of next inning at bottom-end. **9th inning is top-only** (`upcoming.inning === 9 && upcoming.half === "Top"` skips the bottom multiplier — bottom of 9 plays only if home isn't already winning, so we don't multiply a hypothetical bottom in). Bottom of 9 + extras compose normally.
+- **Manfred runner (extras):** at any half-boundary in inning ≥ 10, `readMarkovStartState` returns `{outs: 0, bases: 2}` (runner on 2B). Mid-PA we trust the live feed's offense state — MLB Stats API populates the Manfred runner there at extra-half leadoff. The `oppHalfCleanCache` also seeds `bases: 2` when `upcoming.inning >= 10`. Per-inning capture accepts both `bases === 0` (regulation) and `bases === 2` (Manfred) as clean half-boundary state.
 - **Break-even rounding:** American odds rounded to nearest 5 in display; raw value used for EV calc.
 - **League-rate constants** (`LEAGUE_PA` in `lib/mlb/splits.ts`) are 2024–2025 averages by pitcher hand. Refresh annually.
 - **Empirical-Bayes shrinkage** prior strength `n0 = 200` PA. Don't change without a calibration study.
@@ -95,17 +97,18 @@ Each line is a load-bearing invariant. Where there's deeper context, the parenth
 
 **Workflow scope (bug #5/#7 trap):**
 - Hoisted `lastNrXi` / `lastEnv` / `lastPitcher*` vars in `workflows/game-watcher.ts:42-46` (BUGS.md bug #5)
-- Hoisted `capturedInnings: Record<string, InningCapture>` in workflow scope and the `outs===0 && bases===0` clean-state guard in `buildInningCapture` — folding either back into loop scope or relaxing the guard turns the per-inning archive into a stream of mid-PA snapshots
+- Hoisted `capturedInnings: Record<string, InningCapture>` in workflow scope and the `outs===0 && (bases===0 || bases===2)` clean-state guard in `buildInningCapture` — folding either back into loop scope or relaxing `outs===0` turns the per-inning archive into a stream of mid-PA snapshots. The `bases===2` allowance is specifically for the Manfred runner on 2B in extras; do not widen it further
 - Hoisted `lastLineups` / `lastEnrichedHash` and the `lh !== lastEnrichedHash` enrichment trigger — independent of `shouldRecompute` so Pre-game lineups hydrate immediately (BUGS.md bug #7)
 - Hoisted `lastFullInning` / `lastLineupStats` / `lastOppPitcherHash` (UI.md → Settings panel)
 - Hoisted `lastAwayPitcher` / `lastHomePitcher` carrying each team's last-used pitcher (UI.md → Pitcher row)
-- `oppHalfCleanCache` recomputed only in the structural-reload phase, then composed against `upcoming.half` (NOT raw `half`) (BUGS.md bug #8)
+- `oppHalfCleanCache` recomputed only in the structural-reload phase, then composed against `upcoming.half` (NOT raw `half`) (BUGS.md bug #8). Skipped when `upcoming.inning === 9` (9th-top is top-only); seeded with `bases: 2` when `upcoming.inning >= 10` (Manfred runner)
+- The 9th-inning top-only branch in the full-inning composer (`upcoming.inning === 9 && upcoming.half === "Top"` → `lastFullInning = lastNrXi`). Removing it reintroduces a hypothetical-bottom multiplier for an inning the home team may not bat in
 - The split between `structuralKey` and `playStateKey` in the watcher (BUGS.md bug #8)
 - The single-poller lock semantics — refresh TTL every tick, never `await sleep(...)` longer than the lock TTL minus a margin
 - The `season || season-1` fallback in `loadBatterProfile` / `loadPitcherProfile` — early-season splits are empty and prior-season is the only useful proxy
 
 **Watcher state reads:**
-- `readMarkovStartState` short-circuits to `{outs: 0, bases: 0}` when `inningState` is `middle`/`end` OR `outs >= 3` (BUGS.md bug #8)
+- `readMarkovStartState` (lifted to `workflows/start-state.ts` for unit-testability) short-circuits to `{outs: 0, bases: 0}` when `inningState` is `middle`/`end` OR `outs >= 3` — and to `{outs: 0, bases: 2}` (Manfred runner on 2B) when the upcoming inning is ≥ 10. Mid-PA reads the feed's offense state directly (BUGS.md bug #8)
 - `readDisplayBases` vs `readMarkovStartState` — they diverge intentionally at half-boundaries; folding them breaks either display or probability (UI.md → Bases diamond)
 - **Pitch count read fresh every tick** in the state-construction block, NOT cached in workflow scope — pitch count changes on every pitch, far more often than structural reload (UI.md → Pitcher row)
 
