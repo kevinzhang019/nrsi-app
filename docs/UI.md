@@ -17,8 +17,9 @@ Picks which probability `<ProbabilityPill>` shows.
 - `full` → `pNoHitEventFullInning` / `breakEvenAmericanFullInning` — P(no run scored across BOTH halves of the current inning).
 
 The full-inning value is computed server-side in `services/run-watcher.ts`:
-- `half === "Top"`: `pNoFull = pNoTop_current × pNoBot_clean`. The bottom-half factor comes from a SECOND `computeNrXiStep` call with `startState: { outs: 0, bases: 0 }`, the home team's 9 starters, and the away team's current pitcher.
+- `half === "Top"`: `pNoFull = pNoTop_current × pNoBot_clean`. The bottom-half factor comes from a SECOND `computeNrXiStep` call with `startState: { outs: 0, bases: 0 }` (or `bases: 2` in extras for the Manfred runner), the home team's 9 starters, and the away team's current pitcher.
 - `half === "Bottom"`: `pNoFull = pNoBot_current` — the top is over, so half = full.
+- **Top of the 9th, home leading**: `pNoFull = pNoTop_current` — bottom-9 won't be played, so we skip the bottom multiplier. Predicate `services/full-inning.ts:shouldSkipBottomNinth({inning, half, homeRuns, awayRuns})` gates this. Tied or visitors-ahead in top-9 → bottom-9 plays and we compose normally. Bottom of 9 + extras always compose normally.
 - Opposing pitcher unknown (rare; pre-game with no probable starter, or a feed gap): `pNoHitEventFullInning = null` — the pill renders `—`. **No silent fall-through to half-inning.** That was an explicit product decision; preserve it.
 
 ### View mode (`single` | `split`)

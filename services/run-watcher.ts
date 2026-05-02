@@ -23,6 +23,7 @@ import { enrichLineupHandsStep } from "./steps/enrich-lineup-hands";
 import { persistFinishedGameStep } from "./steps/persist-finished-game";
 import { buildInningCapture } from "./capture-inning";
 import { readMarkovStartState } from "./start-state";
+import { shouldSkipBottomNinth } from "./full-inning";
 import { getUpcomingForCurrentInning, lineupHash } from "../lib/mlb/lineup";
 import { extractLineups, extractLinescore, extractBatterFocus } from "../lib/mlb/extract";
 import {
@@ -250,8 +251,17 @@ export async function runWatcher(
       const bothPitchers = readBothPitchers(tick.feed);
       const op = `${bothPitchers.awayPitcherId ?? "_"}-${bothPitchers.homePitcherId ?? "_"}`;
 
+      const homeRuns = ls.teams?.home.runs ?? 0;
+      const awayRuns = ls.teams?.away.runs ?? 0;
+      const bottomNinthSkipped = shouldSkipBottomNinth({
+        inning: upcoming?.inning ?? null,
+        half: upcoming?.half ?? null,
+        homeRuns,
+        awayRuns,
+      });
+
       const atBat = upcoming?.upcomingBatterIds[0] ?? "_";
-      const structuralKey = `${upcoming?.half ?? "_"}|${upcoming?.inning ?? "_"}|${lh}|${dk}|${op}|${atBat}`;
+      const structuralKey = `${upcoming?.half ?? "_"}|${upcoming?.inning ?? "_"}|${lh}|${dk}|${op}|${atBat}|${bottomNinthSkipped ? "skip9" : "play9"}`;
       const atBatIndex = tick.feed.liveData.plays?.currentPlay?.about?.atBatIndex ?? -1;
       const startStatePeek = readMarkovStartState(tick.feed, upcoming?.inning ?? null);
       const playStateKey = `${startStatePeek.outs}-${startStatePeek.bases}-${atBatIndex}`;
@@ -422,7 +432,7 @@ export async function runWatcher(
           };
         }
 
-        if (upcoming.half === "Top" && upcoming.inning !== 9 && homeBundle) {
+        if (upcoming.half === "Top" && !bottomNinthSkipped && homeBundle) {
           const oppHalf = await withRetry(
             () =>
               computeNrXiStep({
@@ -480,7 +490,7 @@ export async function runWatcher(
           { signal, label: "computeNrXi:play" },
         );
 
-        if (upcoming.inning === 9 && upcoming.half === "Top") {
+        if (bottomNinthSkipped) {
           lastFullInning = {
             pHit: lastNrXi.pHitEvent,
             pNo: lastNrXi.pNoHitEvent,
@@ -573,6 +583,14 @@ export async function runWatcher(
         linescore: extractLinescore(tick.feed),
         ...extractBatterFocus(tick.feed),
         updatedAt: new Date().toISOString(),
+        // Carry venue-local game day + UTC start time straight off the live
+        // feed. The seeded snapshot set these at Pre-game from the schedule,
+        // but the watcher's published state would otherwise drop them on the
+        // first live tick. History persistence (lib/db/games.ts:gameDateOf)
+        // reads officialDate to bucket the row under the correct local day
+        // instead of UTC.
+        startTime: tick.feed.gameData.datetime?.dateTime,
+        officialDate: tick.feed.gameData.datetime?.officialDate,
       };
 
       const captureCandidate = buildInningCapture({
