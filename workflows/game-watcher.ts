@@ -531,7 +531,14 @@ export async function gameWatcherWorkflow(input: WatcherInput) {
     const env = lastEnv;
 
     const decision = isDecisionMoment({ status, inning, half, outs, inningState });
-    const decisionFull = isDecisionMomentFullInning({ status, inning, half, outs, inningState });
+    const decisionFull = isDecisionMomentFullInning({
+      status,
+      inning,
+      half,
+      outs,
+      inningState,
+      upcomingHalf: upcoming?.half ?? null,
+    });
 
     const state: GameState = {
       gamePk: input.gamePk,

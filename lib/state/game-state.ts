@@ -94,17 +94,30 @@ export function isDecisionMoment(state: {
   return false;
 }
 
-// Full-inning variant — kept as a named export for back-compat but now mirrors
-// `isDecisionMoment`. Spec: a card highlights at every 3-out boundary (and
-// at start-of-Top, between halves) regardless of predict mode. The displayed
-// probability changes meaning at top-3-outs in full mode (rest_of_top × clean
-// _bottom → clean_bottom), so the highlight should fire there too.
+// Full-inning variant: highlights only when the next batter will lead off a
+// TOP half — i.e. a new inning is about to begin. That covers:
+//   - start of game / start of any inning's top (`upcoming.half === "Top"`
+//     while currently in the top with outs===0)
+//   - end of bottom of an inning (`upcoming.half` flips to "Top" of N+1)
+//   - between innings (inningState === "end" → upcoming.half === "Top")
+// It does NOT fire at the top→bottom mid-inning flip because there
+// `upcoming.half === "Bottom"`.
+//
+// Why upcoming.half (not raw `state.half` + flag combos): MLB's live feed is
+// inconsistent at half-boundaries — it sometimes uses inningState="middle"
+// for both top→bottom AND inning-end transitions, sometimes advances `inning`
+// or `isTopInning` before posting an "end" state. `upcoming.half` (from
+// lib/mlb/lineup.ts:getUpcomingForCurrentInning) is the canonical "next half
+// to bat" derived from `isMiddleOrEnd || outs >= 3` and is the reliable
+// signal that a TOP half is the next thing to happen.
 export function isDecisionMomentFullInning(state: {
   status: GameStatus;
   inning: number | null;
   half: GameState["half"];
   outs: number | null;
   inningState?: string;
+  upcomingHalf?: "Top" | "Bottom" | null;
 }): boolean {
-  return isDecisionMoment(state);
+  if (!isDecisionMoment(state)) return false;
+  return state.upcomingHalf === "Top";
 }

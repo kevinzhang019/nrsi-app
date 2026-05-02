@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { isDecisionMoment, isDecisionMomentFullInning, type GameState } from "./game-state";
 import { decisionMomentFor } from "./decision-moment";
 
-type PredicateInput = Parameters<typeof isDecisionMoment>[0];
+type PredicateInput = Parameters<typeof isDecisionMomentFullInning>[0];
 
 const live = (overrides: Partial<PredicateInput>): PredicateInput => ({
   status: "Live",
@@ -44,45 +44,74 @@ describe("isDecisionMoment (half-inning)", () => {
 });
 
 describe("isDecisionMomentFullInning", () => {
-  // Spec: cards highlight at every 3-out boundary regardless of predict mode.
-  // The full-inning variant now mirrors the half-inning variant exactly.
-  it("fires at end of TOP (outs=3) — same as half-inning", () => {
+  // Spec: full-inning highlights only when the upcoming half is a TOP — i.e.
+  // a new inning is about to begin. Driven by `upcomingHalf` from
+  // getUpcomingForCurrentInning, which is robust to MLB feed quirks at
+  // half-boundaries (where inningState may be "middle"/"end" inconsistently).
+
+  it("fires at end of BOTTOM — upcomingHalf flips to Top of next inning", () => {
     expect(
-      isDecisionMomentFullInning(live({ half: "Top", outs: 3, inningState: "Top" })),
+      isDecisionMomentFullInning(
+        live({ half: "Bottom", outs: 3, inningState: "Bottom", upcomingHalf: "Top" }),
+      ),
     ).toBe(true);
   });
 
-  it("fires when inningState is middle — same as half-inning", () => {
+  it("fires when inningState is end (between innings, upcoming is Top)", () => {
     expect(
-      isDecisionMomentFullInning(live({ half: "Top", outs: 3, inningState: "Middle" })),
+      isDecisionMomentFullInning(
+        live({ half: "Bottom", outs: 3, inningState: "End", upcomingHalf: "Top" }),
+      ),
     ).toBe(true);
   });
 
-  it("fires at end of BOTTOM (outs=3)", () => {
+  it("fires at start of game (Top, outs=0, upcomingHalf=Top)", () => {
     expect(
-      isDecisionMomentFullInning(live({ half: "Bottom", outs: 3, inningState: "Bottom" })),
+      isDecisionMomentFullInning(
+        live({ inning: 1, half: "Top", outs: 0, inningState: "Top", upcomingHalf: "Top" }),
+      ),
     ).toBe(true);
   });
 
-  it("fires when inningState is end (between innings)", () => {
+  it("fires at start of any new inning's top (mid-game, upcomingHalf=Top)", () => {
     expect(
-      isDecisionMomentFullInning(live({ half: "Bottom", outs: 3, inningState: "End" })),
+      isDecisionMomentFullInning(
+        live({ inning: 5, half: "Top", outs: 0, inningState: "Top", upcomingHalf: "Top" }),
+      ),
     ).toBe(true);
   });
 
-  it("fires at start of new inning (Top, outs=0, inning>1)", () => {
+  it("does NOT fire at end of TOP — upcomingHalf flips to Bottom (mid-inning)", () => {
     expect(
-      isDecisionMomentFullInning(live({ inning: 2, half: "Top", outs: 0 })),
-    ).toBe(true);
+      isDecisionMomentFullInning(
+        live({ half: "Top", outs: 3, inningState: "Top", upcomingHalf: "Bottom" }),
+      ),
+    ).toBe(false);
+  });
+
+  it("does NOT fire when inningState is middle (top→bottom flip)", () => {
+    expect(
+      isDecisionMomentFullInning(
+        live({ half: "Top", outs: 3, inningState: "Middle", upcomingHalf: "Bottom" }),
+      ),
+    ).toBe(false);
   });
 
   it("does not fire mid-half", () => {
-    expect(isDecisionMomentFullInning(live({ outs: 1 }))).toBe(false);
+    expect(
+      isDecisionMomentFullInning(live({ outs: 1, upcomingHalf: "Top" })),
+    ).toBe(false);
   });
 
   it("does not fire when not a baseline decision moment", () => {
     expect(
-      isDecisionMomentFullInning(live({ status: "Pre", outs: 3 })),
+      isDecisionMomentFullInning(live({ status: "Pre", outs: 3, upcomingHalf: "Top" })),
+    ).toBe(false);
+  });
+
+  it("does not fire when upcomingHalf is missing (defensive default)", () => {
+    expect(
+      isDecisionMomentFullInning(live({ half: "Bottom", outs: 3, inningState: "End" })),
     ).toBe(false);
   });
 });

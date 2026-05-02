@@ -6,7 +6,7 @@
 
 - **What:** live MLB no-run-scoring-inning probability dashboard
 - **Stack:** Next.js 16 App Router (Cache Components on) + Vercel Workflow DevKit + Upstash Redis (Vercel Marketplace) + Supabase Postgres (Vercel Marketplace, history archive) + Tailwind v4 + Vitest
-- **Status:** deployed to https://nrsi-app.vercel.app, scheduler workflow runs daily at 13:00 UTC, 155/155 unit tests passing, build green
+- **Status:** deployed to https://nrsi-app.vercel.app, scheduler workflow runs daily at 13:00 UTC, 157/157 unit tests passing, build green
 
 ## Detailed docs
 
@@ -72,7 +72,8 @@ Permanent archive of finished games + per-inning predictions lives in Supabase P
 - **v2 model is the default.** Probability pipeline is `Log5 → applyEnv → applyTtop → applyFraming → applyDefense → 24-state Markov → calibrate`. The legacy `pReach` + 2-state DP path in `lib/prob/{reach-prob,inning-dp}.ts` is retained for back-compat but is **not invoked by the watcher**. See `docs/PROBABILITY_MODEL.md`.
 - **Switch-hitter rule:** `actual` (canonical platoon advantage) by default — switch hitters bat opposite the pitcher's throwing hand. Legacy v1 `max(L, R)` reachable via `NRXI_SWITCH_HITTER_RULE=max`.
 - **nrXi definition:** v2 computes `P(nrXi) = 1 − P(≥1 run scores)` directly via the Markov chain — no proxy. The legacy `pHitEvent` field name on `NrXiResult` is preserved for UI back-compat but its semantics are now exact.
-- **Decision moment:** `outs === 3` (end of half-inning) OR `inningState ∈ {middle, end}` OR `(half === "Top" && outs === 0)`. Both predict modes use the same predicate — cards highlight at every 3-out boundary regardless of half/full setting. The `isDecisionMomentFullInning` export is a back-compat alias that mirrors `isDecisionMoment`.
+- **Decision moment (half-inning):** `outs === 3` OR `inningState ∈ {middle, end}` OR `(half === "Top" && outs === 0)`. Fires at every half-boundary.
+- **Decision moment (full-inning):** half-inning predicate AND `upcoming.half === "Top"`. Fires only when the next batter will lead off a TOP half (= a new inning is approaching). That covers end-of-bottom (upcoming flips to Top of N+1), inningState="end" between innings, and start of any inning's top (mid-game leadoff or game start). Does NOT fire at top→bottom mid-inning flips. **Why upcoming.half (not raw `state.half` + flag combos):** MLB's live feed inconsistently uses inningState="middle" vs "end" at boundaries, sometimes advances `inning`/`isTopInning` before posting an end state. `upcoming.half` from `getUpcomingForCurrentInning` is the canonical "next half to bat" and is the only reliable signal.
 - **Full-inning composition:** `(rest_of_top × clean_bottom)` mid-top → `clean_bottom` at top-end (= half-inning) → `rest_of_bottom` mid-bottom → `clean_top × clean_bottom` of next inning at bottom-end. **9th inning is top-only** (`upcoming.inning === 9 && upcoming.half === "Top"` skips the bottom multiplier — bottom of 9 plays only if home isn't already winning, so we don't multiply a hypothetical bottom in). Bottom of 9 + extras compose normally.
 - **Manfred runner (extras):** at any half-boundary in inning ≥ 10, `readMarkovStartState` returns `{outs: 0, bases: 2}` (runner on 2B). Mid-PA we trust the live feed's offense state — MLB Stats API populates the Manfred runner there at extra-half leadoff. The `oppHalfCleanCache` also seeds `bases: 2` when `upcoming.inning >= 10`. Per-inning capture accepts both `bases === 0` (regulation) and `bases === 2` (Manfred) as clean half-boundary state.
 - **Break-even rounding:** American odds rounded to nearest 5 in display; raw value used for EV calc.
