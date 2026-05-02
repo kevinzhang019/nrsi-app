@@ -76,6 +76,12 @@ export type GameState = {
   nextHalfLeadoffId: number | null;
   updatedAt: string;
   startTime?: string;
+  // Venue-local game day (YYYY-MM-DD). Sourced from MLB's `gameData.datetime
+  // .officialDate` (live feed) or the schedule's `dates[].date` grouping at
+  // seed time. Used by the history archive to bucket games under their local
+  // start day instead of UTC. Optional so legacy snapshots in Redis still
+  // round-trip.
+  officialDate?: string;
 };
 
 export function isDecisionMoment(state: {

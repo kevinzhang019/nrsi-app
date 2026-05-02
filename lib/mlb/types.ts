@@ -100,6 +100,10 @@ export type LiveFeed = {
     status: { abstractGameState: string; detailedState?: string; codedGameState?: string };
     teams: { away: { id: number; name: string }; home: { id: number; name: string } };
     venue?: { id: number; name: string };
+    // Live feed datetime block. `officialDate` is YYYY-MM-DD in venue-local
+    // time — the canonical game-day MLB groups by, used as the history bucket
+    // key. `dateTime` is the canonical UTC ISO start time.
+    datetime?: { officialDate?: string; dateTime?: string };
   };
   liveData: {
     linescore: {

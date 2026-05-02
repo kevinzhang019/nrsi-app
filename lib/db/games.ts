@@ -3,9 +3,14 @@ import type { Linescore } from "@/lib/mlb/extract";
 import type { HistoricalGame, HistoricalInning, InningCapture } from "@/lib/types/history";
 import { supabaseAdmin } from "./supabase";
 
-// Game date in America/New_York. Game logs are bucketed by local-game-day so
-// late-night EST games don't slip into the next UTC date.
-function gameDateOf(startTime: string | undefined): string {
+// Bucket games by their venue-local game day (YYYY-MM-DD) so a 7pm PT start
+// goes to its actual local day, not the next UTC day. MLB exposes this
+// directly as `gameData.datetime.officialDate` in the live feed and as
+// `dates[].date` in the schedule — both already in venue-local convention,
+// no timezone math needed. The ET fallback exists only for legacy snapshots
+// that pre-date the officialDate plumbing; new captures should always have it.
+function gameDateOf(officialDate: string | undefined, startTime: string | undefined): string {
+  if (officialDate && /^\d{4}-\d{2}-\d{2}$/.test(officialDate)) return officialDate;
   const t = startTime ? new Date(startTime) : new Date();
   const ny = new Date(t.toLocaleString("en-US", { timeZone: "America/New_York" }));
   const y = ny.getFullYear();
@@ -43,7 +48,7 @@ export async function saveFinishedGame(args: SaveFinishedGameArgs): Promise<void
   const { finalState, capturedInnings } = args;
   const sb = supabaseAdmin();
 
-  const gameDate = gameDateOf(finalState.startTime);
+  const gameDate = gameDateOf(finalState.officialDate, finalState.startTime);
 
   const gameRow = {
     game_pk: finalState.gamePk,
