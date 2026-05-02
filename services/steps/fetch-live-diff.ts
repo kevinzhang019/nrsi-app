@@ -85,7 +85,6 @@ export async function fetchLiveDiffStep(opts: {
   startTimecode: string | null;
   prevDoc: LiveFeed | null;
 }): Promise<WatcherTick> {
-  "use step";
   const { gamePk, startTimecode, prevDoc } = opts;
   log.info("step", "fetchLiveDiff:start", { gamePk, startTimecode });
 

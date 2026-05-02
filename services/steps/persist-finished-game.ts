@@ -8,7 +8,6 @@ import { log } from "@/lib/log";
 // no-ops so the watcher's Final exit path is unaffected on dev/preview boxes
 // without DB credentials.
 export async function persistFinishedGameStep(args: SaveFinishedGameArgs): Promise<void> {
-  "use step";
   const gamePk = args.finalState.gamePk;
   log.info("step", "persistFinishedGame:start", {
     gamePk,

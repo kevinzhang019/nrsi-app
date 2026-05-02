@@ -11,18 +11,18 @@ import {
   emptyWatcherState,
   type WatcherState,
 } from "./lib/watcher-state";
-import { fetchLiveDiffStep } from "../workflows/steps/fetch-live-diff";
-import { loadLineupSplitsStep } from "../workflows/steps/load-lineup-splits";
-import { loadParkFactorStep } from "../workflows/steps/load-park-factor";
-import { loadWeatherStep } from "../workflows/steps/load-weather";
-import { loadDefenseStep } from "../workflows/steps/load-defense";
-import { computeNrXiStep } from "../workflows/steps/compute-nrXi";
-import { computeLineupStatsStep } from "../workflows/steps/compute-lineup-stats";
-import { publishUpdateStep } from "../workflows/steps/publish-update";
-import { enrichLineupHandsStep } from "../workflows/steps/enrich-lineup-hands";
-import { persistFinishedGameStep } from "../workflows/steps/persist-finished-game";
-import { buildInningCapture } from "../workflows/capture-inning";
-import { readMarkovStartState } from "../workflows/start-state";
+import { fetchLiveDiffStep } from "./steps/fetch-live-diff";
+import { loadLineupSplitsStep } from "./steps/load-lineup-splits";
+import { loadParkFactorStep } from "./steps/load-park-factor";
+import { loadWeatherStep } from "./steps/load-weather";
+import { loadDefenseStep } from "./steps/load-defense";
+import { computeNrXiStep } from "./steps/compute-nrXi";
+import { computeLineupStatsStep } from "./steps/compute-lineup-stats";
+import { publishUpdateStep } from "./steps/publish-update";
+import { enrichLineupHandsStep } from "./steps/enrich-lineup-hands";
+import { persistFinishedGameStep } from "./steps/persist-finished-game";
+import { buildInningCapture } from "./capture-inning";
+import { readMarkovStartState } from "./start-state";
 import { getUpcomingForCurrentInning, lineupHash } from "../lib/mlb/lineup";
 import { extractLineups, extractLinescore, extractBatterFocus } from "../lib/mlb/extract";
 import {
@@ -36,8 +36,6 @@ import { americanBreakEven, roundOdds } from "../lib/prob/odds";
 import { log } from "../lib/log";
 import type { LiveFeed } from "../lib/mlb/types";
 
-// Helper readers — identical bodies to workflows/game-watcher.ts. Kept here so
-// the Railway watcher has no runtime dependency on the WDK file in Phase D.
 function readPitcherPitchCount(feed: LiveFeed, pitcherId: number): number | null {
   const teams = feed.liveData.boxscore?.teams;
   if (!teams) return null;

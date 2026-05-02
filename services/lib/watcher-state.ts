@@ -1,5 +1,5 @@
 import { redis } from "../../lib/cache/redis";
-import type { NrXiResult } from "../../workflows/steps/compute-nrXi";
+import type { NrXiResult } from "../steps/compute-nrXi";
 import type { LineupBatterStat } from "../../lib/state/game-state";
 import type { TeamLineup } from "../../lib/mlb/extract";
 import type { InningCapture } from "../../lib/types/history";

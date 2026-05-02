@@ -6,7 +6,6 @@ export async function loadDefenseStep(opts: {
   gamePk: number;
   season: number;
 }): Promise<{ oaaTable: OaaTable; framingTable: FramingTable }> {
-  "use step";
   const { gamePk, season } = opts;
   log.info("step", "loadDefense:start", { gamePk, season });
   const [oaaTable, framingTable] = await Promise.all([

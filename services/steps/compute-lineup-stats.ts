@@ -32,7 +32,6 @@ export async function computeLineupStatsStep(opts: {
   catcherId?: number | null;
   fielderIds?: number[];
 }): Promise<Record<string, LineupBatterStat>> {
-  "use step";
   const {
     gamePk,
     pitcher,

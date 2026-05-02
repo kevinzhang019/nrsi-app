@@ -1,6 +1,6 @@
 import type { GameState, LineupBatterStat, PitcherInfo } from "@/lib/state/game-state";
 import type { Linescore, TeamLineup } from "@/lib/mlb/extract";
-import type { NrXiPerBatter } from "@/workflows/steps/compute-nrXi";
+import type { NrXiPerBatter } from "@/services/steps/compute-nrXi";
 
 // One inning's prediction snapshot, taken at the moment that half-inning
 // began (clean state: 0 outs, 0 bases). Captured live by the watcher; later

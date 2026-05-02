@@ -1,11 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
 import { runSupervisor, defaultIdleDeadline } from "./supervisor";
-import type { ScheduledGame } from "../workflows/steps/fetch-schedule";
+import type { ScheduledGame } from "./steps/fetch-schedule";
 
 function game(opts: Partial<ScheduledGame> & { gamePk: number; gameDate: string }): ScheduledGame {
   return {
     gamePk: opts.gamePk,
     gameDate: opts.gameDate,
+    officialDate: opts.officialDate ?? opts.gameDate.slice(0, 10),
     abstractGameState: opts.abstractGameState ?? "Preview",
     detailedState: opts.detailedState ?? "Scheduled",
     awayTeam: opts.awayTeam ?? { id: 1, name: "Away" },

@@ -1,8 +1,8 @@
 import { sleepMs, isAbortError } from "./lib/sleep";
 import { withRetry } from "./lib/with-retry";
 import { runWatcher } from "./run-watcher";
-import { fetchScheduleStep, type ScheduledGame } from "../workflows/steps/fetch-schedule";
-import { seedSnapshotStep } from "../workflows/steps/seed-snapshot";
+import { fetchScheduleStep, type ScheduledGame } from "./steps/fetch-schedule";
+import { seedSnapshotStep } from "./steps/seed-snapshot";
 import { pruneStaleSnapshots } from "./lib/prune-snapshots";
 import { todayInTz } from "../lib/utils";
 import { log } from "../lib/log";

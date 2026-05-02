@@ -6,7 +6,6 @@ export async function loadParkFactorStep(opts: {
   homeTeamName: string;
   season: number;
 }): Promise<{ runFactor: number; components: ParkComponentFactors }> {
-  "use step";
   const { gamePk, homeTeamName, season } = opts;
   log.info("step", "loadParkFactor:start", { gamePk, homeTeamName, season });
   const [runFactor, components] = await Promise.all([

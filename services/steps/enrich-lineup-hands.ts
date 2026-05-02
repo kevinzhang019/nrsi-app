@@ -30,7 +30,6 @@ export async function enrichLineupHandsStep(opts: {
   gamePk: number;
   lineups: Lineups;
 }): Promise<Lineups> {
-  "use step";
   const { gamePk, lineups } = opts;
   const ids = collectIds(lineups);
   log.info("step", "enrichLineupHands:start", { gamePk, n: ids.length });

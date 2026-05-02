@@ -12,7 +12,6 @@ export async function loadWeatherStep(opts: {
   awayTeam: string;
   homeTeam: string;
 }): Promise<{ info: WeatherInfo; factor: number; components: WeatherComponentFactors }> {
-  "use step";
   const { gamePk, awayTeam, homeTeam } = opts;
   log.info("step", "loadWeather:start", { gamePk, awayTeam, homeTeam });
   const info = await loadWeather(gamePk, awayTeam, homeTeam);

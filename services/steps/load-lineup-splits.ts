@@ -7,7 +7,6 @@ export async function loadLineupSplitsStep(opts: {
   pitcherId: number;
   batterIds: number[];
 }): Promise<{ pitcher: PitcherPaProfile; batters: BatterPaProfile[] }> {
-  "use step";
   const { gamePk, pitcherId, batterIds } = opts;
   log.info("step", "loadLineupSplits:start", { gamePk, pitcherId, n: batterIds.length });
   const [pitcher, ...batters] = await Promise.all([

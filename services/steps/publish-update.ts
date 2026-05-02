@@ -3,7 +3,6 @@ import { log } from "@/lib/log";
 import type { GameState } from "@/lib/state/game-state";
 
 export async function publishUpdateStep(state: GameState): Promise<void> {
-  "use step";
   log.info("step", "publishUpdate:start", { gamePk: state.gamePk, status: state.status });
   await publishGameState(state);
   log.info("step", "publishUpdate:ok", { gamePk: state.gamePk });

@@ -5,7 +5,6 @@ import type { GameState } from "@/lib/state/game-state";
 import type { ScheduledGame } from "./fetch-schedule";
 
 export async function seedSnapshotStep(games: ScheduledGame[]): Promise<{ seeded: number }> {
-  "use step";
   log.info("step", "seedSnapshot:start", { count: games.length });
   const r = redis();
   const now = new Date().toISOString();
@@ -43,6 +42,7 @@ export async function seedSnapshotStep(games: ScheduledGame[]): Promise<{ seeded
       nextHalfLeadoffId: null,
       updatedAt: now,
       startTime: g.gameDate,
+      officialDate: g.officialDate,
     };
     const wrote = await r.hsetnx(k.snapshot(), String(g.gamePk), JSON.stringify(stub));
     if (wrote === 1) seeded += 1;

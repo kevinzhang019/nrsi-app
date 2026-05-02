@@ -1,4 +1,3 @@
-import { withWorkflow } from "workflow/next";
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
@@ -6,4 +5,4 @@ const nextConfig: NextConfig = {
   serverExternalPackages: ["cheerio"],
 };
 
-export default withWorkflow(nextConfig);
+export default nextConfig;

@@ -9,8 +9,8 @@
 // Usage: npx tsx bin/seed-once.ts [--date 2026-05-02]
 
 import "../services/lib/load-env";
-import { fetchScheduleStep } from "../workflows/steps/fetch-schedule";
-import { seedSnapshotStep } from "../workflows/steps/seed-snapshot";
+import { fetchScheduleStep } from "../services/steps/fetch-schedule";
+import { seedSnapshotStep } from "../services/steps/seed-snapshot";
 import { todayInTz } from "../lib/utils";
 import { log } from "../lib/log";
 

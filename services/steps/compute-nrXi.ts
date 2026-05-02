@@ -49,7 +49,6 @@ export async function computeNrXiStep(opts: {
   catcherId?: number | null;
   fielderIds?: number[]; // 7 non-battery fielders
 }): Promise<NrXiResult> {
-  "use step";
   const {
     gamePk,
     pitcher,
