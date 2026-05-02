@@ -1,11 +1,22 @@
 "use client";
 
+import { createContext, useContext, type ReactNode } from "react";
 import type { TeamLineup } from "@/lib/mlb/extract";
 import { cn } from "@/lib/utils";
 
 type Marker = "current" | "next" | null;
 
 export type BatterStats = { pReach: number; xSlg: number };
+
+export const SuppressPlayerLinksContext = createContext(false);
+
+export function SuppressPlayerLinks({ children }: { children: ReactNode }) {
+  return (
+    <SuppressPlayerLinksContext.Provider value={true}>
+      {children}
+    </SuppressPlayerLinksContext.Provider>
+  );
+}
 
 function formatBatterDisplayName(name: string): string {
   const trimmed = name.trim();
@@ -41,6 +52,7 @@ export function LineupColumn({
   const headerAlign = align === "right" ? "text-right" : "text-left";
   const isCurrentColumn = highlightKind === "current";
   const isNextColumn = highlightKind === "next";
+  const suppressLinks = useContext(SuppressPlayerLinksContext);
 
   const renderStats = (id: number) => {
     const s = statsById?.get(id);
@@ -97,20 +109,34 @@ export function LineupColumn({
                     <span className="w-4 font-mono text-[10px] uppercase tabular-nums text-[var(--color-muted)]">
                       {slot.starter.bats ?? "—"}
                     </span>
-                    <a
-                      href={mlbPlayerUrl(slot.starter.id)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className={cn(
-                        "text-[12px] hover:underline underline-offset-2",
-                        starterIsAccent
-                          ? "text-[var(--color-accent)] font-medium"
-                          : "text-[var(--color-fg)]/90",
-                      )}
-                      title={slot.starter.name}
-                    >
-                      {formatBatterDisplayName(slot.starter.name)}
-                    </a>
+                    {suppressLinks ? (
+                      <span
+                        className={cn(
+                          "text-[12px]",
+                          starterIsAccent
+                            ? "text-[var(--color-accent)] font-medium"
+                            : "text-[var(--color-fg)]/90",
+                        )}
+                        title={slot.starter.name}
+                      >
+                        {formatBatterDisplayName(slot.starter.name)}
+                      </span>
+                    ) : (
+                      <a
+                        href={mlbPlayerUrl(slot.starter.id)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className={cn(
+                          "text-[12px] hover:underline underline-offset-2",
+                          starterIsAccent
+                            ? "text-[var(--color-accent)] font-medium"
+                            : "text-[var(--color-fg)]/90",
+                        )}
+                        title={slot.starter.name}
+                      >
+                        {formatBatterDisplayName(slot.starter.name)}
+                      </a>
+                    )}
                     {renderStats(slot.starter.id)}
                   </div>
                   {slot.subs.map((sub) => {
@@ -128,21 +154,36 @@ export function LineupColumn({
                         <span className="w-4 font-mono text-[10px] uppercase tabular-nums text-[var(--color-muted)]/70">
                           {sub.bats ?? "—"}
                         </span>
-                        <a
-                          href={mlbPlayerUrl(sub.id)}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className={cn(
-                            "text-[11px] hover:underline underline-offset-2",
-                            subIsAccent
-                              ? "text-[var(--color-accent)] font-medium"
-                              : "text-[var(--color-fg)]/90",
-                          )}
-                          title={sub.name}
-                        >
-                          <span className="mr-1 text-[var(--color-muted)]/60">↳</span>
-                          {formatBatterDisplayName(sub.name)}
-                        </a>
+                        {suppressLinks ? (
+                          <span
+                            className={cn(
+                              "text-[11px]",
+                              subIsAccent
+                                ? "text-[var(--color-accent)] font-medium"
+                                : "text-[var(--color-fg)]/90",
+                            )}
+                            title={sub.name}
+                          >
+                            <span className="mr-1 text-[var(--color-muted)]/60">↳</span>
+                            {formatBatterDisplayName(sub.name)}
+                          </span>
+                        ) : (
+                          <a
+                            href={mlbPlayerUrl(sub.id)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className={cn(
+                              "text-[11px] hover:underline underline-offset-2",
+                              subIsAccent
+                                ? "text-[var(--color-accent)] font-medium"
+                                : "text-[var(--color-fg)]/90",
+                            )}
+                            title={sub.name}
+                          >
+                            <span className="mr-1 text-[var(--color-muted)]/60">↳</span>
+                            {formatBatterDisplayName(sub.name)}
+                          </a>
+                        )}
                         {renderStats(sub.id)}
                       </div>
                     );

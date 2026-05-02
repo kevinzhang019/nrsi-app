@@ -137,6 +137,7 @@ Each line is a load-bearing invariant. Where there's deeper context, the parenth
 - `BasesDiamond` `fill-[var(--color-accent)]` ↔ `fill-transparent` swap (NOT `fill-none`) — without `fill-transparent`, ancestor focus surfaces the SVG default fill = black (UI.md → Bases diamond)
 - `LineupColumn`'s empty-string label suppression — lets `<LineupSinglePane>` reuse the column without a duplicate header (UI.md → Settings panel)
 - Single-pane `selectedSide` state lives in `GameCard`, not `LineupSinglePane` — both pitcher row and lineup pane derive from it (UI.md → Pitcher row)
+- `SuppressPlayerLinksContext` in `components/lineup-column.tsx` — `<HistoricalCardLink>` wraps the whole `<GameCard>` in a Next `<Link>` (renders as `<a>`); without the suppression context, the inner player/pitcher `<a>` tags produce nested-`<a>` hydration errors. `LineupColumn` and `PitcherRow` swap to `<span>` when the context flag is true (UI.md → History page)
 
 **Math / display:**
 - `xSlg` field on `NrXiPerBatter` / `PerBatter` — denominator deliberately strips BB+HBP (`1 - bb - hbp`) so the result lines up with conventional baseball-card SLG, not bases-per-PA (UI.md → Lineup row)
