@@ -15,11 +15,12 @@ The supervisor service runs at:
 
 Tail logs from the Railway dashboard → service → Logs. Logs are structured JSON, one line per event. Useful filter terms:
 - `scope:supervisor` — supervisor lifecycle (`start`, `schedule`, `seeded`, `idle-deadline`, `idle-exit`, `aborted`).
-- `scope:watcher` — per-game watcher events (`start`, `tick`, `final`, `lock-held-by-other`, `max-loops`, `max-runtime`).
+- `scope:watcher` — per-game watcher events (`start`, `tick`, `final`, `lock-held-by-other`, `max-loops`, `max-runtime`, `loop:error`, `graceful-exit:finalized`, `graceful-exit:abandoned`, `graceful-exit:skipped`).
 - `scope:step` — individual step calls (`fetchSchedule:ok`, `seedSnapshot:ok`, `publishUpdate:ok`, `persistFinishedGame:ok`, etc.).
 - `scope:retry` — `withRetry` exponential-backoff events.
 - `scope:lock` — acquire / refresh / failure events.
 - `scope:prune` — snapshot prune step output.
+- `scope:stale-live-detector` — supervisor's idle-loop snapshot scanner. `pass {total, staleLive, cleaned}` summary; `cleaning {gamePk, lastInning, lastHalf, ageMs}` per cleaned entry.
 
 JSON shape: `{t, level, scope, msg, ...payload}`. `gamePk` is in payload for per-game events.
 
@@ -53,8 +54,28 @@ Common log signatures to watch for:
 - `lock-held-by-other` — a second watcher tried to spawn for a `gamePk` that already had one. Expected on manual triggers overlapping with cron.
 - `prune:snapshots {deleted: N}` where `N > 0` — supervisor cleaned a row whose `officialDate` was older than today (ET). Healthy on the first cron firing after a day rollover; unhealthy if it keeps reporting `deleted > 0` within the same ET day (see [BUGS.md](BUGS.md) bug #9). On a same-day rerun, `deleted` should be 0 — non-zero suggests rows were written without `officialDate` and the parse-tolerance silently kept them yesterday.
 - `watcher:final {plays: N}` and `step persistFinishedGame:start {plays: N}` — emitted on a game's Final exit. `N` is the count of completed plate appearances captured from `liveData.plays.allPlays`. Healthy range: ~70–90 for a 9-inning game, more for extras. `plays: 0` on a real Final game means either the live feed dropped `allPlays` (rare; refetch + replay via the backfill path) or the migration `0003_plays.sql` hasn't been applied yet.
+- `watcher:graceful-exit:abandoned {reason, lastInning, lastHalf}` — watcher hit a non-Final exit (`max-loops` / `max-runtime` / `abort` / `error`) AND the final feed fetch still showed Live, so we republished a synthetic Final to unfreeze the dashboard. Expected occasionally on container redeploys (`reason: "abort"`); a sustained pattern with `reason: "max-loops"` or `reason: "max-runtime"` suggests games are running longer than the budget — see [BUGS.md](BUGS.md) bug #11.
+- `watcher:graceful-exit:finalized {reason, plays, innings}` — watcher exited via a non-Final path but the final feed fetch caught the Final flip; ran the full persist path. Healthy.
+- `watcher:loop:error` — uncaught throw from a step. Followed by `graceful-exit:*`. Investigate the root cause; recurring errors in the same `gamePk` mean the next supervisor spawn will hit the same step and exit again.
+- `stale-live-detector:cleaning {gamePk, ageMs}` — the supervisor scanner found a snapshot whose lock is gone and `updatedAt` is stale. Republished synthetic Final. A burst of these right after a Railway redeploy is expected (in-process `gracefulExit` couldn't run for everyone). Sustained / non-deploy-correlated `cleaning` events suggest a class of watcher kill that bypasses both gracefulExit and the lock refresher (process OOM most likely).
 
 ---
+
+## Recovering from a stuck-Live snapshot
+
+If a game shows on the dashboard as "Live" with stale data (no recent `updatedAt`, frozen inning), the watcher exited without publishing Final. Three layers of recovery, in order of effort:
+
+1. **Wait one supervisor idle pass (≤ 60s).** The supervisor calls `detectAndCleanStaleLive` every `IDLE_CHECK_INTERVAL_MS` while watchers are pending. Any snapshot with `status === "Live"` AND missing lock AND `updatedAt > 60s ago` gets a synthetic Final published automatically. Watch for `stale-live-detector:cleaning` log lines.
+
+2. **Manual hdel** — only if the supervisor isn't running (off-season, container scaled to zero):
+
+   ```bash
+   set -a; source .env.local; set +a
+   curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" \
+     "$KV_REST_API_URL/hdel/nrxi:snapshot/<gamePk>"
+   ```
+
+3. **Wait for tomorrow's cron firing.** `pruneStaleSnapshots` deletes any row whose `officialDate < todayET`, so all of yesterday's stuck-Live entries get wiped at the next 12:00 UTC supervisor boot. Cheapest, slowest.
 
 ## Recovering from a stuck watcher
 

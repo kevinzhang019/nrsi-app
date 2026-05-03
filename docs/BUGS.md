@@ -246,3 +246,53 @@ Also keeps Bug 9's original guarantee: zombies from a paused/crashed prior runti
 - The discriminator must be the row's own `officialDate`, not today's schedule pk list. Reintroducing the pk-list form re-opens this bug.
 - The conservative parse-failure behavior. Strict mode (delete on parse failure) reintroduces the "transient deserialization wipes the hash" risk.
 - The supervisor passing its own `date` as `todayET`. Letting prune compute its own clock independently can drift if the supervisor was started near a midnight rollover.
+
+---
+
+## Bug 11: Snapshots stuck "Live" at varying innings after a watcher exits without cleanup
+
+**Symptom:** the dashboard's Active section showed multiple "Live" games whose state hadn't updated for hours — Phillies @ Marlins frozen at 9 Top 7-2, Giants @ Rays frozen at 9 Top 1-1, Orioles @ Yankees frozen at 6 Bot 3-4, etc. `npx tsx bin/inspect-snapshot.ts` confirmed 8 entries with `status: "Live"` but `updatedAt` 1-3 hours ago, and `nrxi:lock:{gamePk}` was empty for all of them. Other (still-active) watchers were running normally for the late-evening games — only the early-PM games' watchers had vanished.
+
+The frozen innings varied (6th, 7th, 9th), which ruled out an "all watchers hit MAX_LOOPS at the 9th" hypothesis: a watcher at the 6th inning has been alive for ~80 minutes, nowhere near the old 1500-loop cap (≈2h at 5s/loop).
+
+**Root cause:** the watcher had **four** non-Final exit paths in `services/run-watcher.ts`, all of which `return`ed without publishing a Final status, calling `persistFinishedGameStep`, or deleting the snapshot field:
+
+1. **`MAX_LOOPS`** (the 1500 cap) — `log.warn(...); return { reason: "max-loops" };` at the bottom of the loop. At 5s/loop active-PA cadence this fires after ≈2h, well within the runtime of a normal 9-inning game.
+2. **`MAX_RUNTIME_MS`** (the 6h wall-clock cap) — same shape: `log.warn(...); return { reason: "max-runtime" };`.
+3. **Abort signal (SIGTERM)** — both the top-of-loop `if (signal?.aborted) return { reason: "aborted" };` and the `await sleepMs(...)` catch. When Railway redeploys or kills the container, every in-flight watcher fires this path and freezes its snapshot.
+4. **Uncaught error** — any thrown step (Redis hiccup, MLB API parse error, etc.) propagated up to `services/supervisor.ts:138` which logged and removed from `pending`. The watcher exited, snapshot froze.
+
+Plus a fifth scenario the in-process code can't catch: **process kill** (SIGKILL, OOM, container eviction) — no JS code runs at all.
+
+There was also a **secondary cascade**: when a new supervisor restarted seconds after a kill (e.g., manual deploy), the `acquireWatcherLock` call for early-PM games returned `false` because the dead watcher's lock still had ~30s TTL remaining. The new watcher returned `{ reason: "lock-held" }` immediately and the supervisor never retried. By the time the lock expired naturally, the supervisor had moved on.
+
+The dashboard reads from `nrxi:snapshot` (a Redis hash with 24h TTL that gets reset to 24h on every `publishGameState` call). Once a watcher dies, nothing republishes that field, but `pruneStaleSnapshots` only deletes rows where `officialDate < todayET` — so today's stuck-Live snapshots survive until tomorrow's supervisor cron at 12:00 UTC.
+
+**Fix:** two complementary layers.
+
+**Layer 1 — in-process gracefulExit** (`services/lib/finalize-game.ts:performGracefulExit`). New helper called from all four non-Final exit paths. Captures the last successfully-published state (hoisted `lastPublishedState: GameState | null` set after each `publishUpdateStep`), does one final `fetchLiveDiff` (best-effort, never throws), then:
+
+- If MLB has flipped to Final → run the existing Final logic (`buildPlayRows` + `persistFinishedGameStep` + `clearWatcherState`). Common case: MLB lags a few minutes between actual game end and flipping the status field.
+- Otherwise → republish `{ ...lastPublishedState, status: "Final" }` so the dashboard moves the game out of Active. Doesn't call `persistFinishedGame` here because we don't have a verified terminal feed and don't want to write half-baked rows into the archive.
+- If `lastPublishedState` is null (watcher never reached its first publish) → log and skip.
+
+The main loop body in `services/run-watcher.ts` is wrapped in a single try/catch so any thrown step routes into `gracefulExit("error")` instead of bubbling to the supervisor. The two abort returns (top-of-loop and sleep-catch) also call `gracefulExit("abort")` first.
+
+`MAX_LOOPS` was also bumped from 1500 to 5000 (≈7h at 5s/loop) so normal games never hit the budget. The 6h wall-clock `MAX_RUNTIME_MS` is the real ceiling now; MAX_LOOPS is just a defense against tight-loop bugs.
+
+**Layer 2 — supervisor stale-Live detector** (`services/lib/stale-live-detector.ts:detectAndCleanStaleLive`). Called every `IDLE_CHECK_INTERVAL_MS` (60s) from the supervisor's idle loop. Scans `nrxi:snapshot`, and for each entry where `status === "Live"` AND `nrxi:lock:{gamePk}` is missing AND `updatedAt > 60s ago`, republishes a synthetic `{ ...state, status: "Final" }`. The lock check is the load-bearing signal — `startLockRefresher` keeps the lock fresh every 10s while a watcher is alive, so `lock missing === watcher dead`. The 60s threshold is just a safety margin against the brief publish/exit race within a single tick.
+
+This is the only defense against the process-kill scenarios where no in-process code can run. It also unblocks the secondary lock-held cascade: even if a new supervisor returns "lock-held" for an early-PM game, the next idle pass cleans the orphaned snapshot within 60s of the dead watcher's lock expiring.
+
+**Regression check:**
+- `services/lib/finalize-game.test.ts` — covers all three outcomes (`finalized` / `abandoned` / `skipped`) plus all four exit reasons.
+- `services/lib/stale-live-detector.test.ts` — covers active-lock guard, threshold guard, status filter, malformed entries, mixed snapshots, hgetall/getLock failures, custom thresholds.
+- `services/supervisor.test.ts` — periodic detector invocation while watchers pending, and detector throwing doesn't crash the supervisor.
+
+**Don't change without thinking:**
+- Hoisted `lastPublishedState` set after every successful `publishUpdateStep`. Folding into loop scope, or moving the assignment before the publish, breaks the synthetic-Final reconstruction.
+- `gracefulExit` wired to all four non-Final exit paths (`max-loops`, `max-runtime`, `abort`, `error`). Removing it from any one path reintroduces stuck-Live snapshots for that exit class.
+- The main loop body's try/catch — folding it back into per-step error handling means an uncaught step propagates to the supervisor without cleanup.
+- The stale-Live detector's `lock missing === watcher dead` premise. Any change to lock TTL (currently 30s) or refresher cadence (currently 10s in `services/lib/lock.ts`) must keep that invariant. If both move toward `TTL ≈ refresh interval`, a healthy watcher can briefly look "dead" between refreshes and the detector will false-positive-clean it.
+- The 60s `DEFAULT_STALE_AFTER_MS`. Raising it delays cleanup; lowering it risks racing the publish/exit gap inside a single tick. Don't try to use it to cover Delayed/Suspended games (300s polling) — those still have a live lock and the lock check filters them out before the threshold matters.
+- The detector running BEFORE the sleep but AFTER the break checks in `services/supervisor.ts`. Moving it before the break would run it on past-deadline supervisors (no Live games to clean — wasted call). Moving it after the sleep delays first-pass cleanup by 60s.

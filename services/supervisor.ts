@@ -4,6 +4,11 @@ import { runWatcher } from "./run-watcher";
 import { fetchScheduleStep, type ScheduledGame } from "./steps/fetch-schedule";
 import { seedSnapshotStep } from "./steps/seed-snapshot";
 import { pruneStaleSnapshots } from "./lib/prune-snapshots";
+import {
+  detectAndCleanStaleLive,
+  defaultStaleLiveCleanDeps,
+  type StaleLiveCleanResult,
+} from "./lib/stale-live-detector";
 import { todayInTz } from "../lib/utils";
 import { log } from "../lib/log";
 
@@ -34,6 +39,11 @@ export type SupervisorOpts = {
     deleted: number;
   }>;
   runWatcherFn?: typeof runWatcher;
+  // Override for tests — defaults to scanning the snapshot hash for
+  // dead-watcher entries (status=Live, no lock, stale updatedAt) and
+  // republishing a synthetic Final. The default closes over real Redis +
+  // publisher; tests can supply a stub that records calls.
+  detectStaleLiveFn?: () => Promise<StaleLiveCleanResult>;
   // Override for tests — defaults to "tomorrow at 06:00 UTC". Returning a Date
   // lets tests synthesise a deadline in the very-near future to verify the
   // idle-exit logic without sleeping for hours.
@@ -72,6 +82,8 @@ export async function runSupervisor(opts: SupervisorOpts = {}): Promise<{
   const seedSnapshot = opts.seedSnapshotFn ?? ((g: ScheduledGame[]) => seedSnapshotStep(g));
   const pruneSnapshotsFn = opts.pruneStaleSnapshotsFn ?? pruneStaleSnapshots;
   const runWatcherImpl = opts.runWatcherFn ?? runWatcher;
+  const detectStaleLive =
+    opts.detectStaleLiveFn ?? (() => detectAndCleanStaleLive({}, defaultStaleLiveCleanDeps()));
   const computeIdleDeadline = opts.computeIdleDeadlineFn ?? defaultIdleDeadline;
   const idleInterval = opts.idleCheckIntervalMs ?? IDLE_CHECK_INTERVAL_MS;
   const signal = opts.signal;
@@ -162,6 +174,15 @@ export async function runSupervisor(opts: SupervisorOpts = {}): Promise<{
     if (pending.size === 0 && Date.now() >= deadline.getTime()) {
       log.info("supervisor", "idle-exit", { date });
       break;
+    }
+    // Catch dead-watcher snapshots (process kill, OOM, anything that
+    // skipped the in-process gracefulExit path). Best-effort — never
+    // throws out; a transient Redis hiccup just means we'll catch it on
+    // the next pass. Cheap (one HGETALL + one GET per stale entry).
+    try {
+      await detectStaleLive();
+    } catch (err) {
+      log.warn("supervisor", "stale-live-detector:fail", { err: String(err) });
     }
     try {
       await sleepMs(idleInterval, signal);

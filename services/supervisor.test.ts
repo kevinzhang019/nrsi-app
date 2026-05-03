@@ -36,12 +36,14 @@ describe("runSupervisor", () => {
     const fetchScheduleFn = vi.fn().mockResolvedValue([]);
     const seedSnapshotFn = vi.fn().mockResolvedValue({ seeded: 0 });
     const pruneStaleSnapshotsFn = vi.fn().mockResolvedValue({ total: 0, kept: 0, deleted: 0 });
+    const detectStaleLiveFn = vi.fn().mockResolvedValue({ total: 0, staleLive: 0, cleaned: 0 });
     const runWatcherFn = vi.fn();
     const result = await runSupervisor({
       date: "2026-04-15",
       fetchScheduleFn,
       seedSnapshotFn,
       pruneStaleSnapshotsFn,
+      detectStaleLiveFn,
       runWatcherFn,
       // Past deadline so the very first idle check exits.
       computeIdleDeadlineFn: () => new Date(Date.now() - 1000),
@@ -69,6 +71,7 @@ describe("runSupervisor", () => {
       fetchScheduleFn: vi.fn().mockResolvedValue(games),
       seedSnapshotFn: vi.fn().mockResolvedValue({ seeded: 2 }),
       pruneStaleSnapshotsFn: vi.fn().mockResolvedValue({ total: 0, kept: 0, deleted: 0 }),
+      detectStaleLiveFn: vi.fn().mockResolvedValue({ total: 0, staleLive: 0, cleaned: 0 }),
       runWatcherFn,
       computeIdleDeadlineFn: () => new Date(Date.now() - 1000),
       idleCheckIntervalMs: 5,
@@ -94,6 +97,7 @@ describe("runSupervisor", () => {
       fetchScheduleFn: vi.fn().mockResolvedValue(games),
       seedSnapshotFn: vi.fn().mockResolvedValue({ seeded: 1 }),
       pruneStaleSnapshotsFn: vi.fn().mockResolvedValue({ total: 0, kept: 0, deleted: 0 }),
+      detectStaleLiveFn: vi.fn().mockResolvedValue({ total: 0, staleLive: 0, cleaned: 0 }),
       runWatcherFn,
       // Past deadline so the only thing keeping us alive is `pending.size > 0`.
       computeIdleDeadlineFn: () => new Date(Date.now() - 1000),
@@ -121,12 +125,70 @@ describe("runSupervisor", () => {
       fetchScheduleFn: vi.fn().mockResolvedValue([]),
       seedSnapshotFn: vi.fn().mockResolvedValue({ seeded: 0 }),
       pruneStaleSnapshotsFn,
+      detectStaleLiveFn: vi.fn().mockResolvedValue({ total: 0, staleLive: 0, cleaned: 0 }),
       runWatcherFn: vi.fn(),
       computeIdleDeadlineFn: () => new Date(Date.now() - 1000),
       idleCheckIntervalMs: 5,
     });
     expect(pruneStaleSnapshotsFn).toHaveBeenCalledTimes(1);
     expect(pruneStaleSnapshotsFn).toHaveBeenCalledWith({ todayET: "2026-05-02" });
+  });
+
+  it("invokes detectStaleLive on every idle-loop tick while watchers are pending", async () => {
+    // Watcher that holds the loop open via a pending promise we resolve later.
+    let resolveWatcher: () => void = () => {};
+    const watcherPromise = new Promise<{ reason: "final" }>((resolve) => {
+      resolveWatcher = () => resolve({ reason: "final" });
+    });
+    const games = [
+      game({ gamePk: 500, gameDate: new Date(Date.now() - 1000).toISOString() }),
+    ];
+    const detectStaleLiveFn = vi.fn().mockResolvedValue({ total: 0, staleLive: 0, cleaned: 0 });
+
+    const supervisorPromise = runSupervisor({
+      date: "2026-04-15",
+      fetchScheduleFn: vi.fn().mockResolvedValue(games),
+      seedSnapshotFn: vi.fn().mockResolvedValue({ seeded: 1 }),
+      pruneStaleSnapshotsFn: vi.fn().mockResolvedValue({ total: 0, kept: 0, deleted: 0 }),
+      detectStaleLiveFn,
+      runWatcherFn: vi.fn().mockReturnValue(watcherPromise),
+      computeIdleDeadlineFn: () => new Date(Date.now() - 1000),
+      idleCheckIntervalMs: 5,
+    });
+
+    // Let the idle loop tick a few times (each tick ≥ idleCheckIntervalMs).
+    await new Promise((r) => setTimeout(r, 30));
+    expect(detectStaleLiveFn.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+    resolveWatcher();
+    await supervisorPromise;
+  });
+
+  it("does not crash the supervisor when detectStaleLive throws", async () => {
+    let resolveWatcher: () => void = () => {};
+    const watcherPromise = new Promise<{ reason: "final" }>((resolve) => {
+      resolveWatcher = () => resolve({ reason: "final" });
+    });
+    const games = [
+      game({ gamePk: 600, gameDate: new Date(Date.now() - 1000).toISOString() }),
+    ];
+
+    const supervisorPromise = runSupervisor({
+      date: "2026-04-15",
+      fetchScheduleFn: vi.fn().mockResolvedValue(games),
+      seedSnapshotFn: vi.fn().mockResolvedValue({ seeded: 1 }),
+      pruneStaleSnapshotsFn: vi.fn().mockResolvedValue({ total: 0, kept: 0, deleted: 0 }),
+      detectStaleLiveFn: vi.fn().mockRejectedValue(new Error("redis blew up")),
+      runWatcherFn: vi.fn().mockReturnValue(watcherPromise),
+      computeIdleDeadlineFn: () => new Date(Date.now() - 1000),
+      idleCheckIntervalMs: 5,
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+    resolveWatcher();
+    const result = await supervisorPromise;
+    // Supervisor should still idle-exit normally even after the detector throws.
+    expect(result).toEqual({ scheduled: 1, reason: "idle" });
   });
 
   it("aborts via signal even when watchers are still running", async () => {
@@ -146,6 +208,7 @@ describe("runSupervisor", () => {
       fetchScheduleFn: vi.fn().mockResolvedValue(games),
       seedSnapshotFn: vi.fn().mockResolvedValue({ seeded: 1 }),
       pruneStaleSnapshotsFn: vi.fn().mockResolvedValue({ total: 0, kept: 0, deleted: 0 }),
+      detectStaleLiveFn: vi.fn().mockResolvedValue({ total: 0, staleLive: 0, cleaned: 0 }),
       runWatcherFn,
       // Far-future deadline so only abort can end the supervisor.
       computeIdleDeadlineFn: () => new Date(Date.now() + 60 * 60 * 1000),

@@ -98,7 +98,7 @@ One async task per gamePk, lives inside the supervisor process. Receives `{ game
 1. Acquire `nrxi:lock:{gamePk}` (30s TTL via `services/lib/lock.ts:acquireWatcherLock`). If held by another, exit with `{ reason: "lock-held" }`.
 2. Start background `setInterval` refreshing the lock every 10s via `startLockRefresher`. Stops on watcher exit or parent process abort.
 3. Hydrate hoisted state from `nrxi:watcher-state:{gamePk}` (`services/lib/watcher-state.ts:loadWatcherState`). On first start this returns an empty state; on a process restart we recover `capturedInnings` and the last-published view. Trigger keys (`structuralKey`, `playStateKey`) are deliberately NOT persisted — the first tick after restart unconditionally fires Phase 1 reload to rebuild caches.
-4. Loop up to `MAX_LOOPS = 1500` AND `Date.now() - startedAt < 6h`:
+4. Loop up to `MAX_LOOPS = 5000` AND `Date.now() - startedAt < 6h`. Loop body wrapped in try/catch so any uncaught throw routes into `gracefulExit("error")` instead of bubbling:
    - `fetchLiveDiffStep` with last seen `metaData.timeStamp` for tiny diff payloads.
    - Build `structuralKey` (half | inning | lineup | defense | opposing pitcher | atBat batter | bottom-9-skipped flag) and `playStateKey` (outs | bases | atBatIndex). Set `shouldReloadStructure` and `shouldRecomputePlay` triggers.
    - **Phase 1 (structural reload):** parallel fetch `loadLineupSplitsStep`, `loadParkFactorStep`, `loadWeatherStep`, `loadDefenseStep`. Compute display lineup stats for both teams. Pre-compute opposite-half clean-state P(no run) for full-inning composition (skipped at top-9 when the home team is leading — see `services/full-inning.ts:shouldSkipBottomNinth`; the score is part of `structuralKey` so a tying run mid-top-9 forces a reload). Persist to hoisted `lastNrXi`, `lastEnv`, `lastPitcher*`, `lastLineupStats`, etc. Also kick off `prewarmBenchAndBullpenStep` **fire-and-forget** (`void`-prefixed, not awaited) — it loads handedness + per-PA splits for every bench hitter and bullpen pitcher on both teams so a future pinch-hit / relief change is a pure Redis hit instead of a critical-path MLB Stats API round-trip.
@@ -109,7 +109,15 @@ One async task per gamePk, lives inside the supervisor process. Receives `{ game
    - If `status === "Final"`: call `buildPlayRows(tick.feed, gamePk)` (pure transform of `liveData.plays.allPlays` — completed PAs only, with names resolved from boxscore), then `persistFinishedGameStep` (Supabase upsert of `games` + `inning_predictions` + `plays`), `clearWatcherState`, return `{ reason: "final" }`. Per-play capture is **post-game only**, not per-tick — terminal feed already has the full play log, and history-only data shouldn't inflate `saveWatcherState` writes.
    - Adaptive sleep: 5s during active PAs, 15s otherwise (Live), 30s Pre, 300s Delayed/Suspended. See `services/steps/fetch-live-diff.ts:chooseRecommendedWaitSeconds`.
 
+5. Non-Final exits (`max-loops`, `max-runtime`, `abort` from SIGTERM, `error` from any uncaught throw) all call `services/lib/finalize-game.ts:performGracefulExit` first. The helper does one final feed fetch: if MLB has flipped to Final → run the same Final logic as step 4 (persist + clear watcher state). Otherwise → republish `{ ...lastPublishedState, status: "Final" }` so the dashboard moves the game out of Active. Best-effort, never throws. Hoisted `lastPublishedState: GameState | null` (set after every successful `publishUpdateStep`) is the source for the synthetic state.
+
 The core probability pipeline (Log5 → env → TTOP → framing → defense → 24-state Markov → calibrate) lives in `lib/prob/*` and is unchanged from the WDK days. See [`PROBABILITY_MODEL.md`](PROBABILITY_MODEL.md).
+
+#### Supervisor stale-Live detector
+
+Process kills (SIGKILL, OOM, container eviction) bypass `gracefulExit` because no JS code runs at all. The supervisor's idle loop calls `services/lib/stale-live-detector.ts:detectAndCleanStaleLive` every `IDLE_CHECK_INTERVAL_MS` (60s) as the second-line defense. It scans `nrxi:snapshot` for entries where `status === "Live"` AND `nrxi:lock:{gamePk}` is missing AND `updatedAt > 60s ago`, and republishes a synthetic `{ ...state, status: "Final" }` for each.
+
+The `lock missing === watcher dead` premise is load-bearing: `startLockRefresher` keeps a healthy watcher's lock fresh every 10s (TTL 30s), so any missing lock means the in-process watcher is gone. The 60s `updatedAt` threshold is just a safety margin against the brief publish/exit gap inside a single tick. See [BUGS.md bug #11](BUGS.md#bug-11-snapshots-stuck-live-at-varying-innings-after-a-watcher-exits-without-cleanup).
 
 #### `services/lib/*` — primitives
 
@@ -120,6 +128,8 @@ The core probability pipeline (Log5 → env → TTOP → framing → defense →
 | `lock.ts` | `workflows/steps/lock.ts` | acquire (30s TTL) + background refresher every 10s |
 | `watcher-state.ts` | WDK hoisted-var durability | JSON serialize hoisted vars to Redis per tick |
 | `prune-snapshots.ts` | (new) | hdel snapshot field-keys whose row's own `officialDate < todayET` |
+| `finalize-game.ts` | (new) | `performGracefulExit` + `buildSyntheticFinalState` — best-effort cleanup on every non-Final watcher exit (`max-loops`, `max-runtime`, `abort`, `error`) |
+| `stale-live-detector.ts` | (new) | `detectAndCleanStaleLive` — supervisor idle-loop scanner that catches dead-watcher snapshots whose process never ran cleanup (SIGKILL, OOM) |
 | `load-env.ts` | Next.js auto-load of `.env.local` | tsx doesn't auto-load it; bin/* scripts import this first |
 
 #### `services/steps/*` — plain async helpers
@@ -187,6 +197,12 @@ Pre-built ballpark silhouette data, generated once at build time.
 - `team-to-venue.ts` — team slug → venueId map.
 - Refresh via `npm run build:park-shapes`.
 
+#### `lib/teams/`
+Team logo asset path + metadata.
+- `logo.ts` — `teamLogoSrc(teamId): string` returning `/logos/{id}.svg`. Single source of truth used by `<GameCard>` header and `<LineScore>` row labels.
+- `team-meta.json` — keyed by MLB teamId. Each entry has `{ name, abbreviation, teamCode }`. Written alongside the SVGs.
+- Refresh via `npm run build:team-logos` — `scripts/fetch-team-logos.mjs` pulls the 30 active MLB teams from `statsapi.mlb.com/api/v1/teams?sportId=1` and downloads each `https://www.mlbstatic.com/team-logos/{id}.svg` into `public/logos/`. SVGs and the JSON manifest are committed; idempotent re-runs.
+
 #### `lib/prob/`
 Pure, fully unit-tested math.
 - `log5.ts` — generalized multinomial Log5, switch-hitter routing, matchup builder, env scaling.
@@ -246,10 +262,10 @@ The canonical `GameState` type that flows from watcher → Redis → SSE → Rea
 Server component. Suspense-wraps `<GameBoardLoader />` which calls `getInitialGames()` (cached read of `nrxi:snapshot`). Skeleton fallback during initial paint.
 
 #### `components/game-board.tsx`
-Client. Uses `useGameStream(initial)` to maintain a live `Map<gamePk, GameState>`. Partitions games into Highlighted / Active / Upcoming / Finished sections, with `motion`'s `<AnimatePresence mode="popLayout">` for cross-section motion. Each card has a stable `layoutId={`card-${gamePk}`}` so it cross-fades when sections change.
+Client. Uses `useGameStream(initial)` to maintain a live `Map<gamePk, GameState>`. Partitions games into Highlighted / Active / Upcoming / Finished sections, with `motion`'s `<AnimatePresence mode="popLayout">` for cross-section motion. Each card has a stable `layoutId={`card-${gamePk}`}` so it cross-fades when sections change. Highlighted / Active / Upcoming cards render `<GameCard game={g} />`; Finished cards render `<HistoricalCardLink game={g} />` so the dashboard's Finished section is byte-identical to the same game on `/history` and clicking it routes to `/history/[pk]`.
 
 #### `components/game-card.tsx`
-Per-game card with two team rows, `<InningState>` block, pitcher line, two `<LineupColumn>`s, footer with `<ProbabilityPill>`. Decision moments add `ring-2 ring-[var(--color-accent)]/60` and a brief flash.
+Per-game card. Header is a 3-column grid `[logo | team name | runs]` × 2 rows (away on top, home below) with `<InningState>` floated right. Below the header: `<LineScore>` (with logo-prefixed row labels), pitcher line, two `<LineupColumn>`s, footer with `<ProbabilityPill>`. Decision moments add `ring-2 ring-[var(--color-accent)]/60` and a brief flash. See [UI.md](UI.md) → "Score header" for the logo / color invariants.
 
 #### `app/games/[pk]/page.tsx`
 Drilldown. Full upcoming-lineup table with `pReach`%, plus the three-column nrXi/odds/env summary.
@@ -296,5 +312,5 @@ Cost: every dynamic data access must be wrapped in `<Suspense>` and call `connec
 - **HTML scraping fragility.** Both Baseball Savant and covers.com return HTML. Scrapers wrap try/catch with neutral fallbacks. Captured fixtures in `lib/env/__fixtures__/` give regression tests.
 - **Switch hitters use canonical platoon advantage** (v2 `actual` rule). `NRXI_SWITCH_HITTER_RULE=max` revives v1's generous `max(L, R)`.
 - **Calibration shim is identity.** Needs ≥1k production `(predicted, actual)` pairs before isotonic regression can be fit.
-- **MAX_LOOPS = 1500 + 6h wall-clock cap.** Long delays could exhaust this; we'd want re-spawn from the supervisor if a game is suspended overnight.
+- **MAX_LOOPS = 5000 + 6h wall-clock cap.** The 6h wall-clock is the real ceiling; MAX_LOOPS (≈7h at 5s active cadence) is a defense against tight-loop bugs. Long delays could still exhaust this; we'd want re-spawn from the supervisor if a game is suspended overnight. Non-Final exits run `gracefulExit` so a hit doesn't leave a stuck-Live snapshot — see BUGS.md bug #11.
 - **Supabase Marketplace is a convenience layer, not a runtime requirement.** Both Vercel and Railway connect to Supabase directly via the same `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` from the Supabase dashboard. If you ever rotate the key, manually re-sync to both. See [RUNBOOK.md](RUNBOOK.md#supabase-key-rotation).

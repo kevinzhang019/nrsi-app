@@ -22,6 +22,7 @@ import { computeLineupStatsStep } from "./steps/compute-lineup-stats";
 import { publishUpdateStep } from "./steps/publish-update";
 import { enrichLineupHandsStep } from "./steps/enrich-lineup-hands";
 import { persistFinishedGameStep } from "./steps/persist-finished-game";
+import { performGracefulExit, type GracefulExitReason } from "./lib/finalize-game";
 import { buildInningCapture } from "./capture-inning";
 import { buildPlayRows } from "../lib/history/build-plays";
 import { readMarkovStartState } from "./start-state";
@@ -130,14 +131,23 @@ export type WatcherInput = {
   homeTeamName: string;
 };
 
-export type WatcherResult = { reason: "lock-held" | "final" | "max-loops" | "max-runtime" | "aborted" };
+export type WatcherResult = {
+  reason: "lock-held" | "final" | "max-loops" | "max-runtime" | "aborted" | "error";
+};
 
 const SEASON = new Date().getUTCFullYear();
-const MAX_LOOPS = 1500;
-// Hard wall-clock cap as a safety net independent of MAX_LOOPS — even at the
-// 5s active-PA polling rate, MAX_LOOPS would only let one watcher run ~2h. A
-// 6h cap protects against any pathological case (extra-innings + delays + a
-// scheduling bug that left a watcher running past its game).
+// Loop ceiling sized to comfortably outlast a normal MLB game at the active
+// 5s PA-polling cadence: 5000 × 5s ≈ 7h, which covers 9 innings + extras +
+// a couple of rain delays without tripping. The actual ceiling is the 6h
+// wall-clock `MAX_RUNTIME_MS` below; MAX_LOOPS is just a defense against a
+// runaway tight-loop bug. Historically this was 1500 (≈2h) and watchers
+// hit it during the late innings, exiting silently and leaving the
+// dashboard's snapshot stuck on a "Live" 9th — see `services/lib/finalize-
+// game.ts` for the graceful-exit cleanup that the budget exits now run.
+const MAX_LOOPS = 5000;
+// Hard wall-clock cap as the real ceiling. 6h covers extras + delays in any
+// reasonable scenario; anything past that is a scheduling bug that left a
+// watcher running past its game and we want it gone.
 const MAX_RUNTIME_MS = 6 * 60 * 60 * 1000;
 
 // Run a single game's watcher loop to completion (Final or abort). Designed
@@ -221,506 +231,578 @@ export async function runWatcher(
     let lastFullInning = restored.lastFullInning;
     let lastLineupStats: GameState["lineupStats"] = restored.lastLineupStats;
     let capturedInnings = restored.capturedInnings;
+    // Tracked so the graceful-exit path (MAX_LOOPS / MAX_RUNTIME_MS) can flip
+    // status to "Final" on the most recent state we successfully published,
+    // instead of leaving the snapshot stuck in "Live" forever.
+    let lastPublishedState: GameState | null = null;
 
     const startedAt = Date.now();
 
+    // Best-effort cleanup invoked from every non-Final exit path: the budget
+    // caps (max-loops / max-runtime), supervisor abort (SIGTERM), and any
+    // uncaught error in a step. Closure captures the latest
+    // `lastPublishedState`, `capturedInnings`, and the current
+    // `lastTimecode` / `prevDoc` for the final fetch attempt. Never throws —
+    // see `performGracefulExit` for the three outcomes.
+    const gracefulExit = async (reason: GracefulExitReason): Promise<void> => {
+      try {
+        await performGracefulExit(
+          {
+            gamePk: input.gamePk,
+            reason,
+            lastPublishedState,
+            capturedInnings,
+          },
+          {
+            fetchLiveDiff: () =>
+              fetchLiveDiffStep({
+                gamePk: input.gamePk,
+                startTimecode: lastTimecode,
+                prevDoc,
+              }),
+            publishUpdate: publishUpdateStep,
+            persistFinishedGame: persistFinishedGameStep,
+            clearWatcherState,
+            buildPlayRows,
+          },
+        );
+      } catch (err) {
+        // performGracefulExit catches its own errors, but defend against an
+        // unexpected throw — this path must never escalate the original
+        // budget-exit reason into a watcher crash.
+        log.warn("watcher", "graceful-exit:unexpected", {
+          gamePk: input.gamePk,
+          reason,
+          err: String(err),
+        });
+      }
+    };
+
     for (let loop = 0; loop < MAX_LOOPS; loop++) {
-      if (signal?.aborted) return { reason: "aborted" };
+      if (signal?.aborted) {
+        await gracefulExit("abort");
+        return { reason: "aborted" };
+      }
       if (Date.now() - startedAt > MAX_RUNTIME_MS) {
         log.warn("watcher", "max-runtime", { gamePk: input.gamePk, loop });
+        await gracefulExit("max-runtime");
         return { reason: "max-runtime" };
       }
 
-      const tick = await withRetry(
-        () => fetchLiveDiffStep({ gamePk: input.gamePk, startTimecode: lastTimecode, prevDoc }),
-        { signal, label: "fetchLiveDiff" },
-      );
-      lastTimecode = tick.newTimecode;
-      prevDoc = tick.feed;
+      try {
 
-      const status = classifyStatus(
-        tick.feed.gameData.status.detailedState,
-        tick.feed.gameData.status.abstractGameState,
-      );
-      const ls = tick.feed.liveData.linescore;
-      const inning = ls.currentInning ?? null;
-      const half: "Top" | "Bottom" | null =
-        ls.isTopInning === true ? "Top" : ls.isTopInning === false ? "Bottom" : null;
-      const outs = ls.outs ?? null;
-      const inningState = ls.inningState ?? "";
+        const tick = await withRetry(
+          () => fetchLiveDiffStep({ gamePk: input.gamePk, startTimecode: lastTimecode, prevDoc }),
+          { signal, label: "fetchLiveDiff" },
+        );
+        lastTimecode = tick.newTimecode;
+        prevDoc = tick.feed;
 
-      // Track the most-recent batter per team during live play. Skipping
-      // middle/end/3-out ticks freezes the value across the inning break, so
-      // when the half flips we still know exactly where each team left off
-      // and can hand a real leadoff (= next spot in the order) to the UI.
-      const inningStateLower = inningState.toLowerCase();
-      const isLivePa =
-        status === "Live" &&
-        outs !== null &&
-        outs < 3 &&
-        inningStateLower !== "middle" &&
-        inningStateLower !== "end";
-      if (isLivePa) {
-        const currentBatterIdRaw = ls.offense?.batter?.id ?? null;
-        if (currentBatterIdRaw !== null) {
-          if (ls.isTopInning === true) lastAwayBatterId = currentBatterIdRaw;
-          else if (ls.isTopInning === false) lastHomeBatterId = currentBatterIdRaw;
+        const status = classifyStatus(
+          tick.feed.gameData.status.detailedState,
+          tick.feed.gameData.status.abstractGameState,
+        );
+        const ls = tick.feed.liveData.linescore;
+        const inning = ls.currentInning ?? null;
+        const half: "Top" | "Bottom" | null =
+          ls.isTopInning === true ? "Top" : ls.isTopInning === false ? "Bottom" : null;
+        const outs = ls.outs ?? null;
+        const inningState = ls.inningState ?? "";
+
+        // Track the most-recent batter per team during live play. Skipping
+        // middle/end/3-out ticks freezes the value across the inning break, so
+        // when the half flips we still know exactly where each team left off
+        // and can hand a real leadoff (= next spot in the order) to the UI.
+        const inningStateLower = inningState.toLowerCase();
+        const isLivePa =
+          status === "Live" &&
+          outs !== null &&
+          outs < 3 &&
+          inningStateLower !== "middle" &&
+          inningStateLower !== "end";
+        if (isLivePa) {
+          const currentBatterIdRaw = ls.offense?.batter?.id ?? null;
+          if (currentBatterIdRaw !== null) {
+            if (ls.isTopInning === true) lastAwayBatterId = currentBatterIdRaw;
+            else if (ls.isTopInning === false) lastHomeBatterId = currentBatterIdRaw;
+          }
         }
-      }
 
-      const lh = lineupHash(
-        tick.feed.liveData.boxscore?.teams.home.battingOrder,
-        tick.feed.liveData.boxscore?.teams.away.battingOrder,
-      );
-      const alignment = readDefenseAlignment(tick.feed);
-      const dk = defenseAlignmentKey(alignment.catcherId, alignment.fielderIds);
-      const upcoming = getUpcomingForCurrentInning(tick.feed);
-      const bothPitchers = readBothPitchers(tick.feed);
-      const op = `${bothPitchers.awayPitcherId ?? "_"}-${bothPitchers.homePitcherId ?? "_"}`;
-
-      const homeRuns = ls.teams?.home.runs ?? 0;
-      const awayRuns = ls.teams?.away.runs ?? 0;
-      const bottomNinthSkipped = shouldSkipBottomNinth({
-        inning: upcoming?.inning ?? null,
-        half: upcoming?.half ?? null,
-        homeRuns,
-        awayRuns,
-      });
-
-      const atBat = upcoming?.upcomingBatterIds[0] ?? "_";
-      const structuralKey = `${upcoming?.half ?? "_"}|${upcoming?.inning ?? "_"}|${lh}|${dk}|${op}|${atBat}|${bottomNinthSkipped ? "skip9" : "play9"}`;
-      const atBatIndex = tick.feed.liveData.plays?.currentPlay?.about?.atBatIndex ?? -1;
-      const startStatePeek = readMarkovStartState(tick.feed, upcoming?.inning ?? null);
-      const playStateKey = `${startStatePeek.outs}-${startStatePeek.bases}-${atBatIndex}`;
-
-      const isLive =
-        status === "Live" && upcoming !== null && upcoming.pitcherId !== null;
-      const shouldReloadStructure = isLive && structuralKey !== lastStructuralKey;
-      const shouldRecomputePlay =
-        isLive && (shouldReloadStructure || playStateKey !== lastPlayStateKey);
-
-      log.info("watcher", "tick", {
-        gamePk: input.gamePk,
-        loop,
-        status,
-        inning,
-        half,
-        outs,
-        inningState,
-        upcoming: upcoming
-          ? { pitcherId: upcoming.pitcherId, batters: upcoming.upcomingBatterIds.length }
-          : null,
-        shouldReloadStructure,
-        shouldRecomputePlay,
-      });
-
-      if (lh !== lastEnrichedHash) {
-        const rawLineups = extractLineups(tick.feed);
-        lastLineups = await withRetry(
-          () => enrichLineupHandsStep({ gamePk: input.gamePk, lineups: rawLineups }),
-          { signal, label: "enrichLineupHands" },
+        const lh = lineupHash(
+          tick.feed.liveData.boxscore?.teams.home.battingOrder,
+          tick.feed.liveData.boxscore?.teams.away.battingOrder,
         );
-        lastEnrichedHash = lh;
-      }
+        const alignment = readDefenseAlignment(tick.feed);
+        const dk = defenseAlignmentKey(alignment.catcherId, alignment.fielderIds);
+        const upcoming = getUpcomingForCurrentInning(tick.feed);
+        const bothPitchers = readBothPitchers(tick.feed);
+        const op = `${bothPitchers.awayPitcherId ?? "_"}-${bothPitchers.homePitcherId ?? "_"}`;
 
-      // ---- Phase 1: structural reload ----
-      if (shouldReloadStructure && upcoming) {
-        const [splits, park, weather, defense] = await Promise.all([
-          withRetry(
-            () =>
-              loadLineupSplitsStep({
-                gamePk: input.gamePk,
-                pitcherId: upcoming.pitcherId!,
-                batterIds: upcoming.upcomingBatterIds,
-              }),
-            { signal, label: "loadLineupSplits" },
-          ),
-          withRetry(
-            () =>
-              loadParkFactorStep({
-                gamePk: input.gamePk,
-                homeTeamName: input.homeTeamName,
-                season: SEASON,
-              }),
-            { signal, label: "loadParkFactor" },
-          ),
-          withRetry(
-            () =>
-              loadWeatherStep({
-                gamePk: input.gamePk,
-                awayTeam: input.awayTeamName,
-                homeTeam: input.homeTeamName,
-              }),
-            { signal, label: "loadWeather" },
-          ),
-          withRetry(
-            () => loadDefenseStep({ gamePk: input.gamePk, season: SEASON }),
-            { signal, label: "loadDefense" },
-          ),
-        ]);
-        splitsCache = splits;
-        parkCache = park;
-        weatherCache = weather;
-        defenseCache = defense;
+        const homeRuns = ls.teams?.home.runs ?? 0;
+        const awayRuns = ls.teams?.away.runs ?? 0;
+        const bottomNinthSkipped = shouldSkipBottomNinth({
+          inning: upcoming?.inning ?? null,
+          half: upcoming?.half ?? null,
+          homeRuns,
+          awayRuns,
+        });
 
-        // Fire-and-forget cache warmup for everyone on the bench / in the
-        // bullpen so a pinch-hit or relief change later in the game is a pure
-        // Redis hit instead of a critical-path MLB Stats API round-trip.
-        void prewarmBenchAndBullpenStep({
+        const atBat = upcoming?.upcomingBatterIds[0] ?? "_";
+        const structuralKey = `${upcoming?.half ?? "_"}|${upcoming?.inning ?? "_"}|${lh}|${dk}|${op}|${atBat}|${bottomNinthSkipped ? "skip9" : "play9"}`;
+        const atBatIndex = tick.feed.liveData.plays?.currentPlay?.about?.atBatIndex ?? -1;
+        const startStatePeek = readMarkovStartState(tick.feed, upcoming?.inning ?? null);
+        const playStateKey = `${startStatePeek.outs}-${startStatePeek.bases}-${atBatIndex}`;
+
+        const isLive =
+          status === "Live" && upcoming !== null && upcoming.pitcherId !== null;
+        const shouldReloadStructure = isLive && structuralKey !== lastStructuralKey;
+        const shouldRecomputePlay =
+          isLive && (shouldReloadStructure || playStateKey !== lastPlayStateKey);
+
+        log.info("watcher", "tick", {
           gamePk: input.gamePk,
-          feed: tick.feed,
-        }).catch((err) =>
-          log.warn("watcher", "prewarmBenchBullpen:err", {
-            gamePk: input.gamePk,
-            err: String(err),
-          }),
-        );
+          loop,
+          status,
+          inning,
+          half,
+          outs,
+          inningState,
+          upcoming: upcoming
+            ? { pitcherId: upcoming.pitcherId, batters: upcoming.upcomingBatterIds.length }
+            : null,
+          shouldReloadStructure,
+          shouldRecomputePlay,
+        });
 
-        lastEnv = {
-          parkRunFactor: park.runFactor,
-          weatherRunFactor: weather.factor,
-          weather: weather.info as unknown as Record<string, unknown>,
-        };
-        lastPitcherId = splits.pitcher.id;
-        lastPitcherName = splits.pitcher.fullName;
-        lastPitcherThrows = splits.pitcher.throws;
-        const seasonStats = readPitcherSeasonStats(tick.feed, splits.pitcher.id);
-        lastPitcherEra = seasonStats.era;
-        lastPitcherWhip = seasonStats.whip;
+        if (lh !== lastEnrichedHash) {
+          const rawLineups = extractLineups(tick.feed);
+          lastLineups = await withRetry(
+            () => enrichLineupHandsStep({ gamePk: input.gamePk, lineups: rawLineups }),
+            { signal, label: "enrichLineupHands" },
+          );
+          lastEnrichedHash = lh;
+        }
 
-        const awayStarterIds = starterIdsOf(lastLineups?.away ?? null);
-        const homeStarterIds = starterIdsOf(lastLineups?.home ?? null);
-        const [awayBundle, homeBundle] = await Promise.all([
-          bothPitchers.homePitcherId !== null && awayStarterIds
-            ? withRetry(
-                () =>
-                  loadLineupSplitsStep({
-                    gamePk: input.gamePk,
-                    pitcherId: bothPitchers.homePitcherId!,
-                    batterIds: awayStarterIds,
-                  }),
-                { signal, label: "loadLineupSplits:awayBundle" },
-              )
-            : Promise.resolve(null),
-          bothPitchers.awayPitcherId !== null && homeStarterIds
-            ? withRetry(
-                () =>
-                  loadLineupSplitsStep({
-                    gamePk: input.gamePk,
-                    pitcherId: bothPitchers.awayPitcherId!,
-                    batterIds: homeStarterIds,
-                  }),
-                { signal, label: "loadLineupSplits:homeBundle" },
-              )
-            : Promise.resolve(null),
-        ]);
-
-        const awayStats: Record<string, LineupBatterStat> = awayBundle
-          ? await withRetry(
+        // ---- Phase 1: structural reload ----
+        if (shouldReloadStructure && upcoming) {
+          const [splits, park, weather, defense] = await Promise.all([
+            withRetry(
               () =>
-                computeLineupStatsStep({
+                loadLineupSplitsStep({
                   gamePk: input.gamePk,
-                  pitcher: awayBundle.pitcher,
-                  batters: awayBundle.batters,
-                  park: park.components,
-                  weather: weather.components,
-                  oaaTable: upcoming.half === "Top" ? defense.oaaTable : undefined,
-                  framingTable: upcoming.half === "Top" ? defense.framingTable : undefined,
-                  catcherId: upcoming.half === "Top" ? alignment.catcherId : null,
-                  fielderIds: upcoming.half === "Top" ? alignment.fielderIds : [],
+                  pitcherId: upcoming.pitcherId!,
+                  batterIds: upcoming.upcomingBatterIds,
                 }),
-              { signal, label: "computeLineupStats:away" },
-            )
-          : {};
-        const homeStats: Record<string, LineupBatterStat> = homeBundle
-          ? await withRetry(
+              { signal, label: "loadLineupSplits" },
+            ),
+            withRetry(
               () =>
-                computeLineupStatsStep({
+                loadParkFactorStep({
+                  gamePk: input.gamePk,
+                  homeTeamName: input.homeTeamName,
+                  season: SEASON,
+                }),
+              { signal, label: "loadParkFactor" },
+            ),
+            withRetry(
+              () =>
+                loadWeatherStep({
+                  gamePk: input.gamePk,
+                  awayTeam: input.awayTeamName,
+                  homeTeam: input.homeTeamName,
+                }),
+              { signal, label: "loadWeather" },
+            ),
+            withRetry(
+              () => loadDefenseStep({ gamePk: input.gamePk, season: SEASON }),
+              { signal, label: "loadDefense" },
+            ),
+          ]);
+          splitsCache = splits;
+          parkCache = park;
+          weatherCache = weather;
+          defenseCache = defense;
+
+          // Fire-and-forget cache warmup for everyone on the bench / in the
+          // bullpen so a pinch-hit or relief change later in the game is a pure
+          // Redis hit instead of a critical-path MLB Stats API round-trip.
+          void prewarmBenchAndBullpenStep({
+            gamePk: input.gamePk,
+            feed: tick.feed,
+          }).catch((err) =>
+            log.warn("watcher", "prewarmBenchBullpen:err", {
+              gamePk: input.gamePk,
+              err: String(err),
+            }),
+          );
+
+          lastEnv = {
+            parkRunFactor: park.runFactor,
+            weatherRunFactor: weather.factor,
+            weather: weather.info as unknown as Record<string, unknown>,
+          };
+          lastPitcherId = splits.pitcher.id;
+          lastPitcherName = splits.pitcher.fullName;
+          lastPitcherThrows = splits.pitcher.throws;
+          const seasonStats = readPitcherSeasonStats(tick.feed, splits.pitcher.id);
+          lastPitcherEra = seasonStats.era;
+          lastPitcherWhip = seasonStats.whip;
+
+          const awayStarterIds = starterIdsOf(lastLineups?.away ?? null);
+          const homeStarterIds = starterIdsOf(lastLineups?.home ?? null);
+          const [awayBundle, homeBundle] = await Promise.all([
+            bothPitchers.homePitcherId !== null && awayStarterIds
+              ? withRetry(
+                  () =>
+                    loadLineupSplitsStep({
+                      gamePk: input.gamePk,
+                      pitcherId: bothPitchers.homePitcherId!,
+                      batterIds: awayStarterIds,
+                    }),
+                  { signal, label: "loadLineupSplits:awayBundle" },
+                )
+              : Promise.resolve(null),
+            bothPitchers.awayPitcherId !== null && homeStarterIds
+              ? withRetry(
+                  () =>
+                    loadLineupSplitsStep({
+                      gamePk: input.gamePk,
+                      pitcherId: bothPitchers.awayPitcherId!,
+                      batterIds: homeStarterIds,
+                    }),
+                  { signal, label: "loadLineupSplits:homeBundle" },
+                )
+              : Promise.resolve(null),
+          ]);
+
+          const awayStats: Record<string, LineupBatterStat> = awayBundle
+            ? await withRetry(
+                () =>
+                  computeLineupStatsStep({
+                    gamePk: input.gamePk,
+                    pitcher: awayBundle.pitcher,
+                    batters: awayBundle.batters,
+                    park: park.components,
+                    weather: weather.components,
+                    oaaTable: upcoming.half === "Top" ? defense.oaaTable : undefined,
+                    framingTable: upcoming.half === "Top" ? defense.framingTable : undefined,
+                    catcherId: upcoming.half === "Top" ? alignment.catcherId : null,
+                    fielderIds: upcoming.half === "Top" ? alignment.fielderIds : [],
+                  }),
+                { signal, label: "computeLineupStats:away" },
+              )
+            : {};
+          const homeStats: Record<string, LineupBatterStat> = homeBundle
+            ? await withRetry(
+                () =>
+                  computeLineupStatsStep({
+                    gamePk: input.gamePk,
+                    pitcher: homeBundle.pitcher,
+                    batters: homeBundle.batters,
+                    park: park.components,
+                    weather: weather.components,
+                    oaaTable: upcoming.half === "Bottom" ? defense.oaaTable : undefined,
+                    framingTable: upcoming.half === "Bottom" ? defense.framingTable : undefined,
+                    catcherId: upcoming.half === "Bottom" ? alignment.catcherId : null,
+                    fielderIds: upcoming.half === "Bottom" ? alignment.fielderIds : [],
+                  }),
+                { signal, label: "computeLineupStats:home" },
+              )
+            : {};
+          lastLineupStats = { away: awayStats, home: homeStats };
+
+          if (awayBundle && bothPitchers.homePitcherId !== null) {
+            const s = readPitcherSeasonStats(tick.feed, bothPitchers.homePitcherId);
+            lastHomePitcher = {
+              id: awayBundle.pitcher.id,
+              name: awayBundle.pitcher.fullName,
+              throws: awayBundle.pitcher.throws,
+              era: s.era,
+              whip: s.whip,
+            };
+          }
+          if (homeBundle && bothPitchers.awayPitcherId !== null) {
+            const s = readPitcherSeasonStats(tick.feed, bothPitchers.awayPitcherId);
+            lastAwayPitcher = {
+              id: homeBundle.pitcher.id,
+              name: homeBundle.pitcher.fullName,
+              throws: homeBundle.pitcher.throws,
+              era: s.era,
+              whip: s.whip,
+            };
+          }
+
+          if (upcoming.half === "Top" && !bottomNinthSkipped && homeBundle) {
+            const oppHalf = await withRetry(
+              () =>
+                computeNrXiStep({
                   gamePk: input.gamePk,
                   pitcher: homeBundle.pitcher,
                   batters: homeBundle.batters,
                   park: park.components,
                   weather: weather.components,
-                  oaaTable: upcoming.half === "Bottom" ? defense.oaaTable : undefined,
-                  framingTable: upcoming.half === "Bottom" ? defense.framingTable : undefined,
-                  catcherId: upcoming.half === "Bottom" ? alignment.catcherId : null,
-                  fielderIds: upcoming.half === "Bottom" ? alignment.fielderIds : [],
+                  startState: { outs: 0, bases: upcoming.inning >= 10 ? 2 : 0 },
+                  paInGameForPitcher: 0,
+                  oaaTable: defense.oaaTable,
+                  framingTable: defense.framingTable,
+                  catcherId: null,
+                  fielderIds: [],
                 }),
-              { signal, label: "computeLineupStats:home" },
-            )
-          : {};
-        lastLineupStats = { away: awayStats, home: homeStats };
+              { signal, label: "computeNrXi:oppHalf" },
+            );
+            oppHalfCleanCache = {
+              pHitEvent: oppHalf.pHitEvent,
+              pNoHitEvent: oppHalf.pNoHitEvent,
+            };
+          } else {
+            oppHalfCleanCache = null;
+          }
 
-        if (awayBundle && bothPitchers.homePitcherId !== null) {
-          const s = readPitcherSeasonStats(tick.feed, bothPitchers.homePitcherId);
-          lastHomePitcher = {
-            id: awayBundle.pitcher.id,
-            name: awayBundle.pitcher.fullName,
-            throws: awayBundle.pitcher.throws,
-            era: s.era,
-            whip: s.whip,
-          };
-        }
-        if (homeBundle && bothPitchers.awayPitcherId !== null) {
-          const s = readPitcherSeasonStats(tick.feed, bothPitchers.awayPitcherId);
-          lastAwayPitcher = {
-            id: homeBundle.pitcher.id,
-            name: homeBundle.pitcher.fullName,
-            throws: homeBundle.pitcher.throws,
-            era: s.era,
-            whip: s.whip,
-          };
+          lastStructuralKey = structuralKey;
         }
 
-        if (upcoming.half === "Top" && !bottomNinthSkipped && homeBundle) {
-          const oppHalf = await withRetry(
+        // ---- Phase 2: play-state recompute ----
+        if (
+          shouldRecomputePlay &&
+          upcoming &&
+          splitsCache &&
+          parkCache &&
+          weatherCache &&
+          defenseCache
+        ) {
+          const startState = readMarkovStartState(tick.feed, upcoming.inning);
+          const paInGameForPitcher = readPaInGameForPitcher(tick.feed, upcoming.pitcherId!);
+          lastNrXi = await withRetry(
             () =>
               computeNrXiStep({
                 gamePk: input.gamePk,
-                pitcher: homeBundle.pitcher,
-                batters: homeBundle.batters,
-                park: park.components,
-                weather: weather.components,
-                startState: { outs: 0, bases: upcoming.inning >= 10 ? 2 : 0 },
-                paInGameForPitcher: 0,
-                oaaTable: defense.oaaTable,
-                framingTable: defense.framingTable,
-                catcherId: null,
-                fielderIds: [],
+                pitcher: splitsCache!.pitcher,
+                batters: splitsCache!.batters,
+                park: parkCache!.components,
+                weather: weatherCache!.components,
+                startState,
+                paInGameForPitcher,
+                oaaTable: defenseCache!.oaaTable,
+                framingTable: defenseCache!.framingTable,
+                catcherId: alignment.catcherId,
+                fielderIds: alignment.fielderIds,
               }),
-            { signal, label: "computeNrXi:oppHalf" },
+            { signal, label: "computeNrXi:play" },
           );
-          oppHalfCleanCache = {
-            pHitEvent: oppHalf.pHitEvent,
-            pNoHitEvent: oppHalf.pNoHitEvent,
-          };
-        } else {
-          oppHalfCleanCache = null;
+
+          if (bottomNinthSkipped) {
+            lastFullInning = {
+              pHit: lastNrXi.pHitEvent,
+              pNo: lastNrXi.pNoHitEvent,
+              breakEven: lastNrXi.breakEvenAmerican,
+            };
+          } else if (upcoming.half === "Top" && oppHalfCleanCache) {
+            const pNoFull = lastNrXi.pNoHitEvent * oppHalfCleanCache.pNoHitEvent;
+            const pHitFull = 1 - pNoFull;
+            lastFullInning = {
+              pHit: pHitFull,
+              pNo: pNoFull,
+              breakEven: roundOdds(americanBreakEven(pNoFull)),
+            };
+          } else if (upcoming.half === "Bottom") {
+            lastFullInning = {
+              pHit: lastNrXi.pHitEvent,
+              pNo: lastNrXi.pNoHitEvent,
+              breakEven: lastNrXi.breakEvenAmerican,
+            };
+          } else {
+            lastFullInning = null;
+          }
+
+          lastPlayStateKey = playStateKey;
         }
 
-        lastStructuralKey = structuralKey;
-      }
+        const nrXi = lastNrXi;
+        const env = lastEnv;
 
-      // ---- Phase 2: play-state recompute ----
-      if (
-        shouldRecomputePlay &&
-        upcoming &&
-        splitsCache &&
-        parkCache &&
-        weatherCache &&
-        defenseCache
-      ) {
-        const startState = readMarkovStartState(tick.feed, upcoming.inning);
-        const paInGameForPitcher = readPaInGameForPitcher(tick.feed, upcoming.pitcherId!);
-        lastNrXi = await withRetry(
-          () =>
-            computeNrXiStep({
-              gamePk: input.gamePk,
-              pitcher: splitsCache!.pitcher,
-              batters: splitsCache!.batters,
-              park: parkCache!.components,
-              weather: weatherCache!.components,
-              startState,
-              paInGameForPitcher,
-              oaaTable: defenseCache!.oaaTable,
-              framingTable: defenseCache!.framingTable,
-              catcherId: alignment.catcherId,
-              fielderIds: alignment.fielderIds,
-            }),
-          { signal, label: "computeNrXi:play" },
-        );
+        const decision = isDecisionMoment({ status, inning, half, outs, inningState });
+        const decisionFull = isDecisionMomentFullInning({
+          status,
+          inning,
+          half,
+          outs,
+          inningState,
+          upcomingHalf: upcoming?.half ?? null,
+        });
 
-        if (bottomNinthSkipped) {
-          lastFullInning = {
-            pHit: lastNrXi.pHitEvent,
-            pNo: lastNrXi.pNoHitEvent,
-            breakEven: lastNrXi.breakEvenAmerican,
-          };
-        } else if (upcoming.half === "Top" && oppHalfCleanCache) {
-          const pNoFull = lastNrXi.pNoHitEvent * oppHalfCleanCache.pNoHitEvent;
-          const pHitFull = 1 - pNoFull;
-          lastFullInning = {
-            pHit: pHitFull,
-            pNo: pNoFull,
-            breakEven: roundOdds(americanBreakEven(pNoFull)),
-          };
-        } else if (upcoming.half === "Bottom") {
-          lastFullInning = {
-            pHit: lastNrXi.pHitEvent,
-            pNo: lastNrXi.pNoHitEvent,
-            breakEven: lastNrXi.breakEvenAmerican,
-          };
-        } else {
-          lastFullInning = null;
-        }
-
-        lastPlayStateKey = playStateKey;
-      }
-
-      const nrXi = lastNrXi;
-      const env = lastEnv;
-
-      const decision = isDecisionMoment({ status, inning, half, outs, inningState });
-      const decisionFull = isDecisionMomentFullInning({
-        status,
-        inning,
-        half,
-        outs,
-        inningState,
-        upcomingHalf: upcoming?.half ?? null,
-      });
-
-      const state: GameState = {
-        gamePk: input.gamePk,
-        status,
-        detailedState: tick.feed.gameData.status.detailedState ?? "",
-        inning,
-        half,
-        outs,
-        bases: readDisplayBases(tick.feed, status),
-        isDecisionMoment: decision,
-        isDecisionMomentFullInning: decisionFull,
-        away: {
-          id: tick.feed.gameData.teams.away.id,
-          name: tick.feed.gameData.teams.away.name,
-          runs: ls.teams?.away.runs ?? 0,
-        },
-        home: {
-          id: tick.feed.gameData.teams.home.id,
-          name: tick.feed.gameData.teams.home.name,
-          runs: ls.teams?.home.runs ?? 0,
-        },
-        venue: tick.feed.gameData.venue
-          ? { id: tick.feed.gameData.venue.id, name: tick.feed.gameData.venue.name }
-          : null,
-        pitcher:
-          lastPitcherId !== null
-            ? {
-                id: lastPitcherId,
-                name: lastPitcherName,
-                throws: lastPitcherThrows,
-                era: lastPitcherEra,
-                whip: lastPitcherWhip,
-                pitchCount: readPitcherPitchCount(tick.feed, lastPitcherId),
-              }
+        const state: GameState = {
+          gamePk: input.gamePk,
+          status,
+          detailedState: tick.feed.gameData.status.detailedState ?? "",
+          inning,
+          half,
+          outs,
+          bases: readDisplayBases(tick.feed, status),
+          isDecisionMoment: decision,
+          isDecisionMomentFullInning: decisionFull,
+          away: {
+            id: tick.feed.gameData.teams.away.id,
+            name: tick.feed.gameData.teams.away.name,
+            runs: ls.teams?.away.runs ?? 0,
+          },
+          home: {
+            id: tick.feed.gameData.teams.home.id,
+            name: tick.feed.gameData.teams.home.name,
+            runs: ls.teams?.home.runs ?? 0,
+          },
+          venue: tick.feed.gameData.venue
+            ? { id: tick.feed.gameData.venue.id, name: tick.feed.gameData.venue.name }
             : null,
-        awayPitcher: lastAwayPitcher
-          ? { ...lastAwayPitcher, pitchCount: readPitcherPitchCount(tick.feed, lastAwayPitcher.id) }
-          : null,
-        homePitcher: lastHomePitcher
-          ? { ...lastHomePitcher, pitchCount: readPitcherPitchCount(tick.feed, lastHomePitcher.id) }
-          : null,
-        upcomingBatters: nrXi?.perBatter ?? [],
-        pHitEvent: nrXi?.pHitEvent ?? null,
-        pNoHitEvent: nrXi?.pNoHitEvent ?? null,
-        breakEvenAmerican: nrXi?.breakEvenAmerican ?? null,
-        pHitEventFullInning: lastFullInning?.pHit ?? null,
-        pNoHitEventFullInning: lastFullInning?.pNo ?? null,
-        breakEvenAmericanFullInning: lastFullInning?.breakEven ?? null,
-        env,
-        lineups: lastLineups ?? extractLineups(tick.feed),
-        lineupStats: lastLineupStats,
-        linescore: extractLinescore(tick.feed),
-        ...extractBatterFocus(tick.feed, { away: lastAwayBatterId, home: lastHomeBatterId }),
-        updatedAt: new Date().toISOString(),
-        // Carry venue-local game day + UTC start time straight off the live
-        // feed. The seeded snapshot set these at Pre-game from the schedule,
-        // but the watcher's published state would otherwise drop them on the
-        // first live tick. History persistence (lib/db/games.ts:gameDateOf)
-        // reads officialDate to bucket the row under the correct local day
-        // instead of UTC.
-        startTime: tick.feed.gameData.datetime?.dateTime,
-        officialDate: tick.feed.gameData.datetime?.officialDate,
-      };
+          pitcher:
+            lastPitcherId !== null
+              ? {
+                  id: lastPitcherId,
+                  name: lastPitcherName,
+                  throws: lastPitcherThrows,
+                  era: lastPitcherEra,
+                  whip: lastPitcherWhip,
+                  pitchCount: readPitcherPitchCount(tick.feed, lastPitcherId),
+                }
+              : null,
+          awayPitcher: lastAwayPitcher
+            ? { ...lastAwayPitcher, pitchCount: readPitcherPitchCount(tick.feed, lastAwayPitcher.id) }
+            : null,
+          homePitcher: lastHomePitcher
+            ? { ...lastHomePitcher, pitchCount: readPitcherPitchCount(tick.feed, lastHomePitcher.id) }
+            : null,
+          upcomingBatters: nrXi?.perBatter ?? [],
+          pHitEvent: nrXi?.pHitEvent ?? null,
+          pNoHitEvent: nrXi?.pNoHitEvent ?? null,
+          breakEvenAmerican: nrXi?.breakEvenAmerican ?? null,
+          pHitEventFullInning: lastFullInning?.pHit ?? null,
+          pNoHitEventFullInning: lastFullInning?.pNo ?? null,
+          breakEvenAmericanFullInning: lastFullInning?.breakEven ?? null,
+          env,
+          lineups: lastLineups ?? extractLineups(tick.feed),
+          lineupStats: lastLineupStats,
+          linescore: extractLinescore(tick.feed),
+          ...extractBatterFocus(tick.feed, { away: lastAwayBatterId, home: lastHomeBatterId }),
+          updatedAt: new Date().toISOString(),
+          // Carry venue-local game day + UTC start time straight off the live
+          // feed. The seeded snapshot set these at Pre-game from the schedule,
+          // but the watcher's published state would otherwise drop them on the
+          // first live tick. History persistence (lib/db/games.ts:gameDateOf)
+          // reads officialDate to bucket the row under the correct local day
+          // instead of UTC.
+          startTime: tick.feed.gameData.datetime?.dateTime,
+          officialDate: tick.feed.gameData.datetime?.officialDate,
+        };
 
-      const captureCandidate = buildInningCapture({
-        inning,
-        half,
-        nrXi: lastNrXi,
-        pitcher: state.pitcher,
-        awayPitcher: state.awayPitcher,
-        homePitcher: state.homePitcher,
-        env: state.env,
-        lineupStats: state.lineupStats,
-        defenseKey: dk,
-      });
-      if (captureCandidate && !capturedInnings[captureCandidate.key]) {
-        capturedInnings[captureCandidate.key] = captureCandidate.capture;
-      }
-
-      await withRetry(() => publishUpdateStep(state), { signal, label: "publishUpdate" });
-
-      // Persist hoisted state once per tick. The trigger keys are deliberately
-      // skipped (see watcher-state.ts) so a restart fires one Phase 1 reload.
-      try {
-        await saveWatcherState(input.gamePk, {
-          ...emptyWatcherState(),
-          capturedInnings,
-          lastEnrichedHash,
-          lastLineups: lastLineups ?? null,
-          lastNrXi,
-          lastEnv,
-          lastFullInning,
-          lastLineupStats,
-          lastPitcherId,
-          lastPitcherName,
-          lastPitcherThrows,
-          lastPitcherEra,
-          lastPitcherWhip,
-          lastAwayPitcher,
-          lastHomePitcher,
-          lastAwayBatterId,
-          lastHomeBatterId,
+        const captureCandidate = buildInningCapture({
+          inning,
+          half,
+          nrXi: lastNrXi,
+          pitcher: state.pitcher,
+          awayPitcher: state.awayPitcher,
+          homePitcher: state.homePitcher,
+          env: state.env,
+          lineupStats: state.lineupStats,
+          defenseKey: dk,
         });
-      } catch (err) {
-        log.error("watcher", "saveWatcherState:fail", {
-          gamePk: input.gamePk,
-          err: String(err),
-        });
-      }
+        if (captureCandidate && !capturedInnings[captureCandidate.key]) {
+          capturedInnings[captureCandidate.key] = captureCandidate.capture;
+        }
 
-      if (status === "Final") {
-        // Build the per-play archive once from the terminal feed. The full
-        // game's allPlays array is in `tick.feed` here, so this is a pure
-        // transform with zero extra fetches. Persisted alongside
-        // capturedInnings; PK (game_pk, at_bat_index) keeps it idempotent if
-        // the watcher retries this branch.
-        const playRows = buildPlayRows(tick.feed, input.gamePk);
-        log.info("watcher", "final", {
-          gamePk: input.gamePk,
-          innings: Object.keys(capturedInnings).length,
-          plays: playRows.length,
-        });
-        await withRetry(
-          () => persistFinishedGameStep({ finalState: state, capturedInnings, playRows }),
-          { signal, label: "persistFinishedGame" },
-        );
-        // Clear the watcher-state key — game is done, no resume needed.
+        await withRetry(() => publishUpdateStep(state), { signal, label: "publishUpdate" });
+        // Remember the most recent state we published so that, if the watcher
+        // exits via MAX_LOOPS / MAX_RUNTIME_MS instead of the normal Final
+        // branch, gracefulExit can flip its status to "Final" and clear the
+        // zombie from the dashboard.
+        lastPublishedState = state;
+
+        // Persist hoisted state once per tick. The trigger keys are deliberately
+        // skipped (see watcher-state.ts) so a restart fires one Phase 1 reload.
         try {
-          await clearWatcherState(input.gamePk);
+          await saveWatcherState(input.gamePk, {
+            ...emptyWatcherState(),
+            capturedInnings,
+            lastEnrichedHash,
+            lastLineups: lastLineups ?? null,
+            lastNrXi,
+            lastEnv,
+            lastFullInning,
+            lastLineupStats,
+            lastPitcherId,
+            lastPitcherName,
+            lastPitcherThrows,
+            lastPitcherEra,
+            lastPitcherWhip,
+            lastAwayPitcher,
+            lastHomePitcher,
+            lastAwayBatterId,
+            lastHomeBatterId,
+          });
         } catch (err) {
-          log.warn("watcher", "clearWatcherState:fail", {
+          log.error("watcher", "saveWatcherState:fail", {
             gamePk: input.gamePk,
             err: String(err),
           });
         }
-        return { reason: "final" };
-      }
 
-      let waitSec = 30;
-      if (status === "Live") waitSec = tick.recommendedWaitSeconds;
-      else if (status === "Pre") waitSec = 30;
-      else if (status === "Delayed" || status === "Suspended") waitSec = 300;
+        if (status === "Final") {
+          // Build the per-play archive once from the terminal feed. The full
+          // game's allPlays array is in `tick.feed` here, so this is a pure
+          // transform with zero extra fetches. Persisted alongside
+          // capturedInnings; PK (game_pk, at_bat_index) keeps it idempotent if
+          // the watcher retries this branch.
+          const playRows = buildPlayRows(tick.feed, input.gamePk);
+          log.info("watcher", "final", {
+            gamePk: input.gamePk,
+            innings: Object.keys(capturedInnings).length,
+            plays: playRows.length,
+          });
+          await withRetry(
+            () => persistFinishedGameStep({ finalState: state, capturedInnings, playRows }),
+            { signal, label: "persistFinishedGame" },
+          );
+          // Clear the watcher-state key — game is done, no resume needed.
+          try {
+            await clearWatcherState(input.gamePk);
+          } catch (err) {
+            log.warn("watcher", "clearWatcherState:fail", {
+              gamePk: input.gamePk,
+              err: String(err),
+            });
+          }
+          return { reason: "final" };
+        }
 
-      try {
+        let waitSec = 30;
+        if (status === "Live") waitSec = tick.recommendedWaitSeconds;
+        else if (status === "Pre") waitSec = 30;
+        else if (status === "Delayed" || status === "Suspended") waitSec = 300;
+
+        // sleepMs throws AbortError on abort — caught by the outer try/catch
+        // below, which routes to gracefulExit("abort"). Other errors here
+        // would route to gracefulExit("error"), which is the right behavior.
         await sleepMs(waitSec * 1000, signal);
       } catch (err) {
-        if (isAbortError(err)) return { reason: "aborted" };
-        throw err;
+        if (isAbortError(err)) {
+          await gracefulExit("abort");
+          return { reason: "aborted" };
+        }
+        // Any other thrown step in the loop body — log, clean up, exit. The
+        // alternative (continuing the loop) would mean the same step throws
+        // again next tick, just spamming errors. Exiting forces a fresh
+        // supervisor run to spawn a new watcher with clean state.
+        log.error("watcher", "loop:error", {
+          gamePk: input.gamePk,
+          loop,
+          err: String(err),
+          stack: err instanceof Error ? err.stack : undefined,
+        });
+        await gracefulExit("error");
+        return { reason: "error" };
       }
     }
 
     log.warn("watcher", "max-loops", { gamePk: input.gamePk });
+    await gracefulExit("max-loops");
     return { reason: "max-loops" };
   } finally {
     cleanup();
