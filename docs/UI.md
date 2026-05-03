@@ -61,6 +61,8 @@ If you ever need to suppress the fade for a specific case (e.g. initial paint), 
 
 Each batter row in `components/lineup-column.tsx` shows exactly four fields, left → right: **bats** (handedness) · **F. Lastname** · **xOBP** · **xSLG**. The marker dot, batting-order spot number, and position abbreviation were intentionally removed — the focus signals are now (1) the row-level background highlight (`bg-[var(--color-accent-soft)]/60`) and (2) the name text rendered in `var(--color-accent)`. The **at-bat** batter gets both: row background + green name. The **next-half (on-deck) leadoff** batter gets the green name only — no row background. Both states share `--color-accent` so the card's focus color stays unified; the row background is what distinguishes "now batting" from "leads off next half." The lineup column header used to render `AT BAT` / `ON DECK` pills next to the team label — those were removed so the row+name pair is the single focus signal.
 
+**Where the on-deck id comes from.** `lib/mlb/extract.ts:extractBatterFocus(feed, lastBatterIds)` resolves `nextHalfLeadoffId` for the team coming up. Because MLB's `linescore.offense` only tracks the team currently at bat, the watcher tracks the most-recent batter per team itself: hoisted `lastAwayBatterId` / `lastHomeBatterId` in `services/run-watcher.ts`, persisted via `saveWatcherState`. With those in hand, leadoff = `order[(idxOfOtherTeamLastBatter + 1) % 9]`. Fallback when that team hasn't batted yet (or the id isn't in the current `battingOrder`) is `order[0]`. The fallback path was the old default for every half-boundary, which manifested as "the highlight is always the leadoff hitter" regardless of where the team actually left off — don't regress to it.
+
 The **bats** field is `HandCode | null` and gets hydrated from `/people/{id}` (cached 30d via `loadHand`) by `services/steps/enrich-lineup-hands.ts` — the live-feed boxscore omits `batSide` for most players, so reading it raw silently produces 18 right-handers per game (see BUGS.md bug #7). The render falls back to `"—"` if enrichment somehow misses, keeping the column width stable.
 
 Each team's `<ol>` is wrapped in `<div className="overflow-x-auto">` with `min-w-max` on the `<ol>` and `whitespace-nowrap` on each row, so the **whole list translates as a unit** when scrolled (not row-by-row). Don't break this by putting overflow on individual rows or by adding `flex-wrap` to the row.
@@ -122,3 +124,61 @@ Refresh path: `npm run build:park-shapes` whenever a team relocates or a new par
 - `bases: null` for non-Live states — keeps the diamond from rendering a misleading "empty" state for finished/scheduled games.
 - The viewBox top-padding (`y=7` for 2B, viewBox height 22) — reverting to a tighter viewBox clips the 2B square.
 - Square fill class swaps `fill-[var(--color-accent)]` ↔ `fill-transparent` (NOT `fill-none` or removing the prop). Without `fill-transparent`, hovering or focus events on parent elements can surface the SVG default fill = black.
+
+---
+
+## History page — wide game card + linescore-as-picker
+
+`/history/[pk]` is a single wide frozen `<GameCard>` (`components/game-card.tsx`, `wide` prop) whose `<LineScore>` cells *are* the inning picker. There is no separate selector strip. Composition lives in `<HistoricalGameView>` (`components/historical-game-view.tsx`); the per-tab plays panel renders below.
+
+**Selection model.** `InningSelection` (defined in `components/historical-game-view-helpers.ts`) is a discriminated union: `{ kind: "half"; inning; half }` or `{ kind: "full"; inning }`. Default selection prefers the first inning where BOTH halves were captured (full-inning view); falls back to the first available half if nothing has both. State is `useState` in `<HistoricalGameView>` and forwarded into `<GameCard>` via `selection`, `inningAvailability`, `onSelectInning`, `onSelectHalf`. `<GameCard>` forwards them all into `<LineScore>` unchanged.
+
+**Click contracts on the linescore.**
+- Header `<th>` for inning N → `<button>` when `onSelectInning` is set. Click sets `{ kind: "full", inning: N }` if both halves are captured; falls back gracefully to whichever half exists if only one was captured (e.g. walkoff bottom-9 not played). Disabled when neither half is available.
+- Away-row `<td>` for inning N → `<button>` setting `{ kind: "half", inning: N, half: "Top" }` (away bats in Top).
+- Home-row `<td>` → `<button>` setting `{ kind: "half", inning: N, half: "Bottom" }`.
+- Disabled state when the corresponding half wasn't captured. Highlight uses `bg-[var(--color-accent-soft)]` + `ring-1 ring-[var(--color-accent)]/40` on the cell; for full-inning, BOTH the away and home cells of the inning highlight (alongside the header number) so the entire inning column reads as selected.
+
+**Live-mode `<LineScore>` is unchanged.** When `selection`/`onSelectInning`/`onSelectHalf` are not passed (the dashboard live `<GameCard>`), cells render as plain `<td>`/`<th>` and the live `currentInning`+`half` highlight runs as before. The detail page passes `currentInning={null}` + `half={null}` so the live highlight doesn't compete with the selection highlight.
+
+**Wide `<GameCard>` layout.** When `wide`:
+- Drops the `max-w-md` constraint (the page wraps it at `max-w-[1400px]`).
+- Forces `viewMode = "split"` regardless of the user's setting — the page is wide enough that single-pane wastes horizontal space.
+- Surfaces lineups + pitchers in `historical` mode (the narrow `historical` `<GameCard>` used by `<HistoricalCardLink>` on the dashboard list still hides them — wide is opt-in).
+- Surfaces the captured `<ProbabilityPill>` in `historical` mode (narrow historical mode renders the pill empty so the dashboard list of past games doesn't get cluttered).
+
+**Both historical views set `battingTeam = null`.** Half-inning (`buildFrozenState`) and full-inning (`buildFullInningFrozenState`) frozen states both null out `battingTeam` so `<GameCard>`'s split layout routes to the same paired-pitcher branch — the pitcher/lineup section renders identically across the two views, and clicking a `<LineScore>` cell only changes the score header and the captured probability, not the layout. Don't restore `battingTeam: "away" | "home"` on the half-inning helper; it would re-fork the layouts and add live-game-style highlighting on a frozen lineup.
+
+**Full-inning view.** `buildFullInningFrozenState(game, top, bottom)` (in `historical-game-view-helpers.ts`) composes the two captured halves:
+- `pNoRunFull = top.pNoRun * bottom.pNoRun` — independence assumption is fine here, the two halves are independent draws against different lineups + pitchers. `breakEvenAmericanFullInning` re-derives via `americanBreakEven` + `roundOdds` from `lib/prob/odds.ts`.
+- Score header = `runsBefore(linescore, inning, "Top")` — the state at the *start* of Top, since this is "what was the prediction going into this whole inning."
+- `inning = N`, `half = "Top"`, `outs = 0`, `bases = null` — canonical clean-state markers.
+- `battingTeam = null` is the "no single batting team" signal that flips `<GameCard>` into a paired-pitcher layout: home pitcher above the away lineup column (he pitched to them in Top); away pitcher above the home lineup column (he pitched to them in Bottom). Don't fold this back into the regular split branch — the regular branch stacks both pitchers at the top, which is correct for live-game viewing but wrong for full-inning history where each pitcher belongs visually with the lineup he faced.
+- `upcomingBatters = [...top.perBatter, ...bottom.perBatter]` so the `statsById` map in `<GameCard>` covers both teams' batters.
+
+**Don't change without thinking:**
+- The `(!historical || wide)` gate on the lineup section in `components/game-card.tsx` — narrowing it back to `!historical` hides lineups on the detail page; widening it to drop the historical guard entirely would surface lineups on the dashboard `<HistoricalCardLink>` cards (which is intentionally not what we want — the listing should stay compact).
+- The `historical && !wide ? null : ...` gate on the footer `<ProbabilityPill>` — same reason. Wide historical wants the captured prediction; narrow historical (the listing card) wants it suppressed.
+- `<LineScore>`'s `currentInning={historical ? null : game.inning}` / `half={historical ? null : game.half}` override at the call site in `<GameCard>` — passing the live values into the historical detail page would mix the live half-inning highlight with the selection highlight on the same cells.
+- `defaultInningSelection` prefers full over half when both are captured. If you change this default to "first half-inning," the page's first paint flips to a half-inning view even when full is available, and the user has to click into the full view manually — wrong default for the page's primary use (looking at full-inning predictions).
+- The `pa` field on `NrXiPerBatter` round-trips through Supabase JSON. The full-inning frozen state stitches `[...top.perBatter, ...bottom.perBatter]` so any test fixture for `perBatter` must include `pa`.
+
+---
+
+## History page — plays panel (per-inning hitter / pitcher rollups)
+
+`<HistoricalPlaysPanel>` (`components/historical-plays-panel.tsx`) renders **below** the frozen-state `<GameCard>` on `/history/[pk]`. For the currently selected inning tab it shows three sections: a Batters table, a Pitchers table, and a play-by-play log. Composed in `<HistoricalGameView>` inside the same wrapping `space-y-6` as the card so the whole thing scrolls as one column.
+
+**Data source:** `lib/db/plays.ts:getGamePlays(pk)` — one row per completed plate appearance, written once at the watcher's Final exit (see [ARCHITECTURE.md](ARCHITECTURE.md) → `lib/history/`). Pre-`0003_plays.sql` games have no rows; the panel renders a "no play-by-play stored" hint instead of an empty table.
+
+**Per-tab slicing:** caller passes the same `InningSelection` the card uses. For `kind: "half"` the panel filters `plays.filter(p => p.inning === sel.inning && p.half === sel.half)` and renders one block. For `kind: "full"` it splits into two blocks (top + bottom of the same inning) so the rollups stay cleanly attributable — combining halves would conflate the two batting teams in the Batters table.
+
+**Rollup attribution:**
+- `rollupBatters(rows)` — one row per unique `batterId`. PA counts every completed PA; AB excludes BB / IBB / HBP / SF / SH / catcher's interference. R is approximated from `eventType === "home_run"` only — runner-scored attribution per row would need walking `runners[]` against the batter id, which we skip in v1 (pitcher R is the load-bearing display, sourced from `runs_on_play` directly).
+- `rollupPitchers(rows)` — one row per unique `pitcherId`. `ipOuts` walks the rows in `at_bat_index` order, tracks the running outs total per `(inning, half)` (resets on key change), and attributes each `max(0, endOuts − prevOuts)` increment to the pitcher who threw the play. This handles mid-inning pitching changes correctly. R = sum of `runs_on_play` (counted at capture time from `runners[]` with `movement.end === "score"`).
+
+**Don't change without thinking:**
+- `selection.kind === "full"` keeps top/bottom in **separate** rendered blocks. Merging them under one Batters table would mix the two teams' lineups (top half = away batters, bottom half = home).
+- `formatIp(outs)` returns `"X.Y"` strings (`7 → "2.1"`), not decimal IP — this is conventional baseball notation. Don't switch to `outs / 3` because it'd render `2.333`.
+- The `{plays.length === 0}` short-circuit at the top of the panel renders a friendly hint for older games. Don't replace with `notFound()` — pre-archive games still have valid card / inning data, only the play log is missing.
+- Reading `plays` from Supabase is part of the page's `Promise.all` next to `getGame` / `getInningPredictions`. Keep it parallel — serializing the three calls inflates TTFB on the history detail page for no benefit.

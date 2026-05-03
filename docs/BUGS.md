@@ -190,27 +190,59 @@ await Promise.all([
 
 Every tick of every watcher resets the entire hash's 24h TTL. As long as **any** watcher is publishing today, the hash never expires — and any field-keys from prior runtimes (especially under different gamePks) stay forever.
 
-**Fix:** `services/lib/prune-snapshots.ts:pruneStaleSnapshots(todaysGamePks)` deletes any field-key not in the keep set. The supervisor calls it after `seedSnapshot` on every cron firing (`services/supervisor.ts`). Idempotent and cheap (one `HKEYS` + at most one `HDEL` of the diff list).
+**Fix:** `services/lib/prune-snapshots.ts:pruneStaleSnapshots({ todayET })` reads the snapshot hash and deletes any field-key whose row's own `officialDate < todayET`. The supervisor calls it after `seedSnapshot` on every cron firing (`services/supervisor.ts`), passing the same `date` it used for the schedule fetch so prune and seed share one clock.
+
+The original implementation discriminated by "field-keys not in today's schedule pk list" — that was reverted in 2026-05-02 because a manual cron rerun whose schedule fetch came back partial or empty wiped still-scheduled games (see Bug 10). The row's own `officialDate` is sourced from the seed step (`services/steps/seed-snapshot.ts:officialDate: g.officialDate`) and preserved by every live publish, so we can identify yesterday's leftovers without consulting the schedule at all.
 
 ```ts
 // services/supervisor.ts (excerpt)
 await withRetry(() => seedSnapshot(games), { signal, label: "seedSnapshot" });
-await withRetry(() => pruneSnapshotsFn(games.map((g) => g.gamePk)), {
+await withRetry(() => pruneSnapshotsFn({ todayET: date }), {
   signal,
   label: "pruneStaleSnapshots",
 });
 ```
 
 Also shipped:
-- `bin/prune-snapshots.ts` — one-shot CLI for emergency cleanup outside a cron firing.
+- `bin/prune-snapshots.ts` — one-shot CLI for emergency cleanup outside a cron firing. `--date YYYY-MM-DD` overrides the cutoff (no longer fetches the schedule).
 - `bin/seed-once.ts` — recovery helper after `bin/prune-snapshots.ts --all` wipes the hash.
 - `bin/inspect-snapshot.ts` — read-only field-key dump.
 
-**Regression check:** after each natural cron firing, `npx tsx bin/inspect-snapshot.ts` should print exactly today's gamePks. If it ever shows extras, the prune step has regressed.
+**Regression check:** after each natural cron firing, `npx tsx bin/inspect-snapshot.ts` should print only rows whose `officialDate === todayET`. Rows with stale `officialDate` mean prune regressed.
 
 **Don't change without thinking:**
 - The `pruneStaleSnapshots` call after `seedSnapshot` in `services/supervisor.ts`. Removing it lets prior-day field-keys accumulate forever (until the entire hash TTL elapses without ANY publish — which doesn't happen during the season).
 - `pruneStaleSnapshots` operating on `nrxi:snapshot` only — never touches `nrxi:lock:*` or `nrxi:watcher-state:*` (those have their own TTLs and per-gamePk semantics).
-- The supervisor calling prune even when `games.length === 0` (off-season days). That's exactly when prior-day field-keys most need wiping.
+- The conservative-on-parse-failure behavior: rows that don't parse, or that lack `officialDate`, are kept. A transient deserialization bug must never become a hash wipe.
 
-**Why an alternative `r.del(snapshot)` + reseed wasn't chosen:** diff-based pruning preserves any HSET writes that landed between schedule fetch and the prune call (e.g., a watcher whose game is on today's schedule and started publishing during the supervisor boot). DEL would briefly wipe valid in-progress data. The diff-based approach is also one extra HKEYS + one HDEL of the diff list — trivial cost.
+**Why an alternative `r.del(snapshot)` + reseed wasn't chosen:** date-based pruning preserves any HSET writes that landed between schedule fetch and the prune call (e.g., a watcher whose game is on today's schedule and started publishing during the supervisor boot). DEL would briefly wipe valid in-progress data. The date-based approach is one HGETALL + one HDEL of the stale list — trivial cost.
+
+---
+
+## Bug 10: Cron rerun pruned today's still-scheduled games
+
+**Symptom:** user reran the daily Railway cron (`0 12 * * *` UTC) on 2026-05-02 and "scheduled games later in the day disappeared" from the dashboard. They never came back without redeploying / waiting for the next natural cron firing.
+
+**Root cause:** `pruneStaleSnapshots(todaysGamePks)` discriminated by "field-keys not in the schedule fetch's pk list" and ran unconditionally after seed. The dashboard reads only from the `nrxi:snapshot` hash (`getSnapshot()` in `lib/pubsub/publisher.ts`, called from `app/page.tsx`) — there is no fallback to the MLB schedule API, so any pk that drops out of `todaysGamePks` between two cron runs vanishes from the UI.
+
+The pk-list discriminator is fragile in three real-world ways:
+
+1. **Empty schedule fetch.** `runSupervisor` only calls `seedSnapshot` when `games.length > 0` but **always** called prune. A transient MLB API hiccup that returns `{ dates: [] }`, or a date with a league-wide postponement, wiped the entire hash.
+2. **TZ rollover at the rerun moment.** `todayInTz("America/New_York")` is computed at supervisor start. A rerun firing after midnight ET (around 04:00–05:00 UTC) queried tomorrow's schedule, today's pks weren't in `todaysGamePks`, and today's still-Live or still-Pre rows got pruned.
+3. **Mid-day postponements.** A single game removed from MLB's schedule between the first and second runs (rainout reclassified) had its snapshot field deleted on rerun even though everything else was fine.
+
+**Fix:** discriminate by each row's own `officialDate`, not by the schedule-fetch pk list. `pruneStaleSnapshots({ todayET })` now `HGETALL`s the snapshot hash, parses each value, and deletes only when `officialDate < todayET`. Rows whose value can't be parsed, or that lack an `officialDate`, are kept (conservative — a transient deserialization bug must never become a hash wipe).
+
+This is robust to all three failure modes:
+- Empty schedule fetch → today's rows all have `officialDate === todayET`, none get deleted.
+- TZ rollover → only rows with yesterday's `officialDate` get cleaned, which is exactly what we want.
+- Mid-day postponement → row stays until its `officialDate` becomes yesterday, then gets cleaned tomorrow.
+
+Also keeps Bug 9's original guarantee: zombies from a paused/crashed prior runtime still get cleaned because their `officialDate` is `< todayET`.
+
+**Regression check:** simulate a rerun in `services/supervisor.test.ts` with `fetchScheduleFn` returning `[]` and assert the prune call site receives `{ todayET: date }`, not a pk list. Unit-test `pruneStaleSnapshots` with mixed today/yesterday rows and confirm only yesterday is deleted.
+
+**Don't change without thinking:**
+- The discriminator must be the row's own `officialDate`, not today's schedule pk list. Reintroducing the pk-list form re-opens this bug.
+- The conservative parse-failure behavior. Strict mode (delete on parse failure) reintroduces the "transient deserialization wipes the hash" risk.
+- The supervisor passing its own `date` as `todayET`. Letting prune compute its own clock independently can drift if the supervisor was started near a midnight rollover.

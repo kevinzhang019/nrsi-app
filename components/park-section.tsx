@@ -61,7 +61,7 @@ function WindStat({ mph, cardinal }: { mph: number | null | undefined; cardinal:
           ) : (
             <span aria-hidden className="inline-block h-3 w-3" />
           )}
-          <span>{formatWindMph(mph)} mph</span>
+          <span>{formatWindMph(mph)}</span>
           {!isCalm && cardinal && cardinal in COMPASS_TO_DEG && (
             <span className="text-[10px] uppercase tracking-wider text-[var(--color-muted)]/80">
               {cardinal}
@@ -152,14 +152,16 @@ export function ParkSection({
           </span>
         </div>
         <div className="flex-1 space-y-3">
-          <div className="flex gap-6">
+          <div className="grid grid-cols-2 gap-x-3 items-center">
             <FactorBadge label="Park" value={parkRunFactor} />
-            <FactorBadge label="Wx" value={weatherRunFactor} />
-            {dome && (
-              <span className="self-center rounded-sm bg-[var(--color-subtle)] px-1.5 py-0.5 text-[9px] uppercase tracking-[0.2em] text-[var(--color-muted)]">
-                dome
-              </span>
-            )}
+            <div className="flex items-center gap-2">
+              <FactorBadge label="Wx" value={weatherRunFactor} />
+              {dome && (
+                <span className="self-center rounded-sm bg-[var(--color-subtle)] px-1.5 py-0.5 text-[9px] uppercase tracking-[0.2em] text-[var(--color-muted)]">
+                  dome
+                </span>
+              )}
+            </div>
           </div>
           <div className="grid grid-cols-2 gap-x-3 gap-y-2">
             <Stat label="Temp" value={w.tempF != null ? `${Math.round(w.tempF)} °F` : null} />

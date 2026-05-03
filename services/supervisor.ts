@@ -28,7 +28,7 @@ export type SupervisorOpts = {
   // Override for tests — defaults to a real schedule fetch + Redis seed.
   fetchScheduleFn?: (date: string) => Promise<ScheduledGame[]>;
   seedSnapshotFn?: (games: ScheduledGame[]) => Promise<{ seeded: number }>;
-  pruneStaleSnapshotsFn?: (todaysGamePks: number[]) => Promise<{
+  pruneStaleSnapshotsFn?: (opts?: { todayET?: string }) => Promise<{
     total: number;
     kept: number;
     deleted: number;
@@ -85,12 +85,14 @@ export async function runSupervisor(opts: SupervisorOpts = {}): Promise<{
     log.info("supervisor", "seeded");
   }
 
-  // Drop any snapshot field-keys not in today's schedule. Required because
-  // `publishGameState` resets the hash's 24h TTL on every tick, so games from
-  // a prior runtime that was mid-watching when paused/crashed can otherwise
-  // hang around as "Live" zombies on the dashboard. Idempotent — safe to call
-  // every cron firing.
-  await withRetry(() => pruneSnapshotsFn(games.map((g) => g.gamePk)), {
+  // Drop snapshot field-keys whose `officialDate` is older than today (ET).
+  // Required because `publishGameState` resets the hash's 24h TTL on every
+  // tick, so games from a prior runtime that was mid-watching when
+  // paused/crashed can otherwise hang around as "Live" zombies on the
+  // dashboard. Discriminator is the row's own `officialDate` rather than the
+  // schedule fetch's pk list — a manual rerun whose fetch is partial or
+  // empty no longer wipes today's still-scheduled games. See BUGS.md bug #10.
+  await withRetry(() => pruneSnapshotsFn({ todayET: date }), {
     signal,
     label: "pruneStaleSnapshots",
   });

@@ -52,8 +52,9 @@ describe("runSupervisor", () => {
     // No games -> seed not called (avoids a no-op Redis call).
     expect(seedSnapshotFn).not.toHaveBeenCalled();
     // Prune still runs even with zero games — that's how off-season days
-    // cleanly wipe the prior day's stale snapshot entries.
-    expect(pruneStaleSnapshotsFn).toHaveBeenCalledWith([]);
+    // cleanly wipe the prior day's stale snapshot entries. It receives the
+    // supervisor's `date` as the cutoff so prune and seed share one clock.
+    expect(pruneStaleSnapshotsFn).toHaveBeenCalledWith({ todayET: "2026-04-15" });
     expect(runWatcherFn).not.toHaveBeenCalled();
   });
 
@@ -107,6 +108,25 @@ describe("runSupervisor", () => {
     resolveWatcher();
     const result = await supervisorPromise;
     expect(result).toEqual({ scheduled: 1, reason: "idle" });
+  });
+
+  it("calls prune with the supervisor's date as todayET, regardless of games count", async () => {
+    // Regression for BUGS.md bug #10: a rerun whose schedule fetch happens to
+    // return zero games (transient API issue, postponements) must not pass a
+    // pk-list to prune — we now pass the date, so prune discriminates by each
+    // row's own officialDate and leaves today's still-scheduled rows alone.
+    const pruneStaleSnapshotsFn = vi.fn().mockResolvedValue({ total: 5, kept: 5, deleted: 0 });
+    await runSupervisor({
+      date: "2026-05-02",
+      fetchScheduleFn: vi.fn().mockResolvedValue([]),
+      seedSnapshotFn: vi.fn().mockResolvedValue({ seeded: 0 }),
+      pruneStaleSnapshotsFn,
+      runWatcherFn: vi.fn(),
+      computeIdleDeadlineFn: () => new Date(Date.now() - 1000),
+      idleCheckIntervalMs: 5,
+    });
+    expect(pruneStaleSnapshotsFn).toHaveBeenCalledTimes(1);
+    expect(pruneStaleSnapshotsFn).toHaveBeenCalledWith({ todayET: "2026-05-02" });
   });
 
   it("aborts via signal even when watchers are still running", async () => {

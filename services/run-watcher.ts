@@ -16,12 +16,14 @@ import { loadLineupSplitsStep } from "./steps/load-lineup-splits";
 import { loadParkFactorStep } from "./steps/load-park-factor";
 import { loadWeatherStep } from "./steps/load-weather";
 import { loadDefenseStep } from "./steps/load-defense";
+import { prewarmBenchAndBullpenStep } from "./steps/prewarm-bench-bullpen";
 import { computeNrXiStep } from "./steps/compute-nrXi";
 import { computeLineupStatsStep } from "./steps/compute-lineup-stats";
 import { publishUpdateStep } from "./steps/publish-update";
 import { enrichLineupHandsStep } from "./steps/enrich-lineup-hands";
 import { persistFinishedGameStep } from "./steps/persist-finished-game";
 import { buildInningCapture } from "./capture-inning";
+import { buildPlayRows } from "../lib/history/build-plays";
 import { readMarkovStartState } from "./start-state";
 import { shouldSkipBottomNinth } from "./full-inning";
 import { getUpcomingForCurrentInning, lineupHash } from "../lib/mlb/lineup";
@@ -210,6 +212,12 @@ export async function runWatcher(
     let lastPitcherWhip = restored.lastPitcherWhip;
     let lastAwayPitcher = restored.lastAwayPitcher;
     let lastHomePitcher = restored.lastHomePitcher;
+    // Per-team most-recent batter id. Updated only on live-play ticks so the
+    // value freezes at the half-inning break and lets extractBatterFocus
+    // resolve the next-half leadoff as order[(idx + 1) % 9] for the OTHER
+    // team instead of always returning order[0].
+    let lastAwayBatterId = restored.lastAwayBatterId;
+    let lastHomeBatterId = restored.lastHomeBatterId;
     let lastFullInning = restored.lastFullInning;
     let lastLineupStats: GameState["lineupStats"] = restored.lastLineupStats;
     let capturedInnings = restored.capturedInnings;
@@ -240,6 +248,25 @@ export async function runWatcher(
         ls.isTopInning === true ? "Top" : ls.isTopInning === false ? "Bottom" : null;
       const outs = ls.outs ?? null;
       const inningState = ls.inningState ?? "";
+
+      // Track the most-recent batter per team during live play. Skipping
+      // middle/end/3-out ticks freezes the value across the inning break, so
+      // when the half flips we still know exactly where each team left off
+      // and can hand a real leadoff (= next spot in the order) to the UI.
+      const inningStateLower = inningState.toLowerCase();
+      const isLivePa =
+        status === "Live" &&
+        outs !== null &&
+        outs < 3 &&
+        inningStateLower !== "middle" &&
+        inningStateLower !== "end";
+      if (isLivePa) {
+        const currentBatterIdRaw = ls.offense?.batter?.id ?? null;
+        if (currentBatterIdRaw !== null) {
+          if (ls.isTopInning === true) lastAwayBatterId = currentBatterIdRaw;
+          else if (ls.isTopInning === false) lastHomeBatterId = currentBatterIdRaw;
+        }
+      }
 
       const lh = lineupHash(
         tick.feed.liveData.boxscore?.teams.home.battingOrder,
@@ -335,6 +362,19 @@ export async function runWatcher(
         parkCache = park;
         weatherCache = weather;
         defenseCache = defense;
+
+        // Fire-and-forget cache warmup for everyone on the bench / in the
+        // bullpen so a pinch-hit or relief change later in the game is a pure
+        // Redis hit instead of a critical-path MLB Stats API round-trip.
+        void prewarmBenchAndBullpenStep({
+          gamePk: input.gamePk,
+          feed: tick.feed,
+        }).catch((err) =>
+          log.warn("watcher", "prewarmBenchBullpen:err", {
+            gamePk: input.gamePk,
+            err: String(err),
+          }),
+        );
 
         lastEnv = {
           parkRunFactor: park.runFactor,
@@ -581,7 +621,7 @@ export async function runWatcher(
         lineups: lastLineups ?? extractLineups(tick.feed),
         lineupStats: lastLineupStats,
         linescore: extractLinescore(tick.feed),
-        ...extractBatterFocus(tick.feed),
+        ...extractBatterFocus(tick.feed, { away: lastAwayBatterId, home: lastHomeBatterId }),
         updatedAt: new Date().toISOString(),
         // Carry venue-local game day + UTC start time straight off the live
         // feed. The seeded snapshot set these at Pre-game from the schedule,
@@ -629,6 +669,8 @@ export async function runWatcher(
           lastPitcherWhip,
           lastAwayPitcher,
           lastHomePitcher,
+          lastAwayBatterId,
+          lastHomeBatterId,
         });
       } catch (err) {
         log.error("watcher", "saveWatcherState:fail", {
@@ -638,12 +680,19 @@ export async function runWatcher(
       }
 
       if (status === "Final") {
+        // Build the per-play archive once from the terminal feed. The full
+        // game's allPlays array is in `tick.feed` here, so this is a pure
+        // transform with zero extra fetches. Persisted alongside
+        // capturedInnings; PK (game_pk, at_bat_index) keeps it idempotent if
+        // the watcher retries this branch.
+        const playRows = buildPlayRows(tick.feed, input.gamePk);
         log.info("watcher", "final", {
           gamePk: input.gamePk,
           innings: Object.keys(capturedInnings).length,
+          plays: playRows.length,
         });
         await withRetry(
-          () => persistFinishedGameStep({ finalState: state, capturedInnings }),
+          () => persistFinishedGameStep({ finalState: state, capturedInnings, playRows }),
           { signal, label: "persistFinishedGame" },
         );
         // Clear the watcher-state key — game is done, no resume needed.

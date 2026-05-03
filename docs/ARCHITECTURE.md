@@ -13,7 +13,7 @@
                   │  services/supervisor│  bin/supervisor.ts → services/supervisor.ts
                   │  - fetchSchedule    │
                   │  - seedSnapshot     │  hsetnx Pre stubs into nrxi:snapshot
-                  │  - pruneStale       │  hdel field-keys not in today's schedule
+                  │  - pruneStale       │  hdel field-keys whose officialDate < today (ET)
                   │  - per game: setTimeout(gameDate-90s, runWatcher)
                   │  - idle-loop until pending=0 AND now > tomorrow 06:00 UTC
                   │  - process.exit(0) → Railway scales container to zero
@@ -31,13 +31,16 @@
    │     fetchLiveDiff (timecode resume)            │ on inning   │
    │     compute (structuralKey, playStateKey)      │ transition: │
    │     loadLineupSplits + park + weather + def ◀──┤  recompute  │
+   │     prewarmBenchAndBullpen (fire-and-forget)   │             │
    │     computeNrXi (24-state Markov)              │             │
    │     buildInningCapture (clean half boundary)   │             │
    │     publishUpdate → nrxi:snapshot HSET         │             │
    │     saveWatcherState (every tick) ─────────────┤             │
    │     adaptive sleep 5s/15s/30s/300s             │             │
-   │  4. on Final: persistFinishedGameStep          │             │
-   │     → games + inning_predictions in Supabase   │             │
+   │  4. on Final: buildPlayRows(tick.feed)          │             │
+   │     persistFinishedGameStep                     │             │
+   │     → games + inning_predictions + plays        │             │
+   │       in Supabase                               │             │
    │     clearWatcherState; exit                    │             │
    └─────────────────────┼───────────────────────────────────────┘
                          │
@@ -46,7 +49,8 @@
               │   Upstash Redis      │         │  Supabase Postgres │
               │   - nrxi:snapshot    │         │  - games          │
               │   - nrxi:games chan  │         │  - inning_predic. │
-              │   - nrxi:lock:{pk}   │         └─────────┬────────┘
+              │   - nrxi:lock:{pk}   │         │  - plays           │
+              │                      │         └─────────┬────────┘
               │   - nrxi:watcher-    │                   │
               │     state:{pk}       │                   │ server-component
               │   - cached splits/   │                   │ reads
@@ -83,7 +87,7 @@ Three levers the Railway architecture adds to keep CPU usage close to the actual
 ### Services (Railway)
 
 #### `services/supervisor.ts` — `runSupervisor`
-Daily entry point invoked by `bin/supervisor.ts`. Fetches today's schedule, calls `seedSnapshotStep` (hsetnx Pre stubs), runs `pruneStaleSnapshots` to wipe field-keys for games not on today's schedule, then enqueues per-game watcher tasks with `setTimeout(gameDate - 90s, runWatcher)`. Tracks `pending: Set<gamePk>` and exits cleanly when the set drains AND we're past `defaultIdleDeadline()` (next-day 06:00 UTC). On SIGTERM, drains watchers up to a 30s budget, then exits.
+Daily entry point invoked by `bin/supervisor.ts`. Fetches today's schedule, calls `seedSnapshotStep` (hsetnx Pre stubs), runs `pruneStaleSnapshots({ todayET: date })` to wipe field-keys whose row's own `officialDate < todayET`, then enqueues per-game watcher tasks with `setTimeout(gameDate - 90s, runWatcher)`. Tracks `pending: Set<gamePk>` and exits cleanly when the set drains AND we're past `defaultIdleDeadline()` (next-day 06:00 UTC). On SIGTERM, drains watchers up to a 30s budget, then exits.
 
 Test seams: `fetchScheduleFn`, `seedSnapshotFn`, `pruneStaleSnapshotsFn`, `runWatcherFn`, `computeIdleDeadlineFn`, `idleCheckIntervalMs` are all injectable.
 
@@ -97,12 +101,12 @@ One async task per gamePk, lives inside the supervisor process. Receives `{ game
 4. Loop up to `MAX_LOOPS = 1500` AND `Date.now() - startedAt < 6h`:
    - `fetchLiveDiffStep` with last seen `metaData.timeStamp` for tiny diff payloads.
    - Build `structuralKey` (half | inning | lineup | defense | opposing pitcher | atBat batter | bottom-9-skipped flag) and `playStateKey` (outs | bases | atBatIndex). Set `shouldReloadStructure` and `shouldRecomputePlay` triggers.
-   - **Phase 1 (structural reload):** parallel fetch `loadLineupSplitsStep`, `loadParkFactorStep`, `loadWeatherStep`, `loadDefenseStep`. Compute display lineup stats for both teams. Pre-compute opposite-half clean-state P(no run) for full-inning composition (skipped at top-9 when the home team is leading — see `services/full-inning.ts:shouldSkipBottomNinth`; the score is part of `structuralKey` so a tying run mid-top-9 forces a reload). Persist to hoisted `lastNrXi`, `lastEnv`, `lastPitcher*`, `lastLineupStats`, etc.
+   - **Phase 1 (structural reload):** parallel fetch `loadLineupSplitsStep`, `loadParkFactorStep`, `loadWeatherStep`, `loadDefenseStep`. Compute display lineup stats for both teams. Pre-compute opposite-half clean-state P(no run) for full-inning composition (skipped at top-9 when the home team is leading — see `services/full-inning.ts:shouldSkipBottomNinth`; the score is part of `structuralKey` so a tying run mid-top-9 forces a reload). Persist to hoisted `lastNrXi`, `lastEnv`, `lastPitcher*`, `lastLineupStats`, etc. Also kick off `prewarmBenchAndBullpenStep` **fire-and-forget** (`void`-prefixed, not awaited) — it loads handedness + per-PA splits for every bench hitter and bullpen pitcher on both teams so a future pinch-hit / relief change is a pure Redis hit instead of a critical-path MLB Stats API round-trip.
    - **Phase 2 (play-state recompute):** `computeNrXiStep` against current outs/bases. Update `lastFullInning`. Cheap — reuses Phase 1 caches.
    - Build `GameState` from current feed + last computed nrXi. `publishUpdateStep` writes to `nrxi:snapshot` hash.
    - `buildInningCapture` records the per-half-inning prediction snapshot exactly once at `outs===0 && (bases===0 || bases===2)` (the Manfred runner allowance for extras).
    - `saveWatcherState` serializes the hoisted-var bundle to Redis (`nrxi:watcher-state:{gamePk}`, 24h TTL). One HSET per tick.
-   - If `status === "Final"`: call `persistFinishedGameStep` (Supabase upsert), `clearWatcherState`, return `{ reason: "final" }`.
+   - If `status === "Final"`: call `buildPlayRows(tick.feed, gamePk)` (pure transform of `liveData.plays.allPlays` — completed PAs only, with names resolved from boxscore), then `persistFinishedGameStep` (Supabase upsert of `games` + `inning_predictions` + `plays`), `clearWatcherState`, return `{ reason: "final" }`. Per-play capture is **post-game only**, not per-tick — terminal feed already has the full play log, and history-only data shouldn't inflate `saveWatcherState` writes.
    - Adaptive sleep: 5s during active PAs, 15s otherwise (Live), 30s Pre, 300s Delayed/Suspended. See `services/steps/fetch-live-diff.ts:chooseRecommendedWaitSeconds`.
 
 The core probability pipeline (Log5 → env → TTOP → framing → defense → 24-state Markov → calibrate) lives in `lib/prob/*` and is unchanged from the WDK days. See [`PROBABILITY_MODEL.md`](PROBABILITY_MODEL.md).
@@ -115,7 +119,7 @@ The core probability pipeline (Log5 → env → TTOP → framing → defense →
 | `with-retry.ts` | WDK step auto-retry | exponential-backoff wrapper |
 | `lock.ts` | `workflows/steps/lock.ts` | acquire (30s TTL) + background refresher every 10s |
 | `watcher-state.ts` | WDK hoisted-var durability | JSON serialize hoisted vars to Redis per tick |
-| `prune-snapshots.ts` | (new) | hdel snapshot field-keys not in today's schedule |
+| `prune-snapshots.ts` | (new) | hdel snapshot field-keys whose row's own `officialDate < todayET` |
 | `load-env.ts` | Next.js auto-load of `.env.local` | tsx doesn't auto-load it; bin/* scripts import this first |
 
 #### `services/steps/*` — plain async helpers
@@ -135,7 +139,7 @@ What used to be WDK `"use step"` functions, now plain async functions called via
 | `compute-lineup-stats.ts` | Display-only xOBP/xSLG for both teams' starters | drives the "one team at a time" view |
 | `enrich-lineup-hands.ts` | Hydrate batter handedness from `/people/{id}` | 30d Redis TTL, graceful per-id fail |
 | `publish-update.ts` | Write `GameState` to Redis snapshot + publish to channel | resets snapshot 24h TTL each call |
-| `persist-finished-game.ts` | Upsert games + inning_predictions to Supabase | no-ops if Supabase env vars unset |
+| `persist-finished-game.ts` | Upsert games + inning_predictions + plays to Supabase | no-ops if Supabase env vars unset |
 
 ### `bin/*` — CLI tools
 
@@ -164,8 +168,9 @@ The two old WDK-era routes (`/api/cron/start-day` and `/api/workflows/*`) are go
 - `types.ts` — Zod schemas (`ScheduleResponse`, `PersonResponse`, `SplitsResponse`) and a `LiveFeed` TypeScript type. Includes `gameData.datetime.officialDate` (venue-local YYYY-MM-DD, the canonical history bucket key).
 - `splits.ts` — Two parallel loader sets:
   - **v1 legacy** — `loadBatterProfile` / `loadPitcherProfile` return scalar `obpVs` / `whipVs`. Retained for the deprecated `pReach` path.
-  - **v2** — `loadBatterPaProfile` / `loadPitcherPaProfile` return per-handedness `paVs: PaOutcomes` (8-outcome multinomial), with empirical-Bayes shrinkage and a last-30-day blend.
+  - **v2** — `loadBatterPaProfile` / `loadPitcherPaProfile` return per-handedness `paVs: PaOutcomes` (8-outcome multinomial). Pulls **current + prior regular-season splits in parallel**, blends them via a Marcel-style 3:2 recency multiplier on PA, EB-shrinks the combined baseline against true PA at `n0 = 200`, then folds in a 30% last-30-day blend when L30 has ≥ 20 PA.
 - `lineup.ts` — `getUpcomingForCurrentInning(feed)` extracts the next 9 upcoming batters and their pitcher. Handles `Middle`/`End`/`outs===3` half-boundary advancement. Returns `null` if `boxscore.battingOrder` < 9.
+- `extract.ts` — `extractLineups`, `extractLinescore`, `extractBatterFocus(feed, lastBatterIds?)`. The last function returns `{ battingTeam, currentBatterId, nextHalfLeadoffId }` for the lineup highlight; `nextHalfLeadoffId` requires per-team `lastBatterIds` (tracked by the watcher across ticks) to resolve to the actual on-deck spot — without it, MLB's live feed only exposes offense state for the team currently batting, so the leadoff falls back to `order[0]`.
 
 #### `lib/env/`
 - `park.ts` — Baseball Savant scraper. `getParkRunFactor` (legacy), `getParkComponentFactors` (per-outcome handedness-keyed factors).
@@ -206,7 +211,12 @@ See [PROBABILITY_MODEL.md](PROBABILITY_MODEL.md) for the full math.
 
 #### `lib/db/`
 - `supabase.ts` — service-role client (no auth/cookies). `isSupabaseConfigured()` guard makes the persist path a clean no-op when env vars are missing.
-- `games.ts` — `saveFinishedGame(args)` upserts to `games` + `inning_predictions`. Idempotent on `game_pk` and `(game_pk, inning, half)`. `gameDateOf(officialDate, startTime)` buckets by venue-local day. Read functions: `listGameDates`, `listGamesByDate`, `getGame`, `getInningPredictions`.
+- `games.ts` — `saveFinishedGame(args)` upserts to `games` + `inning_predictions` + `plays`. Idempotent on `game_pk` / `(game_pk, inning, half)` / `(game_pk, at_bat_index)`. `gameDateOf(officialDate, startTime)` buckets by venue-local day. Read functions: `listGameDates`, `listGamesByDate`, `getGame`, `getInningPredictions`.
+- `plays.ts` — `getGamePlays(gamePk)` returns the per-PA archive ordered by `at_bat_index`, used by the history detail page for per-inning hitter / pitcher rollups.
+
+#### `lib/history/`
+- `build-plays.ts` — pure transform `buildPlayRows(feed, gamePk): PlayRow[]`. Iterates `liveData.plays.allPlays`, keeps only `about.isComplete === true`, resolves batter / pitcher names from the boxscore players map (`ID${id}`) with `matchup.{batter,pitcher}.fullName` as a fallback, sums `runs_on_play` from `runners[]` with `movement.end === 'score'`. Called once at the watcher's Final exit — zero per-tick cost.
+- `rollup-plays.ts` — pure rollups. `rollupBatters(rows)` produces `{pa, ab, h, hr, bb, hbp, k, r, rbi}` per unique `batterId`; `rollupPitchers(rows)` produces `{bf, ipOuts, h, bb, hbp, k, hr, r}` per unique `pitcherId` and attributes outs to the pitcher who threw each play (handles mid-inning changes correctly). `formatIp(outs)` renders `7 → "2.1"`. Caller pre-filters to whatever (inning, half) slice it wants.
 
 ##### Caching layout
 
@@ -247,7 +257,7 @@ Drilldown. Full upcoming-lineup table with `pReach`%, plus the three-column nrXi
 #### `app/history/`
 Server-component-only routes for the persisted-games archive.
 - `page.tsx` — date strip + calendar popover (only data-days enabled). Lists games via `lib/db/games.ts:listGamesByDate`.
-- `[pk]/page.tsx` — inning tabs with frozen-state `<GameCard>` reuse via `<HistoricalGameView>`. Wraps `<GameCard>` in a Next `<Link>` and uses `<SuppressPlayerLinks>` (defined in `components/lineup-column.tsx`) to prevent nested-`<a>` hydration errors. See [UI.md](UI.md) for details.
+- `[pk]/page.tsx` — single wide frozen-state `<GameCard wide>` whose `<LineScore>` cells are themselves the inning picker (no separate selector). Inning *number* click → full-inning composition; runs cell click → that half-inning. State lives in `<HistoricalGameView>` and is forwarded into `<GameCard>` → `<LineScore>`. Below the card, `<HistoricalPlaysPanel>` renders per-tab Batters / Pitchers / play-log tables sourced from `lib/db/plays.ts:getGamePlays`. The `/history` listing page wraps `<GameCard>` in a Next `<Link>` and uses `<SuppressPlayerLinks>` (defined in `components/lineup-column.tsx`) to prevent nested-`<a>` hydration errors. See [UI.md](UI.md) for details.
 
 #### `components/park-outline.tsx`
 Inline SVG glyph rendering each home park's silhouette. Reads `lib/parks/shapes.json` keyed by `game.venue.id`. Hairline 1.25px stroke that transitions to the accent color on `highlighted=true`.

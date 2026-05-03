@@ -12,6 +12,7 @@ export async function persistFinishedGameStep(args: SaveFinishedGameArgs): Promi
   log.info("step", "persistFinishedGame:start", {
     gamePk,
     innings: Object.keys(args.capturedInnings).length,
+    plays: args.playRows.length,
   });
   if (!isSupabaseConfigured()) {
     log.warn("step", "persistFinishedGame:skip-no-config", { gamePk });

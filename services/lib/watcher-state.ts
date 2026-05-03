@@ -49,6 +49,12 @@ export type WatcherState = {
   lastPitcherWhip: number | null;
   lastAwayPitcher: PitcherCore | null;
   lastHomePitcher: PitcherCore | null;
+  // Most-recent batter id seen for each team. Updated only on live-play ticks
+  // (outs < 3 and inningState not in middle/end), so the value freezes at the
+  // half-inning break and gives extractBatterFocus a real basis for the
+  // next-half leadoff = order[(idx + 1) % 9] instead of always order[0].
+  lastAwayBatterId: number | null;
+  lastHomeBatterId: number | null;
 };
 
 export function emptyWatcherState(): WatcherState {
@@ -67,6 +73,8 @@ export function emptyWatcherState(): WatcherState {
     lastPitcherWhip: null,
     lastAwayPitcher: null,
     lastHomePitcher: null,
+    lastAwayBatterId: null,
+    lastHomeBatterId: null,
   };
 }
 

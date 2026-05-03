@@ -39,12 +39,20 @@ set -a; source .env.local; set +a
 curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/hgetall/nrxi:snapshot"
 curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/get/nrxi:lock:<gamePk>"
 curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/get/nrxi:watcher-state:<gamePk>"
+
+# Per-PA archive sanity check (Supabase). After a Final game completes, the
+# row count for that game should match the boxscore PA count (~70–90 for a
+# 9-inning game). Run via the Supabase SQL editor or `scripts/sql.mjs`:
+#   select count(*) from plays where game_pk = <pk>;
+#   select inning, half, count(*) from plays where game_pk = <pk>
+#     group by inning, half order by inning, half;
 ```
 
 Common log signatures to watch for:
 - `park:scrape:failed` / `weather:scrape:failed` — fixture-driven tests should also be failing in CI; see [BUGS.md](BUGS.md) bug #6.
 - `lock-held-by-other` — a second watcher tried to spawn for a `gamePk` that already had one. Expected on manual triggers overlapping with cron.
-- `prune:snapshots {deleted: N}` where `N > 0` — supervisor caught a zombie field-key. Healthy on the first cron firing after a deploy; unhealthy if it keeps reporting `deleted > 0` on subsequent firings (see [BUGS.md](BUGS.md) bug #9).
+- `prune:snapshots {deleted: N}` where `N > 0` — supervisor cleaned a row whose `officialDate` was older than today (ET). Healthy on the first cron firing after a day rollover; unhealthy if it keeps reporting `deleted > 0` within the same ET day (see [BUGS.md](BUGS.md) bug #9). On a same-day rerun, `deleted` should be 0 — non-zero suggests rows were written without `officialDate` and the parse-tolerance silently kept them yesterday.
+- `watcher:final {plays: N}` and `step persistFinishedGame:start {plays: N}` — emitted on a game's Final exit. `N` is the count of completed plate appearances captured from `liveData.plays.allPlays`. Healthy range: ~70–90 for a 9-inning game, more for extras. `plays: 0` on a real Final game means either the live feed dropped `allPlays` (rare; refetch + replay via the backfill path) or the migration `0003_plays.sql` hasn't been applied yet.
 
 ---
 
@@ -97,21 +105,21 @@ From the Railway dashboard: Deployments → ⋮ → Run Now. Or run locally:
 npx tsx bin/supervisor.ts
 ```
 
-The supervisor will fetch today's schedule, seed snapshots, prune zombies, and idle-loop until tomorrow 06:00 UTC (or until you Ctrl-C). On SIGTERM/SIGINT it drains active watchers up to 30s.
+The supervisor will fetch today's schedule, seed snapshots, prune yesterday-or-older rows from the snapshot hash, and idle-loop until tomorrow 06:00 UTC (or until you Ctrl-C). On SIGTERM/SIGINT it drains active watchers up to 30s. A manual rerun on the same ET day is safe — prune discriminates by each row's own `officialDate`, not by the schedule fetch's pk list, so a partial/empty fetch on the rerun won't wipe still-scheduled rows (BUGS.md bug #10).
 
 ---
 
 ## Diagnosing snapshot zombies
 
-The supervisor's `pruneStaleSnapshots` step reconciles the `nrxi:snapshot` hash against today's schedule on every cron firing. If you see games on the dashboard that aren't in today's MLB slate, something has bypassed the prune step.
+The supervisor's `pruneStaleSnapshots` step deletes any row in the `nrxi:snapshot` hash whose own `officialDate` is older than today (ET) on every cron firing. If you see rows on the dashboard whose `officialDate` is yesterday or earlier, the prune step has been bypassed (or the row was written without `officialDate` and the parse-tolerance kept it).
 
 ```bash
-# Read-only field-key dump — should match today's schedule exactly
+# Read-only field-key dump — should only contain today's officialDate
 npx tsx bin/inspect-snapshot.ts
 
 # One-shot prune (emergency cleanup outside a cron firing)
-npx tsx bin/prune-snapshots.ts                  # uses today's schedule (America/New_York)
-npx tsx bin/prune-snapshots.ts --date 2026-05-01
+npx tsx bin/prune-snapshots.ts                  # uses today (America/New_York) as the cutoff
+npx tsx bin/prune-snapshots.ts --date 2026-05-02   # override the cutoff (no longer fetches the schedule)
 
 # Nuclear option — wipe the entire hash (frontend goes blank until next seed)
 npx tsx bin/prune-snapshots.ts --all
@@ -121,7 +129,9 @@ npx tsx bin/prune-snapshots.ts --all
 npx tsx bin/seed-once.ts
 ```
 
-If the prune step keeps catching zombies firing after firing, something is writing to `nrxi:snapshot` outside the supervised path. Search for `r.hset(k.snapshot()` in the codebase — currently the only writer is `lib/pubsub/publisher.ts:publishGameState`. See [BUGS.md](BUGS.md) bug #9 for the original incident.
+The `--date` flag now overrides the date used as the cutoff, NOT the schedule we fetch — there is no schedule fetch in this script any more. Pass tomorrow's date if you want to wipe today's rows too (rare; `--all` is faster).
+
+If rows with stale `officialDate` keep appearing, something is writing to `nrxi:snapshot` outside the supervised path or with a missing/malformed `officialDate`. Search for `r.hset(k.snapshot()` in the codebase — currently the only writer is `lib/pubsub/publisher.ts:publishGameState`, which carries the seed step's `officialDate` through. See [BUGS.md](BUGS.md) bugs #9 and #10 for context.
 
 ---
 
@@ -147,7 +157,7 @@ The Supabase project lives on Supabase's infrastructure regardless of how it was
 
 **If you rotate the service-role key in the Supabase dashboard:** Vercel Marketplace's auto-injection does not propagate to Railway. Manually update `SUPABASE_SERVICE_ROLE_KEY` on Railway from the Supabase dashboard's new value.
 
-**Don't click "Disconnect" in the Vercel Marketplace UI** without first transferring billing ownership to Supabase directly (Supabase dashboard → Settings → Billing → Transfer ownership). Marketplace disconnect can interpret as "tear down the resource" and delete the `games` and `inning_predictions` tables. For free-tier projects, leaving the Marketplace integration dormant is fine — no need to disconnect.
+**Don't click "Disconnect" in the Vercel Marketplace UI** without first transferring billing ownership to Supabase directly (Supabase dashboard → Settings → Billing → Transfer ownership). Marketplace disconnect can interpret as "tear down the resource" and delete the `games`, `inning_predictions`, and `plays` tables. For free-tier projects, leaving the Marketplace integration dormant is fine — no need to disconnect.
 
 ---
 

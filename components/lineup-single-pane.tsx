@@ -9,9 +9,9 @@ type Side = "away" | "home";
 
 function teamShort(name: string): string {
   const parts = name.split(" ");
-  if (parts.length === 1) return name.slice(0, 3).toUpperCase();
+  if (parts.length === 1) return name;
   const last = parts[parts.length - 1];
-  if (["Sox", "Jays", "Rays"].includes(last)) return parts.slice(-2).join(" ");
+  if (["Sox", "Jays"].includes(last)) return parts.slice(-2).join(" ");
   return last;
 }
 

@@ -8,14 +8,18 @@
 // The supervisor calls the same logic on every cron firing — this script is
 // just for the immediate one-time cleanup before the next cron fires.
 //
+// Discrimination is by the row's own `officialDate < todayET` (see
+// `services/lib/prune-snapshots.ts`). The `--date` flag overrides what
+// "today" means for the cutoff, NOT what schedule we fetch — there is no
+// schedule fetch any more.
+//
 // Usage:
-//   npx tsx bin/prune-snapshots.ts                  # uses today (America/New_York)
+//   npx tsx bin/prune-snapshots.ts                  # uses today (America/New_York) as the cutoff
 //   npx tsx bin/prune-snapshots.ts --date 2026-05-02
 //   npx tsx bin/prune-snapshots.ts --all            # nuke the whole hash (rare)
 
 import "../services/lib/load-env";
 import { pruneStaleSnapshots } from "../services/lib/prune-snapshots";
-import { fetchSchedule } from "../lib/mlb/client";
 import { redis } from "../lib/cache/redis";
 import { k } from "../lib/cache/keys";
 import { todayInTz } from "../lib/utils";
@@ -34,13 +38,9 @@ async function main() {
     return;
   }
 
-  const date = arg("--date") ?? todayInTz("America/New_York");
-  log.info("bin/prune-snapshots", "fetching-schedule", { date });
-  const schedule = await fetchSchedule(date);
-  const gamePks = schedule.dates.flatMap((d) => d.games).map((g) => g.gamePk);
-  log.info("bin/prune-snapshots", "today's-games", { date, count: gamePks.length });
-
-  const result = await pruneStaleSnapshots(gamePks);
+  const todayET = arg("--date") ?? todayInTz("America/New_York");
+  log.info("bin/prune-snapshots", "start", { todayET });
+  const result = await pruneStaleSnapshots({ todayET });
   log.info("bin/prune-snapshots", "done", result);
 }
 

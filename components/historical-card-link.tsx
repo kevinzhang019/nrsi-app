@@ -18,7 +18,7 @@ export function HistoricalCardLink({ game }: { game: GameState }) {
     >
       <div className="pointer-events-none">
         <SuppressPlayerLinks>
-          <GameCard game={game} />
+          <GameCard game={game} historical />
         </SuppressPlayerLinks>
       </div>
     </Link>

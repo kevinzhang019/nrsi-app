@@ -1,6 +1,6 @@
 import type { GameState, PitcherInfo } from "@/lib/state/game-state";
 import type { Linescore } from "@/lib/mlb/extract";
-import type { HistoricalGame, HistoricalInning, InningCapture } from "@/lib/types/history";
+import type { HistoricalGame, HistoricalInning, InningCapture, PlayRow } from "@/lib/types/history";
 import { supabaseAdmin } from "./supabase";
 
 // Bucket games by their venue-local game day (YYYY-MM-DD) so a 7pm PT start
@@ -39,13 +39,16 @@ function actualRunsFor(linescore: Linescore | null, inning: number, half: "Top" 
 export type SaveFinishedGameArgs = {
   finalState: GameState;
   capturedInnings: Record<string, InningCapture>;
+  // Built once at the watcher's Final exit by lib/history/build-plays.ts. May
+  // be empty on dev fixtures that don't carry liveData.plays.allPlays.
+  playRows: PlayRow[];
 };
 
 // Persist a finished game + its captured per-inning predictions. Idempotent:
 // the watcher's Final exit branch could fire twice if the workflow retries the
 // step, so we upsert on (game_pk) and (game_pk, inning, half).
 export async function saveFinishedGame(args: SaveFinishedGameArgs): Promise<void> {
-  const { finalState, capturedInnings } = args;
+  const { finalState, capturedInnings, playRows } = args;
   const sb = supabaseAdmin();
 
   const gameDate = gameDateOf(finalState.officialDate, finalState.startTime);
@@ -93,12 +96,39 @@ export async function saveFinishedGame(args: SaveFinishedGameArgs): Promise<void
     captured_at: cap.capturedAt,
   }));
 
-  if (inningRows.length === 0) return;
+  if (inningRows.length > 0) {
+    const { error: innErr } = await sb
+      .from("inning_predictions")
+      .upsert(inningRows, { onConflict: "game_pk,inning,half" });
+    if (innErr) throw new Error(`saveFinishedGame: inning_predictions upsert failed — ${innErr.message}`);
+  }
 
-  const { error: innErr } = await sb
-    .from("inning_predictions")
-    .upsert(inningRows, { onConflict: "game_pk,inning,half" });
-  if (innErr) throw new Error(`saveFinishedGame: inning_predictions upsert failed — ${innErr.message}`);
+  if (playRows.length > 0) {
+    const dbRows = playRows.map((p) => ({
+      game_pk: p.gamePk,
+      at_bat_index: p.atBatIndex,
+      inning: p.inning,
+      half: p.half,
+      batter_id: p.batterId,
+      batter_name: p.batterName,
+      batter_side: p.batterSide,
+      pitcher_id: p.pitcherId,
+      pitcher_name: p.pitcherName,
+      pitcher_hand: p.pitcherHand,
+      event: p.event,
+      event_type: p.eventType,
+      rbi: p.rbi,
+      runs_on_play: p.runsOnPlay,
+      end_outs: p.endOuts,
+      away_score: p.awayScore,
+      home_score: p.homeScore,
+      raw: p.raw,
+    }));
+    const { error: playsErr } = await sb
+      .from("plays")
+      .upsert(dbRows, { onConflict: "game_pk,at_bat_index" });
+    if (playsErr) throw new Error(`saveFinishedGame: plays upsert failed — ${playsErr.message}`);
+  }
 }
 
 // Distinct game dates we have data for, latest first. Drives the date strip

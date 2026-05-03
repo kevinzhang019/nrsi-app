@@ -83,10 +83,11 @@ Implementation: `lib/prob/log5.ts:log5Matchup`.
 ```
 
 Each side is built by:
-1. Pulling raw counts from the MLB Stats API splits payload (cached 12h).
-2. Converting to per-PA rates: `single = (H − 2B − 3B − HR) / PA`, `bb = BB / PA`, etc. The `ipOut` rate is `1 − Σ(other rates)` so the multinomial sums to 1 by construction.
-3. **Empirical-Bayes shrinkage** to `LEAGUE_PA[handedness]` with prior strength `n0 = 200` PA: `shrunken = (n × observed + n0 × league) / (n + n0)`. Stabilizes early-season and small-sample players.
-4. **Recent-form blend** (last 30 days, weight 0.30 if there is material recent data): `(1 − w) × season_shrunk + w × recent_shrunk`. Falls back gracefully to season-only if the date-range fetch is empty.
+1. Pulling raw counts from the MLB Stats API splits payload **for both current and prior regular seasons in parallel** (each cached 12h, regular-season only — `season=YYYY` aggregates exclude postseason by default).
+2. Converting each season's splits to per-PA rates: `single = (H − 2B − 3B − HR) / PA`, `bb = BB / PA`, etc. The `ipOut` rate is `1 − Σ(other rates)` so the multinomial sums to 1 by construction.
+3. **Marcel-style 3:2 recency blend** of current + prior into a single baseline rate: `combined = (W_CURRENT × currentPa × currentRates + W_PRIOR × priorPa × priorRates) / (W_CURRENT × currentPa + W_PRIOR × priorPa)` with `W_CURRENT = 3`, `W_PRIOR = 2`. Per-PA weight on current is 1.5× prior — the simplest two-year analogue of Marcel's 5/4/3 / ZiPS's 8/5/4/3 schemes. Early-season this means a veteran's rate is dominated by their prior season (e.g. 30 current + 600 prior PA → blend is `(3·30):(2·600) = 90:1200`, so prior contributes ~93%). Late-season the same player tilts ~63% current. Either side can be missing — combine collapses to whichever exists.
+4. **Empirical-Bayes shrinkage** of the combined baseline to `LEAGUE_PA[handedness]` with prior strength `n0 = 200` PA, applied against the **actual** observed PA (`currentPa + priorPa`, *not* the weighted PA): `shrunken = (truePa × combined + n0 × league) / (truePa + n0)`. Keeping `n0 = 200` against true PA preserves the existing calibration — the recency multiplier biases *which* observations dominate, but doesn't claim more evidence than we have.
+5. **Recent-form blend** (last 30 days, weight 0.30 if there is material recent data — `≥ 20 PA`): `(1 − w) × baseline_shrunk + w × recent_shrunk`. Falls back gracefully to baseline-only if the date-range fetch is empty or the L30 sample is below the materiality gate.
 
 `LEAGUE_PA` constants are 2024–2025 MLB averages by pitcher hand, sourced from FanGraphs splits leaderboards. They drift very slowly year-over-year; refresh annually or when calibration starts to drift.
 

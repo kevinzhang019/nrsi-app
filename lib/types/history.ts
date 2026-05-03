@@ -51,3 +51,26 @@ export type HistoricalGame = {
 export type HistoricalInning = InningCapture & {
   actualRuns: number | null;
 };
+
+// One plate appearance, written once at the watcher's Final exit. Mirrors
+// the columns of supabase migration 0003_plays.sql exactly.
+export type PlayRow = {
+  gamePk: number;
+  atBatIndex: number;
+  inning: number;
+  half: "Top" | "Bottom";
+  batterId: number;
+  batterName: string;
+  batterSide: string | null;
+  pitcherId: number;
+  pitcherName: string;
+  pitcherHand: string | null;
+  event: string | null;
+  eventType: string | null;
+  rbi: number;
+  runsOnPlay: number;
+  endOuts: number | null;
+  awayScore: number | null;
+  homeScore: number | null;
+  raw: Record<string, unknown>;
+};

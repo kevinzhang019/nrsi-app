@@ -118,6 +118,16 @@ const RECENT_WEIGHT = 0.30;
 
 const RECENT_DAYS = 30;
 
+/**
+ * Marcel-style recency multipliers on per-PA blending across current + prior
+ * regular seasons. Current-year observations carry 1.5× the per-PA weight of
+ * prior-year observations in the blended rate. Shrinkage strength (SHRINK_N0)
+ * is applied against ACTUAL observed PA, not the weighted PA, so the existing
+ * EB calibration stays grounded in real sample size.
+ */
+const W_CURRENT = 3;
+const W_PRIOR = 2;
+
 // Default profile when a split is entirely absent (rare; fallback path).
 function defaultPa(hand: "L" | "R"): PaOutcomes {
   return { ...LEAGUE_PA[hand] };
@@ -166,6 +176,30 @@ function blendPa(a: PaOutcomes, b: PaOutcomes, bWeight: number): PaOutcomes {
     out[key] = (1 - w) * a[key] + w * b[key];
   });
   return out;
+}
+
+/**
+ * Combine current + prior regular-season per-PA outcomes with the W_CURRENT /
+ * W_PRIOR recency multiplier on the blended rate. Returns the actual observed
+ * PA (truePa) separately, so callers can shrink against true sample size while
+ * still benefiting from the recency bias in the rates.
+ */
+function combineSeasonsPa(
+  current: { rates: PaOutcomes; pa: number } | null,
+  prior: { rates: PaOutcomes; pa: number } | null,
+): { rates: PaOutcomes; truePa: number } | null {
+  if (!current && !prior) return null;
+  if (!current) return { rates: prior!.rates, truePa: prior!.pa };
+  if (!prior) return { rates: current.rates, truePa: current.pa };
+  const wc = W_CURRENT * current.pa;
+  const wp = W_PRIOR * prior.pa;
+  const denom = wc + wp;
+  if (denom === 0) return null;
+  const out = {} as PaOutcomes;
+  (Object.keys(current.rates) as (keyof PaOutcomes)[]).forEach((key) => {
+    out[key] = (wc * current.rates[key] + wp * prior.rates[key]) / denom;
+  });
+  return { rates: out, truePa: current.pa + prior.pa };
 }
 
 /** Empirical-Bayes shrinkage to the league mean. Preserves sum-to-1. */
@@ -334,20 +368,26 @@ type SideResult = { rates: PaOutcomes; pa: number };
 
 /** Build a shrunken, recency-blended PaOutcomes for one handedness side. */
 function buildSide(
-  seasonStat: Record<string, unknown> | null,
+  currentSeasonStat: Record<string, unknown> | null,
+  priorSeasonStat: Record<string, unknown> | null,
   recentStat: Record<string, unknown> | null,
   league: PaOutcomes,
   hand: "L" | "R",
 ): SideResult {
-  const seasonRaw = paFromStat(seasonStat);
+  const baselineRaw = combineSeasonsPa(
+    paFromStat(currentSeasonStat),
+    paFromStat(priorSeasonStat),
+  );
   const recentRaw = paFromStat(recentStat);
 
-  if (!seasonRaw && !recentRaw) {
+  if (!baselineRaw && !recentRaw) {
     return { rates: defaultPa(hand), pa: 0 };
   }
 
-  const seasonShrunk = seasonRaw
-    ? shrinkPa(seasonRaw.rates, seasonRaw.pa, league)
+  // Shrink the recency-weighted blend against the *actual* observed PA so the
+  // existing SHRINK_N0 calibration stays grounded in real sample size.
+  const baselineShrunk = baselineRaw
+    ? shrinkPa(baselineRaw.rates, baselineRaw.truePa, league)
     : league;
   const recentShrunk = recentRaw
     ? shrinkPa(recentRaw.rates, recentRaw.pa, league)
@@ -356,29 +396,32 @@ function buildSide(
   // Only blend in recent form if we actually have last-30 data with material PA.
   const hasMaterialRecent = recentRaw && recentRaw.pa >= 20 && recentShrunk;
   const blended = hasMaterialRecent
-    ? blendPa(seasonShrunk, recentShrunk, RECENT_WEIGHT)
-    : seasonShrunk;
+    ? blendPa(baselineShrunk, recentShrunk, RECENT_WEIGHT)
+    : baselineShrunk;
 
-  return { rates: blended, pa: seasonRaw?.pa ?? 0 };
+  return { rates: blended, pa: baselineRaw?.truePa ?? 0 };
 }
 
 export async function loadBatterPaProfile(playerId: number): Promise<BatterPaProfile> {
-  const hand = await loadHand(playerId);
-  let raw = await loadHittingSplitsRaw(playerId, SEASON);
-  let splits = raw.stats[0]?.splits ?? [];
-  if (splits.length === 0) {
-    raw = await loadHittingSplitsRaw(playerId, FALLBACK_SEASON);
-    splits = raw.stats[0]?.splits ?? [];
-  }
-  const recent = await loadHittingSplitsRecentRaw(playerId, RECENT_DAYS);
+  const [hand, currentRaw, priorRaw, recent] = await Promise.all([
+    loadHand(playerId),
+    loadHittingSplitsRaw(playerId, SEASON),
+    loadHittingSplitsRaw(playerId, SEASON - 1),
+    loadHittingSplitsRecentRaw(playerId, RECENT_DAYS),
+  ]);
 
-  const seasonVL = pickSplit(splits, "vl");
-  const seasonVR = pickSplit(splits, "vr");
+  const currentSplits = currentRaw.stats[0]?.splits ?? [];
+  const priorSplits = priorRaw.stats[0]?.splits ?? [];
+
+  const currentVL = pickSplit(currentSplits, "vl");
+  const currentVR = pickSplit(currentSplits, "vr");
+  const priorVL = pickSplit(priorSplits, "vl");
+  const priorVR = pickSplit(priorSplits, "vr");
   const recentVL = pickSplit(recent, "vl");
   const recentVR = pickSplit(recent, "vr");
 
-  const sideL = buildSide(seasonVL, recentVL, LEAGUE_PA.L, "L");
-  const sideR = buildSide(seasonVR, recentVR, LEAGUE_PA.R, "R");
+  const sideL = buildSide(currentVL, priorVL, recentVL, LEAGUE_PA.L, "L");
+  const sideR = buildSide(currentVR, priorVR, recentVR, LEAGUE_PA.R, "R");
 
   return {
     id: hand.id,
@@ -390,22 +433,25 @@ export async function loadBatterPaProfile(playerId: number): Promise<BatterPaPro
 }
 
 export async function loadPitcherPaProfile(playerId: number): Promise<PitcherPaProfile> {
-  const hand = await loadHand(playerId);
-  let raw = await loadPitchingSplitsRaw(playerId, SEASON);
-  let splits = raw.stats[0]?.splits ?? [];
-  if (splits.length === 0) {
-    raw = await loadPitchingSplitsRaw(playerId, FALLBACK_SEASON);
-    splits = raw.stats[0]?.splits ?? [];
-  }
-  const recent = await loadPitchingSplitsRecentRaw(playerId, RECENT_DAYS);
+  const [hand, currentRaw, priorRaw, recent] = await Promise.all([
+    loadHand(playerId),
+    loadPitchingSplitsRaw(playerId, SEASON),
+    loadPitchingSplitsRaw(playerId, SEASON - 1),
+    loadPitchingSplitsRecentRaw(playerId, RECENT_DAYS),
+  ]);
 
-  const seasonVL = pickSplit(splits, "vl");
-  const seasonVR = pickSplit(splits, "vr");
+  const currentSplits = currentRaw.stats[0]?.splits ?? [];
+  const priorSplits = priorRaw.stats[0]?.splits ?? [];
+
+  const currentVL = pickSplit(currentSplits, "vl");
+  const currentVR = pickSplit(currentSplits, "vr");
+  const priorVL = pickSplit(priorSplits, "vl");
+  const priorVR = pickSplit(priorSplits, "vr");
   const recentVL = pickSplit(recent, "vl");
   const recentVR = pickSplit(recent, "vr");
 
-  const sideL = buildSide(seasonVL, recentVL, LEAGUE_PA.L, "L");
-  const sideR = buildSide(seasonVR, recentVR, LEAGUE_PA.R, "R");
+  const sideL = buildSide(currentVL, priorVL, recentVL, LEAGUE_PA.L, "L");
+  const sideR = buildSide(currentVR, priorVR, recentVR, LEAGUE_PA.R, "R");
 
   return {
     id: hand.id,
@@ -417,4 +463,4 @@ export async function loadPitcherPaProfile(playerId: number): Promise<PitcherPaP
 }
 
 // Internal helpers exported for tests.
-export const __testing = { paFromStat, blendPa, defaultPa };
+export const __testing = { paFromStat, blendPa, combineSeasonsPa, defaultPa, buildSide };

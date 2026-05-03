@@ -6,6 +6,7 @@ import { HistoricalGameView } from "@/components/historical-game-view";
 import { SettingsProvider } from "@/lib/hooks/use-settings";
 import { isSupabaseConfigured } from "@/lib/db/supabase";
 import { getGame, getInningPredictions } from "@/lib/db/games";
+import { getGamePlays } from "@/lib/db/plays";
 
 async function DetailBody({ paramsPromise }: { paramsPromise: Promise<{ pk: string }> }) {
   await connection();
@@ -21,10 +22,14 @@ async function DetailBody({ paramsPromise }: { paramsPromise: Promise<{ pk: stri
     );
   }
 
-  const [game, innings] = await Promise.all([getGame(pk), getInningPredictions(pk)]);
+  const [game, innings, plays] = await Promise.all([
+    getGame(pk),
+    getInningPredictions(pk),
+    getGamePlays(pk),
+  ]);
   if (!game) notFound();
 
-  return <HistoricalGameView game={game} innings={innings} />;
+  return <HistoricalGameView game={game} innings={innings} plays={plays} />;
 }
 
 function DetailSkeleton() {
@@ -45,11 +50,8 @@ export default function HistoricalGameDetailPage({
   return (
     <SettingsProvider>
       <main className="mx-auto max-w-[1400px] px-6 py-8">
-        <header className="mb-8 flex items-start justify-between">
-          <div>
-            <h1 className="text-2xl font-medium tracking-tight text-[var(--color-accent)]">game detail</h1>
-            <p className="mt-1 text-sm text-[var(--color-muted)]">predictions per inning + actual outcome</p>
-          </div>
+        <header className="mb-4 flex items-start justify-between">
+          <h1 className="text-2xl font-medium tracking-tight text-[var(--color-accent)]">game details</h1>
           <Link
             href="/history"
             className="text-xs uppercase tracking-[0.16em] text-[var(--color-muted)] hover:text-[var(--color-accent)]"

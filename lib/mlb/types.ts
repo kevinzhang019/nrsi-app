@@ -94,6 +94,36 @@ export type BoxscorePlayer = {
   };
 };
 
+// Subset of `liveData.plays.allPlays[]` we consume. Plain TS, no zod — same
+// trust convention as the rest of LiveFeed. Anything we read in
+// lib/history/build-plays.ts goes here; everything else stays on `raw`.
+export type PlayDoc = {
+  about?: {
+    atBatIndex?: number;
+    inning?: number;
+    halfInning?: string; // 'top' | 'bottom'
+    isComplete?: boolean;
+  };
+  matchup?: {
+    batter?: { id?: number; fullName?: string };
+    pitcher?: { id?: number; fullName?: string };
+    batSide?: { code?: HandCode };
+    pitchHand?: { code?: PitchHand };
+  };
+  result?: {
+    event?: string;
+    eventType?: string;
+    rbi?: number;
+    awayScore?: number;
+    homeScore?: number;
+  };
+  count?: { outs?: number };
+  runners?: Array<{
+    details?: { runner?: { id?: number } };
+    movement?: { end?: string | null };
+  }>;
+};
+
 export type LiveFeed = {
   metaData: { timeStamp: string; wait?: number };
   gameData: {
@@ -150,11 +180,15 @@ export type LiveFeed = {
         away: {
           battingOrder?: number[];
           pitchers?: number[];
+          bench?: number[];
+          bullpen?: number[];
           players?: Record<string, BoxscorePlayer>;
         };
         home: {
           battingOrder?: number[];
           pitchers?: number[];
+          bench?: number[];
+          bullpen?: number[];
           players?: Record<string, BoxscorePlayer>;
         };
       };
@@ -169,6 +203,10 @@ export type LiveFeed = {
           pitchHand?: { code: PitchHand };
         };
       };
+      // Full game play log. Present on full feeds; we only consume it once
+      // at the Final exit branch in services/run-watcher.ts so per-tick cost
+      // is zero. Each completed plate appearance becomes one `plays` row.
+      allPlays?: PlayDoc[];
     };
   };
 };

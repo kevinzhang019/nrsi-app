@@ -12,20 +12,44 @@ import { ParkSection } from "@/components/park-section";
 import { PitcherRow } from "@/components/pitcher-row";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { decisionMomentFor } from "@/lib/state/decision-moment";
+import type {
+  InningSelection,
+  InningAvailability,
+} from "@/components/historical-game-view-helpers";
 
 type Side = "away" | "home";
 
 function teamShort(name: string): string {
   const parts = name.split(" ");
-  if (parts.length === 1) return name.slice(0, 3).toUpperCase();
+  if (parts.length === 1) return name;
   const last = parts[parts.length - 1];
-  if (["Sox", "Jays", "Rays"].includes(last)) return parts.slice(-2).join(" ");
+  if (["Sox", "Jays"].includes(last)) return parts.slice(-2).join(" ");
   return last;
 }
 
-export function GameCard({ game }: { game: GameState }) {
+export function GameCard({
+  game,
+  historical = false,
+  wide = false,
+  selection = null,
+  inningAvailability,
+  onSelectInning,
+  onSelectHalf,
+}: {
+  game: GameState;
+  historical?: boolean;
+  wide?: boolean;
+  selection?: InningSelection | null;
+  inningAvailability?: InningAvailability;
+  onSelectInning?: (n: number) => void;
+  onSelectHalf?: (n: number, half: "Top" | "Bottom") => void;
+}) {
   const { settings } = useSettings();
-  const decision = decisionMomentFor(game, settings.predictMode);
+  const decision = !historical && decisionMomentFor(game, settings.predictMode);
+  // Wide mode forces side-by-side lineups regardless of the user's
+  // viewMode setting — the detail page is wide enough that single-pane
+  // would waste horizontal space.
+  const effectiveViewMode = wide ? "split" : settings.viewMode;
 
   // Single-pane lineup selection. Lifted here so the pitcher row above the
   // pane can render the OPPOSING pitcher to the selected lineup. Auto-snaps
@@ -110,14 +134,18 @@ export function GameCard({ game }: { game: GameState }) {
             linescore={game.linescore}
             awayName={game.away.name}
             homeName={game.home.name}
-            currentInning={game.inning}
-            half={game.half}
+            currentInning={historical ? null : game.inning}
+            half={historical ? null : game.half}
+            selection={selection}
+            availability={inningAvailability}
+            onSelectInning={onSelectInning}
+            onSelectHalf={onSelectHalf}
           />
         </section>
       )}
 
       <section className="space-y-3 px-4 py-4">
-        {settings.viewMode === "single" ? (
+        {(!historical || wide) && (effectiveViewMode === "single" ? (
           <>
             {(() => {
               // Pitcher pitching to the selected lineup (the OPPOSING side).
@@ -138,39 +166,70 @@ export function GameCard({ game }: { game: GameState }) {
           </>
         ) : (
           <>
-            {(() => {
-              // Currently-pitching team is the one fielding now: Top → home pitches,
-              // Bottom → away pitches. Pre-game / Final default to home on top.
-              const fieldingSide: Side =
-                game.half === "Top" ? "home" : game.half === "Bottom" ? "away" : "home";
-              const top = fieldingSide === "away" ? game.awayPitcher : game.homePitcher;
-              const bottom = fieldingSide === "away" ? game.homePitcher : game.awayPitcher;
-              if (!top && !bottom) return game.pitcher ? <PitcherRow pitcher={game.pitcher} /> : null;
-              return (
-                <div className="space-y-1">
-                  {top && <PitcherRow pitcher={top} />}
-                  {bottom && <PitcherRow pitcher={bottom} muted />}
+            {game.battingTeam === null ? (
+              // Full-inning view: each lineup paired with the OPPOSING pitcher
+              // (the one who actually pitched to it that half). Render the
+              // pitchers above their respective lineup columns instead of
+              // stacked at the top.
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div className="space-y-2">
+                  {game.homePitcher && <PitcherRow pitcher={game.homePitcher} />}
+                  <LineupColumn
+                    label={teamShort(game.away.name)}
+                    lineup={game.lineups?.away ?? null}
+                    highlightId={null}
+                    highlightKind={null}
+                    statsById={statsById}
+                  />
                 </div>
-              );
-            })()}
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              <LineupColumn
-                label={teamShort(game.away.name)}
-                lineup={game.lineups?.away ?? null}
-                highlightId={awayHighlightId}
-                highlightKind={awayMarker}
-                statsById={statsById}
-              />
-              <LineupColumn
-                label={teamShort(game.home.name)}
-                lineup={game.lineups?.home ?? null}
-                highlightId={homeHighlightId}
-                highlightKind={homeMarker}
-                statsById={statsById}
-              />
-            </div>
+                <div className="space-y-2">
+                  {game.awayPitcher && <PitcherRow pitcher={game.awayPitcher} />}
+                  <LineupColumn
+                    label={teamShort(game.home.name)}
+                    lineup={game.lineups?.home ?? null}
+                    highlightId={null}
+                    highlightKind={null}
+                    statsById={statsById}
+                  />
+                </div>
+              </div>
+            ) : (
+              <>
+                {(() => {
+                  // Currently-pitching team is the one fielding now: Top → home pitches,
+                  // Bottom → away pitches. Pre-game / Final default to home on top.
+                  const fieldingSide: Side =
+                    game.half === "Top" ? "home" : game.half === "Bottom" ? "away" : "home";
+                  const top = fieldingSide === "away" ? game.awayPitcher : game.homePitcher;
+                  const bottom = fieldingSide === "away" ? game.homePitcher : game.awayPitcher;
+                  if (!top && !bottom) return game.pitcher ? <PitcherRow pitcher={game.pitcher} /> : null;
+                  return (
+                    <div className="space-y-1">
+                      {top && <PitcherRow pitcher={top} />}
+                      {bottom && <PitcherRow pitcher={bottom} muted />}
+                    </div>
+                  );
+                })()}
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                  <LineupColumn
+                    label={teamShort(game.away.name)}
+                    lineup={game.lineups?.away ?? null}
+                    highlightId={awayHighlightId}
+                    highlightKind={awayMarker}
+                    statsById={statsById}
+                  />
+                  <LineupColumn
+                    label={teamShort(game.home.name)}
+                    lineup={game.lineups?.home ?? null}
+                    highlightId={homeHighlightId}
+                    highlightKind={homeMarker}
+                    statsById={statsById}
+                  />
+                </div>
+              </>
+            )}
           </>
-        )}
+        ))}
 
         <ParkSection
           venueId={game.venue?.id ?? null}
@@ -185,12 +244,16 @@ export function GameCard({ game }: { game: GameState }) {
       <footer className="border-t border-[var(--color-border)] bg-[var(--color-subtle)]/40 px-4 py-3">
         <ProbabilityPill
           pNoHitEvent={
-            settings.predictMode === "full"
+            historical && !wide
+              ? null
+              : settings.predictMode === "full"
               ? game.pNoHitEventFullInning
               : game.pNoHitEvent
           }
           breakEvenAmerican={
-            settings.predictMode === "full"
+            historical && !wide
+              ? null
+              : settings.predictMode === "full"
               ? game.breakEvenAmericanFullInning
               : game.breakEvenAmerican
           }

@@ -116,8 +116,17 @@ export function extractLinescore(feed: LiveFeed): Linescore {
  * Identify the current batter (for the team batting now) and the leadoff
  * batter for the next half-inning (the team coming up). The card UI uses
  * these to highlight rows in each lineup.
+ *
+ * `lastBatterIds` carries the most-recent batter id seen for each team
+ * across ticks (the watcher tracks this). When provided, the next-half
+ * leadoff is the spot AFTER the other team's last batter, which is the
+ * correct value most of the game. When not provided (or before the team
+ * has batted), we fall back to order[0].
  */
-export function extractBatterFocus(feed: LiveFeed): {
+export function extractBatterFocus(
+  feed: LiveFeed,
+  lastBatterIds?: { away: number | null; home: number | null },
+): {
   battingTeam: "home" | "away" | null;
   currentBatterId: number | null;
   nextHalfLeadoffId: number | null;
@@ -151,13 +160,19 @@ export function extractBatterFocus(feed: LiveFeed): {
     currentBatterId = ls.offense?.batter?.id ?? null;
   }
 
-  // Next-half leadoff for the OTHER team.
+  // Next-half leadoff for the OTHER team. If the watcher has tracked their
+  // last batter, advance one spot in the order; otherwise (team hasn't
+  // batted yet) leadoff = order[0].
   const otherOrder = bx.teams[otherTeam].battingOrder ?? [];
-  // We don't know exactly where they left off without more state, so default
-  // to the next batter in their order; if MLB feed exposes per-team offense
-  // state we'd use it here. For now, leadoff = order[0] when the team hasn't
-  // batted yet, otherwise null (we'll just highlight the last known batter).
-  const nextHalfLeadoffId = otherOrder[0] ?? null;
+  const otherLast = otherTeam === "away" ? lastBatterIds?.away : lastBatterIds?.home;
+  let nextHalfLeadoffId: number | null;
+  if (otherLast != null && otherOrder.length === 9) {
+    const idx = otherOrder.indexOf(otherLast);
+    nextHalfLeadoffId =
+      idx >= 0 ? otherOrder[(idx + 1) % 9] ?? null : otherOrder[0] ?? null;
+  } else {
+    nextHalfLeadoffId = otherOrder[0] ?? null;
+  }
 
   return { battingTeam, currentBatterId, nextHalfLeadoffId };
 }
