@@ -1,0 +1,152 @@
+{
+  "108": {
+    "name": "Los Angeles Angels",
+    "abbreviation": "LAA",
+    "teamCode": "ana"
+  },
+  "109": {
+    "name": "Arizona Diamondbacks",
+    "abbreviation": "AZ",
+    "teamCode": "ari"
+  },
+  "110": {
+    "name": "Baltimore Orioles",
+    "abbreviation": "BAL",
+    "teamCode": "bal"
+  },
+  "111": {
+    "name": "Boston Red Sox",
+    "abbreviation": "BOS",
+    "teamCode": "bos"
+  },
+  "112": {
+    "name": "Chicago Cubs",
+    "abbreviation": "CHC",
+    "teamCode": "chn"
+  },
+  "113": {
+    "name": "Cincinnati Reds",
+    "abbreviation": "CIN",
+    "teamCode": "cin"
+  },
+  "114": {
+    "name": "Cleveland Guardians",
+    "abbreviation": "CLE",
+    "teamCode": "cle"
+  },
+  "115": {
+    "name": "Colorado Rockies",
+    "abbreviation": "COL",
+    "teamCode": "col"
+  },
+  "116": {
+    "name": "Detroit Tigers",
+    "abbreviation": "DET",
+    "teamCode": "det"
+  },
+  "117": {
+    "name": "Houston Astros",
+    "abbreviation": "HOU",
+    "teamCode": "hou"
+  },
+  "118": {
+    "name": "Kansas City Royals",
+    "abbreviation": "KC",
+    "teamCode": "kca"
+  },
+  "119": {
+    "name": "Los Angeles Dodgers",
+    "abbreviation": "LAD",
+    "teamCode": "lan"
+  },
+  "120": {
+    "name": "Washington Nationals",
+    "abbreviation": "WSH",
+    "teamCode": "was"
+  },
+  "121": {
+    "name": "New York Mets",
+    "abbreviation": "NYM",
+    "teamCode": "nyn"
+  },
+  "133": {
+    "name": "Athletics",
+    "abbreviation": "ATH",
+    "teamCode": "ath"
+  },
+  "134": {
+    "name": "Pittsburgh Pirates",
+    "abbreviation": "PIT",
+    "teamCode": "pit"
+  },
+  "135": {
+    "name": "San Diego Padres",
+    "abbreviation": "SD",
+    "teamCode": "sdn"
+  },
+  "136": {
+    "name": "Seattle Mariners",
+    "abbreviation": "SEA",
+    "teamCode": "sea"
+  },
+  "137": {
+    "name": "San Francisco Giants",
+    "abbreviation": "SF",
+    "teamCode": "sfn"
+  },
+  "138": {
+    "name": "St. Louis Cardinals",
+    "abbreviation": "STL",
+    "teamCode": "sln"
+  },
+  "139": {
+    "name": "Tampa Bay Rays",
+    "abbreviation": "TB",
+    "teamCode": "tba"
+  },
+  "140": {
+    "name": "Texas Rangers",
+    "abbreviation": "TEX",
+    "teamCode": "tex"
+  },
+  "141": {
+    "name": "Toronto Blue Jays",
+    "abbreviation": "TOR",
+    "teamCode": "tor"
+  },
+  "142": {
+    "name": "Minnesota Twins",
+    "abbreviation": "MIN",
+    "teamCode": "min"
+  },
+  "143": {
+    "name": "Philadelphia Phillies",
+    "abbreviation": "PHI",
+    "teamCode": "phi"
+  },
+  "144": {
+    "name": "Atlanta Braves",
+    "abbreviation": "ATL",
+    "teamCode": "atl"
+  },
+  "145": {
+    "name": "Chicago White Sox",
+    "abbreviation": "CWS",
+    "teamCode": "cha"
+  },
+  "146": {
+    "name": "Miami Marlins",
+    "abbreviation": "MIA",
+    "teamCode": "mia"
+  },
+  "147": {
+    "name": "New York Yankees",
+    "abbreviation": "NYY",
+    "teamCode": "nya"
+  },
+  "158": {
+    "name": "Milwaukee Brewers",
+    "abbreviation": "MIL",
+    "teamCode": "mil"
+  }
+}

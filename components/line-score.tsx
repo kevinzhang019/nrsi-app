@@ -2,6 +2,7 @@
 
 import type { Linescore } from "@/lib/mlb/extract";
 import { cn } from "@/lib/utils";
+import { teamLogoSrc } from "@/lib/teams/logo";
 import type { InningSelection, InningAvailability } from "@/components/historical-game-view-helpers";
 
 function teamShort(name: string): string {
@@ -16,6 +17,8 @@ export function LineScore({
   linescore,
   awayName,
   homeName,
+  awayId,
+  homeId,
   currentInning,
   half,
   selection,
@@ -26,6 +29,8 @@ export function LineScore({
   linescore: Linescore;
   awayName: string;
   homeName: string;
+  awayId: number;
+  homeId: number;
   currentInning: number | null;
   half: "Top" | "Bottom" | null;
   selection?: InningSelection | null;
@@ -54,6 +59,7 @@ export function LineScore({
   const renderRow = (
     side: "away" | "home",
     teamLabel: string,
+    teamId: number,
     totals: { R: number; H: number; E: number },
   ) => {
     const sideHalf: "Top" | "Bottom" = side === "away" ? "Top" : "Bottom";
@@ -69,8 +75,19 @@ export function LineScore({
       selection?.kind === "full" && selection.inning === n;
     return (
       <tr>
-        <td className="pr-2 text-left text-[10px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
-          {teamLabel}
+        <td className="pr-2 text-left text-[10px] uppercase tracking-[0.16em] text-[var(--color-fg)]/85">
+          <span className="inline-flex items-center gap-1.5">
+            <img
+              src={teamLogoSrc(teamId)}
+              alt=""
+              width={14}
+              height={14}
+              loading="lazy"
+              decoding="async"
+              className="size-3.5 shrink-0 object-contain"
+            />
+            {teamLabel}
+          </span>
         </td>
         {innings.map((inn) => {
           const accent = isLiveHalf(inn.num) || isSelectedHalf(inn.num) || isInFullSelection(inn.num);
@@ -183,8 +200,8 @@ export function LineScore({
           </tr>
         </thead>
         <tbody>
-          {renderRow("away", teamShort(awayName), linescore.totals.away)}
-          {renderRow("home", teamShort(homeName), linescore.totals.home)}
+          {renderRow("away", teamShort(awayName), awayId, linescore.totals.away)}
+          {renderRow("home", teamShort(homeName), homeId, linescore.totals.home)}
         </tbody>
       </table>
     </div>

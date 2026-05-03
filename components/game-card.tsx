@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { ProbabilityPill } from "@/components/probability-pill";
 import { InningState } from "@/components/inning-state";
 import { LineScore } from "@/components/line-score";
+import { teamLogoSrc } from "@/lib/teams/logo";
 import { LineupColumn } from "@/components/lineup-column";
 import { LineupSinglePane } from "@/components/lineup-single-pane";
 import { ParkSection } from "@/components/park-section";
@@ -104,19 +105,33 @@ export function GameCard({
       )}
     >
       <header className="flex items-start justify-between border-b border-[var(--color-border)] px-4 py-3">
-        <div className="space-y-1">
-          <div className="flex items-baseline gap-3">
-            <span className="text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
-              {teamShort(game.away.name)}
-            </span>
-            <span className="font-mono text-2xl tabular-nums">{game.away.runs}</span>
-          </div>
-          <div className="flex items-baseline gap-3">
-            <span className="text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
-              {teamShort(game.home.name)}
-            </span>
-            <span className="font-mono text-2xl tabular-nums">{game.home.runs}</span>
-          </div>
+        <div className="grid grid-cols-[28px_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1.5">
+          <img
+            src={teamLogoSrc(game.away.id)}
+            alt=""
+            width={28}
+            height={28}
+            loading="lazy"
+            decoding="async"
+            className="size-7 shrink-0 object-contain"
+          />
+          <span className="text-[11px] uppercase tracking-[0.16em] text-[var(--color-fg)]/85 truncate">
+            {teamShort(game.away.name)}
+          </span>
+          <span className="font-mono text-2xl tabular-nums justify-self-end">{game.away.runs}</span>
+          <img
+            src={teamLogoSrc(game.home.id)}
+            alt=""
+            width={28}
+            height={28}
+            loading="lazy"
+            decoding="async"
+            className="size-7 shrink-0 object-contain"
+          />
+          <span className="text-[11px] uppercase tracking-[0.16em] text-[var(--color-fg)]/85 truncate">
+            {teamShort(game.home.name)}
+          </span>
+          <span className="font-mono text-2xl tabular-nums justify-self-end">{game.home.runs}</span>
         </div>
         <InningState
           status={game.status}
@@ -134,6 +149,8 @@ export function GameCard({
             linescore={game.linescore}
             awayName={game.away.name}
             homeName={game.home.name}
+            awayId={game.away.id}
+            homeId={game.home.id}
             currentInning={historical ? null : game.inning}
             half={historical ? null : game.half}
             selection={selection}
@@ -257,6 +274,7 @@ export function GameCard({
               ? game.breakEvenAmericanFullInning
               : game.breakEvenAmerican
           }
+          inning={game.inning}
         />
       </footer>
     </article>

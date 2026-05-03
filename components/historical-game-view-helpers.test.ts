@@ -6,7 +6,7 @@ import {
   buildAvailability,
   buildFullInningFrozenState,
   defaultInningSelection,
-  runsBefore,
+  runsThrough,
 } from "./historical-game-view-helpers";
 
 const baseSnapshot: GameState = {
@@ -96,19 +96,19 @@ function makeInning(
   };
 }
 
-describe("runsBefore", () => {
-  it("sums all prior innings + away half when half=Bottom", () => {
+describe("runsThrough", () => {
+  it("includes all innings through the selected one when half=Bottom", () => {
     const g = makeGame();
-    const before = runsBefore(g.linescore, 3, "Bottom");
-    expect(before.away).toBe(1 + 0 + 4); // innings 1,2 + away of 3
-    expect(before.home).toBe(0 + 2);
+    const score = runsThrough(g.linescore, 3, "Bottom");
+    expect(score.away).toBe(1 + 0 + 4); // innings 1,2,3 away
+    expect(score.home).toBe(0 + 2 + 1); // innings 1,2,3 home
   });
 
-  it("excludes the same-inning away when half=Top", () => {
+  it("includes the selected inning's away but not its home when half=Top", () => {
     const g = makeGame();
-    const before = runsBefore(g.linescore, 3, "Top");
-    expect(before.away).toBe(1);
-    expect(before.home).toBe(2);
+    const score = runsThrough(g.linescore, 3, "Top");
+    expect(score.away).toBe(1 + 0 + 4); // innings 1,2,3 away
+    expect(score.home).toBe(0 + 2); // innings 1,2 home only
   });
 });
 
@@ -158,14 +158,14 @@ describe("buildFullInningFrozenState", () => {
     expect(Math.abs(frozen.breakEvenAmerican! % 5)).toBe(0);
   });
 
-  it("scores the header at runs-before-Top of the inning", () => {
+  it("scores the header at runs-through-end of the inning", () => {
     const game = makeGame();
     const top = makeInning(3, "Top", 0.7, 0.3);
     const bottom = makeInning(3, "Bottom", 0.7, 0.3);
     const frozen = buildFullInningFrozenState(game, top, bottom);
-    // Innings 1,2 only — inning-3 runs not yet "in" for full-inning view.
-    expect(frozen.away.runs).toBe(1);
-    expect(frozen.home.runs).toBe(2);
+    // Innings 1..3 inclusive — full-inning view shows the score AFTER the inning.
+    expect(frozen.away.runs).toBe(1 + 0 + 4);
+    expect(frozen.home.runs).toBe(0 + 2 + 1);
   });
 
   it("sets battingTeam=null and inning/half=Top/0", () => {

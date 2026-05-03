@@ -4,6 +4,7 @@ import { useMemo } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { useGameStream } from "@/lib/hooks/use-game-stream";
 import { GameCard } from "@/components/game-card";
+import { HistoricalCardLink } from "@/components/historical-card-link";
 import type { GameState } from "@/lib/state/game-state";
 import { decisionMomentFor } from "@/lib/state/decision-moment";
 import { useSettings } from "@/lib/hooks/use-settings";
@@ -96,7 +97,7 @@ export function GameBoard({ initial }: { initial: GameState[] }) {
                   exit={{ opacity: 0 }}
                   transition={{ type: "spring", stiffness: 350, damping: 32, opacity: { duration: 0.25 } }}
                 >
-                  <GameCard game={g} />
+                  {section.id === "finished" ? <HistoricalCardLink game={g} /> : <GameCard game={g} />}
                 </motion.div>
               ))}
             </AnimatePresence>

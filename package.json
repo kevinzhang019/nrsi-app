@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "build:park-shapes": "node scripts/build-park-shapes.mjs"
+    "build:park-shapes": "node scripts/build-park-shapes.mjs",
+    "build:team-logos": "node scripts/fetch-team-logos.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.105.1",

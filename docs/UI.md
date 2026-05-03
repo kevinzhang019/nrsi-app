@@ -16,6 +16,10 @@ Picks which probability `<ProbabilityPill>` shows.
 - `half` → `pNoHitEvent` / `breakEvenAmerican` — P(no run scored in the current half-inning).
 - `full` → `pNoHitEventFullInning` / `breakEvenAmericanFullInning` — P(no run scored across BOTH halves of the current inning).
 
+The pill's label substitutes the predicted inning into the brand: `P(nr{N}i)` where `N = game.inning`. `<GameCard>` threads `game.inning` into `<ProbabilityPill>`. Pre-game cards (`game.inning === null`) fall back to literal `nrXi`. On the historical detail page, `buildFrozenState` / `buildFullInningFrozenState` already write the selected inning into `game.inning`, so the same path renders `P(nr5i)`, `P(nr7i)`, etc., as the user clicks through the line-score cells.
+
+**Empty-state label is always `nrXi`, never `nr{N}i`.** When `pNoHitEvent` or `breakEvenAmerican` is `null` (the pill renders the `—` placeholder), the label is hardcoded to the project name `nrXi` regardless of `game.inning`. This matters for the dashboard Finished section and `/history` listing: both pass `pNoHitEvent={null}` (no inning-specific prediction is being shown), so without this branch a Final game with `inning = 9` would surface "nr9i" on a card that has nothing to do with the 9th inning specifically. The non-null branch (live cards + the wide `/history/[pk]` detail page) still substitutes the actual inning, since there `nr{N}i` accurately labels the captured prediction.
+
 The full-inning value is computed server-side in `services/run-watcher.ts`:
 - `half === "Top"`: `pNoFull = pNoTop_current × pNoBot_clean`. The bottom-half factor comes from a SECOND `computeNrXiStep` call with `startState: { outs: 0, bases: 0 }` (or `bases: 2` in extras for the Manfred runner), the home team's 9 starters, and the away team's current pitcher.
 - `half === "Bottom"`: `pNoFull = pNoBot_current` — the top is over, so half = full.
@@ -48,12 +52,28 @@ Picks which lineup layout `<GameCard>` renders.
 
 The dashboard groups today's games into four sections in fixed order: **Highlighted → Active → Upcoming → Finished**. Each is a separate `<AnimatePresence mode="popLayout">` parent, and each card is a `<motion.div layout layoutId={`card-${gamePk}`}>` so a card animates smoothly when `isDecisionMoment` flips (Active ↔ Highlighted) or when status changes (Pre → Live → Final).
 
+**Finished section uses `<HistoricalCardLink>`, not `<GameCard>` directly.** `components/game-board.tsx` branches on `section.id === "finished"` and renders `<HistoricalCardLink game={g} />` for that section only — so a Finished dashboard card is byte-identical to the same game's card on `/history` (compact `historical` mode: linescore + score header only, no lineups / probability pill), and clicking it routes to `/history/[pk]`. Live, Highlighted, Upcoming, and Delayed/Suspended games still render the full `<GameCard game={g} />`. The branch keys off the section id so the Pre → Live → Final transition still hits the same `<motion.div layoutId={`card-${gamePk}`}>` wrapper — only the inner card swaps. Don't add a section-name suffix to `key` or `layoutId`; the cross-section fade depends on the wrapper staying mounted.
+
 Two things make this work end-to-end:
 
 1. **`services/steps/seed-snapshot.ts`** runs at the top of the supervisor (Railway cron `0 12 * * *`) and writes a `Pre` stub `GameState` into `nrxi:snapshot` for every scheduled game via `hsetnx`. This is what populates the Upcoming section before any per-game watcher starts (~90s pre-game). When a watcher's first `publishGameState` lands, the `hset` overwrites the stub atomically — same `gamePk` → same `layoutId` → card stays mounted, fields fill in.
 2. **`useGameStream` keeps a stable `Map<gamePk, GameState>`.** SSE updates merge into the map; `<GameBoard>` re-derives sections via `useMemo`; cards already in flight finish their layout animation while still receiving fresh props. Don't add a section-name suffix to the `key` or `layoutId` — that would force remounts on section changes.
 
 If you ever need to suppress the fade for a specific case (e.g. initial paint), use `<AnimatePresence initial={false}>` (already set in `game-board.tsx`).
+
+---
+
+## Score header (logo + name + runs)
+
+The top-left block of `<GameCard>` (`components/game-card.tsx`) is a 3-column CSS grid (`grid-cols-[28px_minmax(0,1fr)_auto]`), two rows — away on top, home below. Each row is `[28px logo] [team short name] [mono runs]`, with the runs cell `justify-self-end` so both teams' runs are right-aligned regardless of name length. `<InningState>` keeps its position on the right via the parent `flex justify-between`. The grid is unchanged across `historical` / `wide` variants — every card surface gets the same header.
+
+**Logos.** Static SVGs at `public/logos/{teamId}.svg`, fetched once via `npm run build:team-logos` (`scripts/fetch-team-logos.mjs`). The script pulls the canonical 30-team list from `https://statsapi.mlb.com/api/v1/teams?sportId=1` and downloads each `https://www.mlbstatic.com/team-logos/{id}.svg` to disk; it also writes `lib/teams/team-meta.json` (name + abbreviation per id) as a sanity-check manifest. The runtime helper `lib/teams/logo.ts:teamLogoSrc(id)` is the single source of truth for the asset path — don't hardcode `/logos/...` strings in components. Logos render via plain `<img loading="lazy" decoding="async" alt="">` (decorative; the visible team name carries the semantics). No `next/image` because the SVGs are tiny and there's nothing to optimize, and the project's existing convention is zero `next/image` usage.
+
+**LineScore parity.** The team-label cell in `components/line-score.tsx`'s left column gets a 14px logo prefix in front of the abbreviation. `<LineScore>` accepts `awayId` / `homeId` props that `<GameCard>` plumbs from `game.away.id` / `game.home.id` (already on every `GameState`). The full game-card header logo + the line-score row-label logo share `lib/teams/logo.ts` so a path rename is one line.
+
+**Team-name color.** Both the score header and the line-score row labels render team short names in `text-[var(--color-fg)]/85` — deliberately matching the **hover** color of the away/home toggle in `components/lineup-single-pane.tsx:83`. That color is the de facto "secondary text emphasized" tone used by the single-pane lineup tabs, and reusing it keeps the card's typographic hierarchy coherent (logos give identity, names sit at the same emphasis level as interactive lineup-tab text, runs dominate at `text-2xl`). Don't drift to bare `text-white` (loses the consistency) or back to `text-[var(--color-muted)]` (was washed out next to the bold logos).
+
+**Refresh.** Run `npm run build:team-logos` if a team rebrands or relocates with a new MLB id (vanishingly rare). Output is checked in. Athletics use id 133 — confirmed served by mlbstatic post-relocation.
 
 ---
 
@@ -144,20 +164,20 @@ Refresh path: `npm run build:park-shapes` whenever a team relocates or a new par
 **Wide `<GameCard>` layout.** When `wide`:
 - Drops the `max-w-md` constraint (the page wraps it at `max-w-[1400px]`).
 - Forces `viewMode = "split"` regardless of the user's setting — the page is wide enough that single-pane wastes horizontal space.
-- Surfaces lineups + pitchers in `historical` mode (the narrow `historical` `<GameCard>` used by `<HistoricalCardLink>` on the dashboard list still hides them — wide is opt-in).
+- Surfaces lineups + pitchers in `historical` mode (the narrow `historical` `<GameCard>` used by `<HistoricalCardLink>` on the `/history` listing AND the dashboard's Finished section still hides them — wide is opt-in).
 - Surfaces the captured `<ProbabilityPill>` in `historical` mode (narrow historical mode renders the pill empty so the dashboard list of past games doesn't get cluttered).
 
 **Both historical views set `battingTeam = null`.** Half-inning (`buildFrozenState`) and full-inning (`buildFullInningFrozenState`) frozen states both null out `battingTeam` so `<GameCard>`'s split layout routes to the same paired-pitcher branch — the pitcher/lineup section renders identically across the two views, and clicking a `<LineScore>` cell only changes the score header and the captured probability, not the layout. Don't restore `battingTeam: "away" | "home"` on the half-inning helper; it would re-fork the layouts and add live-game-style highlighting on a frozen lineup.
 
 **Full-inning view.** `buildFullInningFrozenState(game, top, bottom)` (in `historical-game-view-helpers.ts`) composes the two captured halves:
 - `pNoRunFull = top.pNoRun * bottom.pNoRun` — independence assumption is fine here, the two halves are independent draws against different lineups + pitchers. `breakEvenAmericanFullInning` re-derives via `americanBreakEven` + `roundOdds` from `lib/prob/odds.ts`.
-- Score header = `runsBefore(linescore, inning, "Top")` — the state at the *start* of Top, since this is "what was the prediction going into this whole inning."
+- Score header = `runsThrough(linescore, inning, "Bottom")` — the state at the *end* of the inning. Half-inning views (`buildFrozenState`) likewise show runs through the end of the selected half. Picking an inning answers "what was the score after this inning played out?" — the captured prediction probability still reflects what the model saw going *into* the inning.
 - `inning = N`, `half = "Top"`, `outs = 0`, `bases = null` — canonical clean-state markers.
 - `battingTeam = null` is the "no single batting team" signal that flips `<GameCard>` into a paired-pitcher layout: home pitcher above the away lineup column (he pitched to them in Top); away pitcher above the home lineup column (he pitched to them in Bottom). Don't fold this back into the regular split branch — the regular branch stacks both pitchers at the top, which is correct for live-game viewing but wrong for full-inning history where each pitcher belongs visually with the lineup he faced.
 - `upcomingBatters = [...top.perBatter, ...bottom.perBatter]` so the `statsById` map in `<GameCard>` covers both teams' batters.
 
 **Don't change without thinking:**
-- The `(!historical || wide)` gate on the lineup section in `components/game-card.tsx` — narrowing it back to `!historical` hides lineups on the detail page; widening it to drop the historical guard entirely would surface lineups on the dashboard `<HistoricalCardLink>` cards (which is intentionally not what we want — the listing should stay compact).
+- The `(!historical || wide)` gate on the lineup section in `components/game-card.tsx` — narrowing it back to `!historical` hides lineups on the detail page; widening it to drop the historical guard entirely would surface lineups on every `<HistoricalCardLink>` card (both the `/history` listing AND the dashboard's Finished section, since both render via the same component now — both should stay compact).
 - The `historical && !wide ? null : ...` gate on the footer `<ProbabilityPill>` — same reason. Wide historical wants the captured prediction; narrow historical (the listing card) wants it suppressed.
 - `<LineScore>`'s `currentInning={historical ? null : game.inning}` / `half={historical ? null : game.half}` override at the call site in `<GameCard>` — passing the live values into the historical detail page would mix the live half-inning highlight with the selection highlight on the same cells.
 - `defaultInningSelection` prefers full over half when both are captured. If you change this default to "first half-inning," the page's first paint flips to a half-inning view even when full is available, and the user has to click into the full view manually — wrong default for the page's primary use (looking at full-inning predictions).

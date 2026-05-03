@@ -7,10 +7,10 @@ export type InningSelection =
   | { kind: "half"; inning: number; half: "Top" | "Bottom" }
   | { kind: "full"; inning: number };
 
-// Compute (away, home) cumulative runs scored before the start of the given
-// half-inning. e.g. start of inning 5 Top → sum innings 1..4 both teams.
-// Start of inning 5 Bottom → sum innings 1..4 both teams + inning 5 away.
-export function runsBefore(
+// Compute (away, home) cumulative runs scored through the END of the given
+// half-inning. e.g. end of inning 5 Top → sum innings 1..4 both teams + inning 5 away.
+// End of inning 5 Bottom → sum innings 1..5 both teams.
+export function runsThrough(
   linescore: Linescore | null,
   inning: number,
   half: "Top" | "Bottom",
@@ -22,23 +22,24 @@ export function runsBefore(
     if (i.num < inning) {
       away += i.away.runs ?? 0;
       home += i.home.runs ?? 0;
-    } else if (i.num === inning && half === "Bottom") {
+    } else if (i.num === inning) {
       away += i.away.runs ?? 0;
+      if (half === "Bottom") home += i.home.runs ?? 0;
     }
   }
   return { away, home };
 }
 
-// Build a frozen GameState representing the game AT THE START of the
-// selected half-inning. The score header reflects runs-before-this-half;
-// the inning/half/outs/bases reflect a clean leadoff state; the prediction
-// fields come from the captured snapshot for that half.
+// Build a frozen GameState representing the selected half-inning. The score
+// header reflects runs through the END of this half; the inning/half label
+// marks the selection; outs/bases are cleared (no in-progress mid-PA state);
+// the prediction fields come from the captured snapshot for that half.
 export function buildFrozenState(
   game: HistoricalGame,
   inning: HistoricalInning,
 ): GameState {
   const base = game.finalSnapshot!;
-  const before = runsBefore(game.linescore, inning.inning, inning.half);
+  const score = runsThrough(game.linescore, inning.inning, inning.half);
   const activePitcher: PitcherInfo | null = inning.pitcher?.active ?? null;
   const awayPitcher: PitcherInfo | null = inning.pitcher?.away ?? base.awayPitcher ?? null;
   const homePitcher: PitcherInfo | null = inning.pitcher?.home ?? base.homePitcher ?? null;
@@ -52,8 +53,8 @@ export function buildFrozenState(
     bases: null,
     isDecisionMoment: false,
     isDecisionMomentFullInning: false,
-    away: { ...base.away, runs: before.away },
-    home: { ...base.home, runs: before.home },
+    away: { ...base.away, runs: score.away },
+    home: { ...base.home, runs: score.home },
     pitcher: activePitcher,
     awayPitcher,
     homePitcher,
@@ -78,19 +79,19 @@ export function buildFrozenState(
   };
 }
 
-// Build a frozen GameState representing the game AT THE START of a full
-// inning (Top through Bottom). Probability fields compose the two captured
-// halves: P(no run in inning) = P(no run in Top) * P(no run in Bottom).
-// Both pitchers are surfaced (each pitched the half against the OTHER team's
-// lineup); battingTeam=null marks "no single batting team" for GameCard's
-// wide-mode lineup pairing.
+// Build a frozen GameState representing a full inning (Top through Bottom).
+// Score reflects runs through the END of this inning. Probability fields
+// compose the two captured halves: P(no run in inning) = P(no run in Top) *
+// P(no run in Bottom). Both pitchers are surfaced (each pitched the half
+// against the OTHER team's lineup); battingTeam=null marks "no single
+// batting team" for GameCard's wide-mode lineup pairing.
 export function buildFullInningFrozenState(
   game: HistoricalGame,
   top: HistoricalInning,
   bottom: HistoricalInning,
 ): GameState {
   const base = game.finalSnapshot!;
-  const before = runsBefore(game.linescore, top.inning, "Top");
+  const score = runsThrough(game.linescore, top.inning, "Bottom");
   const awayPitcher: PitcherInfo | null =
     top.pitcher?.away ?? bottom.pitcher?.away ?? base.awayPitcher ?? null;
   const homePitcher: PitcherInfo | null =
@@ -109,8 +110,8 @@ export function buildFullInningFrozenState(
     bases: null,
     isDecisionMoment: false,
     isDecisionMomentFullInning: false,
-    away: { ...base.away, runs: before.away },
-    home: { ...base.home, runs: before.home },
+    away: { ...base.away, runs: score.away },
+    home: { ...base.home, runs: score.home },
     pitcher: null,
     awayPitcher,
     homePitcher,
