@@ -15,12 +15,14 @@ The supervisor service runs at:
 
 Tail logs from the Railway dashboard → service → Logs. Logs are structured JSON, one line per event. Useful filter terms:
 - `scope:supervisor` — supervisor lifecycle (`start`, `schedule`, `seeded`, `idle-deadline`, `idle-exit`, `aborted`).
-- `scope:watcher` — per-game watcher events (`start`, `tick`, `final`, `lock-held-by-other`, `max-loops`, `max-runtime`, `loop:error`, `graceful-exit:finalized`, `graceful-exit:abandoned`, `graceful-exit:skipped`).
-- `scope:step` — individual step calls (`fetchSchedule:ok`, `seedSnapshot:ok`, `publishUpdate:ok`, `persistFinishedGame:ok`, etc.).
+- `scope:watcher` — per-game watcher events (`start`, `tick`, `final`, `lock-held-by-other`, `max-loops`, `max-runtime`, `loop:error`, `graceful-exit:publish-synthetic`, `graceful-exit:skipped`, `upsertInningPrediction:fail`).
+- `scope:step` — individual step calls (`fetchSchedule:ok`, `seedSnapshot:ok`, `publishUpdate:ok`, `enrichLineupHands:ok`, etc.).
 - `scope:retry` — `withRetry` exponential-backoff events.
 - `scope:lock` — acquire / refresh / failure events.
 - `scope:prune` — snapshot prune step output.
 - `scope:stale-live-detector` — supervisor's idle-loop snapshot scanner. `pass {total, staleLive, cleaned}` summary; `cleaning {gamePk, lastInning, lastHalf, ageMs}` per cleaned entry.
+- `scope:sweep-finalize` — supervisor's idle-loop + exit-time post-game persistence sweep. `pass {gameDate, candidates, finalized, errors}` summary; `game:fail {gamePk, err}` per-game errors.
+- `scope:finalizeGame` — the actual Supabase finalize call invoked by the sweep. `ok {gamePk, plays, innings}` on success; `actual_runs:fail` on a non-fatal per-half UPDATE error.
 
 JSON shape: `{t, level, scope, msg, ...payload}`. `gamePk` is in payload for per-game events.
 
@@ -53,11 +55,14 @@ Common log signatures to watch for:
 - `park:scrape:failed` / `weather:scrape:failed` — fixture-driven tests should also be failing in CI; see [BUGS.md](BUGS.md) bug #6.
 - `lock-held-by-other` — a second watcher tried to spawn for a `gamePk` that already had one. Expected on manual triggers overlapping with cron.
 - `prune:snapshots {deleted: N}` where `N > 0` — supervisor cleaned a row whose `officialDate` was older than today (ET). Healthy on the first cron firing after a day rollover; unhealthy if it keeps reporting `deleted > 0` within the same ET day (see [BUGS.md](BUGS.md) bug #9). On a same-day rerun, `deleted` should be 0 — non-zero suggests rows were written without `officialDate` and the parse-tolerance silently kept them yesterday.
-- `watcher:final {plays: N}` and `step persistFinishedGame:start {plays: N}` — emitted on a game's Final exit. `N` is the count of completed plate appearances captured from `liveData.plays.allPlays`. Healthy range: ~70–90 for a 9-inning game, more for extras. `plays: 0` on a real Final game means either the live feed dropped `allPlays` (rare; refetch + replay via the backfill path) or the migration `0003_plays.sql` hasn't been applied yet.
-- `watcher:graceful-exit:abandoned {reason, innings, plays, lastInning, lastHalf}` — watcher hit a non-Final exit (`max-loops` / `max-runtime` / `abort` / `error`) AND the final feed fetch still showed Live, so we republished a synthetic Final to unfreeze the dashboard AND persisted the captured `inning_predictions` (count = `innings`) + partial `plays` (count = `plays`) so they don't evaporate with the 24h Redis TTL. Expected occasionally on container redeploys (`reason: "abort"`); a sustained pattern with `reason: "max-loops"` or `reason: "max-runtime"` suggests games are running longer than the budget. The `innings` count should match the new rows landing in `inning_predictions` for that `gamePk` — if it doesn't, look for a `graceful-exit:persist-fail` warning from the same gamePk. See [BUGS.md](BUGS.md) bug #11 (stuck-Live snapshots) and bug #12 (missing per-inning predictions).
-- `watcher:graceful-exit:finalized {reason, plays, innings}` — watcher exited via a non-Final path but the final feed fetch caught the Final flip; ran the full persist path. Healthy.
-- `watcher:loop:error` — uncaught throw from a step. Followed by `graceful-exit:*`. Investigate the root cause; recurring errors in the same `gamePk` mean the next supervisor spawn will hit the same step and exit again.
+- `watcher:final {gamePk, innings}` — emitted on a game's normal Final exit. `innings` is the count of half-inning predictions the watcher's in-process `capturedInnings` map saw during the game (each one was already written to Supabase via the per-boundary fire-and-forget `upsertInningPrediction`). Watcher does NO DB writes here — it just clears watcher state and exits. The supervisor's `sweepFinalize` lands `games`/`plays`/`actual_runs` within ≤60s.
+- `watcher:upsertInningPrediction:fail {gamePk, key, err}` — per-boundary write to Supabase failed. Logged but doesn't block the tick — the supervisor's `sweepFinalize` backstops missing rows on its next iteration. Sustained patterns suggest Supabase free-tier throttle or a credentials issue.
+- `watcher:graceful-exit:publish-synthetic {gamePk, reason, lastInning, lastHalf, lastStatus}` — watcher hit a non-Final exit (`max-loops` / `max-runtime` / `abort` / `error`). Published `{ ...lastPublishedState, status: "Final" }` so the dashboard moves the game out of Active, then cleared the watcher-state Redis key. **No DB writes here** — captured per-inning predictions are already in Supabase (per-boundary writes), and `sweepFinalize` will land `games`/`plays`/`actual_runs` once MLB flips the game to Final. Expected occasionally on container redeploys (`reason: "abort"`); a sustained pattern with `reason: "max-loops"` or `reason: "max-runtime"` suggests games are running longer than the budget. See [BUGS.md](BUGS.md) bug #11 (stuck-Live snapshots) and bug #12 (per-inning persistence).
+- `watcher:graceful-exit:skipped {gamePk, reason, detail}` — watcher exited via a non-Final path but never reached its first `publishUpdateStep`, so there's no `lastPublishedState` to flip. Rare; the seeded "Pre" snapshot will get cleaned by tomorrow's prune.
+- `watcher:loop:error` — uncaught throw from a step. Followed by `graceful-exit:publish-synthetic`. Investigate the root cause; recurring errors in the same `gamePk` mean the next supervisor spawn will hit the same step and exit again.
 - `stale-live-detector:cleaning {gamePk, ageMs}` — the supervisor scanner found a snapshot whose lock is gone and `updatedAt` is stale. Republished synthetic Final. A burst of these right after a Railway redeploy is expected (in-process `gracefulExit` couldn't run for everyone). Sustained / non-deploy-correlated `cleaning` events suggest a class of watcher kill that bypasses both gracefulExit and the lock refresher (process OOM most likely).
+- `sweep-finalize:pass {gameDate, candidates, finalized, errors}` — supervisor's post-game persistence sweep iteration. `candidates` is the count of today-bucket games whose archive isn't fully written; `finalized` is how many were flipped to Final per a fresh `fetchLiveFull` and persisted via `finalizeGame`; `errors` counts per-game failures (logged separately as `sweep-finalize:game:fail`). Quiet under normal conditions (only logged when `finalized > 0` or `errors > 0`).
+- `finalizeGame:ok {gamePk, plays, innings}` — successful `finalizeGame` call. `plays` is the count of completed PAs upserted into the `plays` table (~70–90 for a 9-inning game, more for extras); `innings` is the count of `linescore.innings[]` entries for which `actual_runs` UPDATEs were dispatched. `plays: 0` on a real Final game means either the live feed dropped `allPlays` (rare — investigate) or the `0003_plays.sql` migration hasn't been applied.
 
 ---
 
@@ -77,6 +82,32 @@ If a game shows on the dashboard as "Live" with stale data (no recent `updatedAt
 
 3. **Wait for tomorrow's cron firing.** `pruneStaleSnapshots` deletes any row whose `officialDate < todayET`, so all of yesterday's stuck-Live entries get wiped at the next 12:00 UTC supervisor boot. Cheapest, slowest.
 
+## Recovering from a missing /history entry
+
+A finished game whose `games` row is missing or whose `actual_runs` are NULL on `/history`. Causes: the supervisor died between MLB-flip-to-Final and its next `sweepFinalize` iteration, OR Supabase was unreachable during the sweep, OR the watcher never fired any `upsertInningPrediction` (no captures stored, no stub games row).
+
+1. **Wait one supervisor idle pass (≤ 60s).** Same cadence as the stale-Live detector. The sweep predicate matches today's games where `status != 'Final'` OR `linescore IS NULL` OR any `inning_predictions.actual_runs IS NULL`; for each, fetches a fresh feed and finalizes if MLB has flipped to Final. Watch for `sweep-finalize:pass {finalized: N}` and `finalizeGame:ok {plays, innings}` log lines.
+
+2. **Re-trigger the supervisor.** From the Railway dashboard: Deployments → ⋮ → Run Now. The supervisor's idle loop will sweep pending finalizations on its first iteration (~immediately).
+
+3. **Direct SQL audit:** verify what's actually persisted.
+
+   ```sql
+   -- games row state
+   select game_pk, status, linescore is null as no_linescore, away_runs, home_runs
+   from games where game_pk = <pk>;
+   
+   -- inning_predictions actual_runs coverage
+   select inning, half, p_no_run, actual_runs
+   from inning_predictions where game_pk = <pk>
+   order by inning, half;
+   
+   -- plays count
+   select count(*) from plays where game_pk = <pk>;
+   ```
+
+4. **If the watcher never wrote any predictions** (e.g., game finished before any half-boundary fired, or watcher died before its first publish), there's nothing to recover. The game won't appear on `/history`.
+
 ## Recovering from a stuck watcher
 
 The lock TTL is **30 seconds**, so most "stuck" watchers self-heal — wait 30s and the next cycle's spawn will acquire the lock cleanly. If you need faster recovery:
@@ -87,9 +118,10 @@ set -a; source .env.local; set +a
 curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/nrxi:lock:<gamePk>"
 
 # (optional) wipe the watcher's persisted hoisted state — forces a fresh
-# Phase 1 reload on the next watcher start. Loses captured-innings progress
-# for the half-innings already captured this game; only do this if the
-# state itself is corrupt.
+# Phase 1 reload on the next watcher start. Safe to do — capturedInnings
+# is no longer in the saved bundle, and predictions are durable in
+# Supabase from per-boundary writes. Only useful if the state itself is
+# corrupt.
 curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/nrxi:watcher-state:<gamePk>"
 ```
 

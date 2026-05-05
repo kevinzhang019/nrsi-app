@@ -27,21 +27,30 @@
    │     start background refresher (every 10s)    │             │
    │  2. hydrate hoisted state from                 │             │
    │     nrxi:watcher-state:{gamePk}                │             │
-   │  3. while !Final && loops < 1500 && < 6h:      │             │
+   │  3. while !Final && loops < 5000 && < 6h:      │             │
    │     fetchLiveDiff (timecode resume)            │ on inning   │
    │     compute (structuralKey, playStateKey)      │ transition: │
    │     loadLineupSplits + park + weather + def ◀──┤  recompute  │
    │     prewarmBenchAndBullpen (fire-and-forget)   │             │
    │     computeNrXi (24-state Markov)              │             │
    │     buildInningCapture (clean half boundary)   │             │
+   │       → fire-and-forget upsertInningPrediction │             │
+   │         (stub games + inning_predictions row)  │             │
    │     publishUpdate → nrxi:snapshot HSET         │             │
-   │     saveWatcherState (every tick) ─────────────┤             │
+   │     saveWatcherState (every tick, no captures) │             │
    │     adaptive sleep 5s/15s/30s/300s             │             │
-   │  4. on Final: buildPlayRows(tick.feed)          │             │
-   │     persistFinishedGameStep                     │             │
-   │     → games + inning_predictions + plays        │             │
-   │       in Supabase                               │             │
-   │     clearWatcherState; exit                    │             │
+   │  4. on Final: clearWatcherState; exit          │             │
+   │     (no DB writes — supervisor sweep handles)  │             │
+   └─────────────────────┼───────────────────────────────────────┘
+                         │  every 60s in supervisor idle loop
+                         ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │  services/lib/sweep-finalize  (supervisor-owned)            │
+   │  predicate: games today with status != Final OR no          │
+   │             linescore OR any NULL actual_runs               │
+   │  for each:  fetchLiveFull → if Final, finalizeGame          │
+   │             (UPSERT games + UPSERT plays +                  │
+   │              UPDATE actual_runs from linescore.innings)     │
    └─────────────────────┼───────────────────────────────────────┘
                          │
                          ▼
@@ -97,19 +106,19 @@ One async task per gamePk, lives inside the supervisor process. Receives `{ game
 **Lifecycle:**
 1. Acquire `nrxi:lock:{gamePk}` (30s TTL via `services/lib/lock.ts:acquireWatcherLock`). If held by another, exit with `{ reason: "lock-held" }`.
 2. Start background `setInterval` refreshing the lock every 10s via `startLockRefresher`. Stops on watcher exit or parent process abort.
-3. Hydrate hoisted state from `nrxi:watcher-state:{gamePk}` (`services/lib/watcher-state.ts:loadWatcherState`). On first start this returns an empty state; on a process restart we recover `capturedInnings` and the last-published view. Trigger keys (`structuralKey`, `playStateKey`) are deliberately NOT persisted — the first tick after restart unconditionally fires Phase 1 reload to rebuild caches.
+3. Hydrate hoisted state from `nrxi:watcher-state:{gamePk}` (`services/lib/watcher-state.ts:loadWatcherState`). On first start this returns an empty state; on a process restart we recover the last-published view. Trigger keys (`structuralKey`, `playStateKey`) and `capturedInnings` are deliberately NOT persisted — the first tick after restart unconditionally fires Phase 1 reload to rebuild caches, and `capturedInnings` lives only in process memory (predictions are durable in Supabase from the moment they're computed, see step 4).
 4. Loop up to `MAX_LOOPS = 5000` AND `Date.now() - startedAt < 6h`. Loop body wrapped in try/catch so any uncaught throw routes into `gracefulExit("error")` instead of bubbling:
    - `fetchLiveDiffStep` with last seen `metaData.timeStamp` for tiny diff payloads.
    - Build `structuralKey` (half | inning | lineup | defense | opposing pitcher | atBat batter | bottom-9-skipped flag) and `playStateKey` (outs | bases | atBatIndex). Set `shouldReloadStructure` and `shouldRecomputePlay` triggers.
    - **Phase 1 (structural reload):** parallel fetch `loadLineupSplitsStep`, `loadParkFactorStep`, `loadWeatherStep`, `loadDefenseStep`. Compute display lineup stats for both teams. Pre-compute opposite-half clean-state P(no run) for full-inning composition (skipped at top-9 when the home team is leading — see `services/full-inning.ts:shouldSkipBottomNinth`; the score is part of `structuralKey` so a tying run mid-top-9 forces a reload). Persist to hoisted `lastNrXi`, `lastEnv`, `lastPitcher*`, `lastLineupStats`, etc. Also kick off `prewarmBenchAndBullpenStep` **fire-and-forget** (`void`-prefixed, not awaited) — it loads handedness + per-PA splits for every bench hitter and bullpen pitcher on both teams so a future pinch-hit / relief change is a pure Redis hit instead of a critical-path MLB Stats API round-trip.
    - **Phase 2 (play-state recompute):** `computeNrXiStep` against current outs/bases. Update `lastFullInning`. Cheap — reuses Phase 1 caches.
    - Build `GameState` from current feed + last computed nrXi. `publishUpdateStep` writes to `nrxi:snapshot` hash.
-   - `buildInningCapture` records the per-half-inning prediction snapshot exactly once at `outs===0 && (bases===0 || bases===2)` (the Manfred runner allowance for extras).
-   - `saveWatcherState` serializes the hoisted-var bundle to Redis (`nrxi:watcher-state:{gamePk}`, 24h TTL). One HSET per tick.
-   - If `status === "Final"`: call `buildPlayRows(tick.feed, gamePk)` (pure transform of `liveData.plays.allPlays` — completed PAs only, with names resolved from boxscore), then `persistFinishedGameStep` (Supabase upsert of `games` + `inning_predictions` + `plays`), `clearWatcherState`, return `{ reason: "final" }`. Per-play capture is **post-game only**, not per-tick — terminal feed already has the full play log, and history-only data shouldn't inflate `saveWatcherState` writes.
+   - `buildInningCapture` records the per-half-inning prediction snapshot exactly once at `outs===0 && (bases===0 || bases===2)` (the Manfred runner allowance for extras). When a fresh capture is added to the in-process `capturedInnings` map, the watcher fires `void upsertInningPrediction(...).catch(log.warn)` — fire-and-forget Supabase write of the stub `games` row (idempotent `ON CONFLICT DO NOTHING`) + the prediction row keyed `(game_pk, inning, half)`. Failures are logged but never block the tick; the supervisor's `sweepFinalize` backstops any rows that don't make it.
+   - `saveWatcherState` serializes the hoisted-var bundle to Redis (`nrxi:watcher-state:{gamePk}`, 24h TTL). One HSET per tick. **`capturedInnings` is NOT in the bundle** — predictions are durable in Supabase, so the in-memory map is just an idempotency dedup buffer.
+   - If `status === "Final"`: log, `clearWatcherState`, return `{ reason: "final" }`. **No DB writes** — the supervisor's `sweepFinalize` (which runs every 60s in the idle loop AND once at supervisor exit) handles all post-game persistence (`games` UPSERT, `plays` upsert, `actual_runs` UPDATE) from a fresh `fetchLiveFull`. Trade-off: ≤60s lag from MLB-Final → `/history` listing population. The dashboard moves the game out of Active immediately (the just-published state already has `status === "Final"`).
    - Adaptive sleep: 5s during active PAs, 15s otherwise (Live), 30s Pre, 300s Delayed/Suspended. See `services/steps/fetch-live-diff.ts:chooseRecommendedWaitSeconds`.
 
-5. Non-Final exits (`max-loops`, `max-runtime`, `abort` from SIGTERM, `error` from any uncaught throw) all call `services/lib/finalize-game.ts:performGracefulExit` first. The helper does one final feed fetch: if MLB has flipped to Final → run the same Final logic as step 4 (persist + clear watcher state). Otherwise → republish `{ ...lastPublishedState, status: "Final" }` so the dashboard moves the game out of Active **AND** call `persistFinishedGameStep` with the synthetic state + `capturedInnings` (+ `playRows` from the last successful feed if available) so the per-inning predictions land in Supabase instead of expiring with the watcher's 24h Redis TTL. Skipped only when both `capturedInnings` is empty and `playRows` is empty (no point in an empty `games` row). Best-effort, never throws. Hoisted `lastPublishedState: GameState | null` (set after every successful `publishUpdateStep`) is the source for the synthetic state. See [BUGS.md bug #12](BUGS.md#bug-12-history-missing-per-inning-predictions-when-the-watcher-exits-via-graceful-exit-abandoned).
+5. Non-Final exits (`max-loops`, `max-runtime`, `abort` from SIGTERM, `error` from any uncaught throw) all call `services/lib/finalize-game.ts:performGracefulExit`. The helper publishes `{ ...lastPublishedState, status: "Final" }` so the dashboard moves the game out of Active, then clears `nrxi:watcher-state:{gamePk}`. **No DB writes here** — captured per-inning predictions are already in Supabase from the per-boundary fire-and-forget upserts, and the supervisor's `sweepFinalize` will land `games`/`plays`/`actual_runs` once MLB flips the game to Final. Best-effort, never throws. Hoisted `lastPublishedState: GameState | null` (set after every successful `publishUpdateStep`) is the source for the synthetic state. See [BUGS.md bug #11](BUGS.md#bug-11-snapshots-stuck-live-at-varying-innings-after-a-watcher-exits-without-cleanup) and [bug #12](BUGS.md#bug-12-history-missing-per-inning-predictions-when-the-watcher-exits-via-graceful-exit-abandoned).
 
 The core probability pipeline (Log5 → env → TTOP → framing → defense → 24-state Markov → calibrate) lives in `lib/prob/*` and is unchanged from the WDK days. See [`PROBABILITY_MODEL.md`](PROBABILITY_MODEL.md).
 
@@ -119,6 +128,23 @@ Process kills (SIGKILL, OOM, container eviction) bypass `gracefulExit` because n
 
 The `lock missing === watcher dead` premise is load-bearing: `startLockRefresher` keeps a healthy watcher's lock fresh every 10s (TTL 30s), so any missing lock means the in-process watcher is gone. The 60s `updatedAt` threshold is just a safety margin against the brief publish/exit gap inside a single tick. See [BUGS.md bug #11](BUGS.md#bug-11-snapshots-stuck-live-at-varying-innings-after-a-watcher-exits-without-cleanup).
 
+#### Supervisor sweep-finalize
+
+The watcher does no DB writes at Final — all post-game persistence is centralized in the supervisor. `services/lib/sweep-finalize.ts:sweepFinalize` runs every `IDLE_CHECK_INTERVAL_MS` (60s) inside the supervisor's idle loop AND once at supervisor exit before scaling to zero.
+
+**Predicate** (`defaultListCandidateGamePks`): two-stage query against today's `games` rows.
+1. Stage 1 — games rows where `status != 'Final' OR linescore IS NULL`. Catches stub-only rows (created lazily by the watcher's first `upsertInningPrediction`) that haven't been finalized yet.
+2. Stage 2 — `inning_predictions.actual_runs IS NULL` for any of today's gamePks. Catches games where everything else finalized but actuals didn't fill (defensive — shouldn't normally happen).
+
+**Per-game work:** `fetchLiveFull(gamePk)` → `classifyStatus` → if `Final`, call `lib/db/inning-predictions.ts:finalizeGame({gamePk, freshFeed})`. Otherwise (still Live, or fetch failed) skip — the next sweep iteration will retry. Errors per-game are caught + warn-logged so one bad game doesn't poison the whole pass; never throws.
+
+`finalizeGame` does three things in sequence (all idempotent):
+1. UPSERT the `games` row with the full final shape derived from the feed (linescore, lineups, final_snapshot, scores, status, venue, etc.).
+2. UPSERT every play from `buildPlayRows(freshFeed, gamePk)` keyed `(game_pk, at_bat_index)`.
+3. Parallel UPDATE `inning_predictions.actual_runs` for each row in `linescore.innings[]` (top half = `away.runs`, bottom half = `home.runs`).
+
+Trade-off vs the old "watcher persists at Final" model: ≤60s lag before a finished game appears on `/history`. The dashboard's Finished section is unaffected — it reads from `nrxi:snapshot`, which the watcher already populated with `status: "Final"` before exiting. See [BUGS.md bug #12](BUGS.md#bug-12-history-missing-per-inning-predictions-when-the-watcher-exits-via-graceful-exit-abandoned).
+
 #### `services/lib/*` — primitives
 
 | File | Replaces | Purpose |
@@ -126,10 +152,11 @@ The `lock missing === watcher dead` premise is load-bearing: `startLockRefresher
 | `sleep.ts` | WDK `sleep()` | `sleepMs(ms, signal?)` cancellable via AbortSignal |
 | `with-retry.ts` | WDK step auto-retry | exponential-backoff wrapper |
 | `lock.ts` | `workflows/steps/lock.ts` | acquire (30s TTL) + background refresher every 10s |
-| `watcher-state.ts` | WDK hoisted-var durability | JSON serialize hoisted vars to Redis per tick |
+| `watcher-state.ts` | WDK hoisted-var durability | JSON serialize hoisted vars to Redis per tick (no `capturedInnings` — durable in Supabase) |
 | `prune-snapshots.ts` | (new) | hdel snapshot field-keys whose row's own `officialDate < todayET` |
-| `finalize-game.ts` | (new) | `performGracefulExit` + `buildSyntheticFinalState` — best-effort cleanup on every non-Final watcher exit (`max-loops`, `max-runtime`, `abort`, `error`) |
+| `finalize-game.ts` | (new) | `performGracefulExit` + `buildSyntheticFinalState` — dashboard-only cleanup on every non-Final watcher exit (publish synthetic Final + clear watcher state). No DB writes |
 | `stale-live-detector.ts` | (new) | `detectAndCleanStaleLive` — supervisor idle-loop scanner that catches dead-watcher snapshots whose process never ran cleanup (SIGKILL, OOM) |
+| `sweep-finalize.ts` | (new) | `sweepFinalize` — supervisor idle-loop + exit-time post-game persistence sweep. Fetches fresh feed for every today-bucket game whose archive isn't fully written and runs `finalizeGame` if MLB has flipped the game to Final |
 | `load-env.ts` | Next.js auto-load of `.env.local` | tsx doesn't auto-load it; bin/* scripts import this first |
 
 #### `services/steps/*` — plain async helpers
@@ -149,7 +176,6 @@ What used to be WDK `"use step"` functions, now plain async functions called via
 | `compute-lineup-stats.ts` | Display-only xOBP/xSLG for both teams' starters | drives the "one team at a time" view |
 | `enrich-lineup-hands.ts` | Hydrate batter handedness from `/people/{id}` | 30d Redis TTL, graceful per-id fail |
 | `publish-update.ts` | Write `GameState` to Redis snapshot + publish to channel | resets snapshot 24h TTL each call |
-| `persist-finished-game.ts` | Upsert games + inning_predictions + plays to Supabase | no-ops if Supabase env vars unset |
 
 ### `bin/*` — CLI tools
 
@@ -226,12 +252,13 @@ See [PROBABILITY_MODEL.md](PROBABILITY_MODEL.md) for the full math.
 - `keys.ts` — every Redis key shape lives here. Don't hardcode key strings elsewhere.
 
 #### `lib/db/`
-- `supabase.ts` — service-role client (no auth/cookies). `isSupabaseConfigured()` guard makes the persist path a clean no-op when env vars are missing.
-- `games.ts` — `saveFinishedGame(args)` upserts to `games` + `inning_predictions` + `plays`. Idempotent on `game_pk` / `(game_pk, inning, half)` / `(game_pk, at_bat_index)`. `gameDateOf(officialDate, startTime)` buckets by venue-local day. Read functions: `listGameDates`, `listGamesByDate`, `getGame`, `getInningPredictions`.
+- `supabase.ts` — service-role client (no auth/cookies). `isSupabaseConfigured()` guard makes the persist paths a clean no-op when env vars are missing.
+- `games.ts` — read helpers: `listGameDates`, `listGamesByDate`, `getGame`, `getInningPredictions`. Plus `gameDateOf(officialDate, startTime)` (exported) for bucketing by venue-local day.
+- `inning-predictions.ts` — write paths used by both the watcher and the supervisor sweep. `upsertInningPrediction({context, capture})` is the watcher's per-boundary fire-and-forget call: idempotent stub `games` UPSERT (`ON CONFLICT DO NOTHING`) + `inning_predictions` UPSERT keyed `(game_pk, inning, half)`. `finalizeGame({gamePk, freshFeed})` is the sweep's centralized finalization: UPSERT `games` (full final shape) + UPSERT `plays` (via `buildPlayRows`) + parallel UPDATE `inning_predictions.actual_runs` from `linescore.innings[]`. All idempotent.
 - `plays.ts` — `getGamePlays(gamePk)` returns the per-PA archive ordered by `at_bat_index`, used by the history detail page for per-inning hitter / pitcher rollups.
 
 #### `lib/history/`
-- `build-plays.ts` — pure transform `buildPlayRows(feed, gamePk): PlayRow[]`. Iterates `liveData.plays.allPlays`, keeps only `about.isComplete === true`, resolves batter / pitcher names from the boxscore players map (`ID${id}`) with `matchup.{batter,pitcher}.fullName` as a fallback, sums `runs_on_play` from `runners[]` with `movement.end === 'score'`. Called once at the watcher's Final exit — zero per-tick cost.
+- `build-plays.ts` — pure transform `buildPlayRows(feed, gamePk): PlayRow[]`. Iterates `liveData.plays.allPlays`, keeps only `about.isComplete === true`, resolves batter / pitcher names from the boxscore players map (`ID${id}`) with `matchup.{batter,pitcher}.fullName` as a fallback, sums `runs_on_play` from `runners[]` with `movement.end === 'score'`. Called once per game from the supervisor's `sweepFinalize` against a fresh `fetchLiveFull` — zero per-tick cost.
 - `rollup-plays.ts` — pure rollups. `rollupBatters(rows)` produces `{pa, ab, h, hr, bb, hbp, k, r, rbi}` per unique `batterId`; `rollupPitchers(rows)` produces `{bf, ipOuts, h, bb, hbp, k, hr, r}` per unique `pitcherId` and attributes outs to the pitcher who threw each play (handles mid-inning changes correctly). `formatIp(outs)` renders `7 → "2.1"`. Caller pre-filters to whatever (inning, half) slice it wants.
 
 ##### Caching layout
@@ -293,7 +320,7 @@ The lock has a 30s TTL refreshed every 10s by a background `setInterval` (`servi
 
 Three reasons. First, the Vercel free tier's Fluid Compute cap can't sustain a 24/7 polling system — the watcher was burning the budget. Second, the workload is bursty (10–14 hours/day during MLB season, near-zero off-season), so scale-to-zero matters. The supervisor's `process.exit(0)` after idle-deadline lets Railway stop the container entirely until the next cron firing. Third, Railway's native cron + simple Node runtime maps cleanly to "fetch schedule, run async tasks, exit when done" — no orchestration framework needed.
 
-What we gave up vs. WDK: durable `sleep()` and free crash-replay. Replaced with Redis-persisted hoisted state (`services/lib/watcher-state.ts`) — restart hydrates capturedInnings + the last-published view, then the first tick rebuilds caches via Phase 1 reload. Net: same behavior, slightly different mechanism.
+What we gave up vs. WDK: durable `sleep()` and free crash-replay. Replaced with Redis-persisted hoisted state (`services/lib/watcher-state.ts`) — restart hydrates the last-published view, then the first tick rebuilds caches via Phase 1 reload. Per-inning predictions are durable in Supabase from the moment they're computed (per-boundary `upsertInningPrediction`), so the in-memory `capturedInnings` map can be safely lost on watcher death. Net: same behavior, more robust mechanism.
 
 ### Why we kept Vercel for the frontend
 

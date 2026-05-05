@@ -21,10 +21,12 @@ import { computeNrXiStep } from "./steps/compute-nrXi";
 import { computeLineupStatsStep } from "./steps/compute-lineup-stats";
 import { publishUpdateStep } from "./steps/publish-update";
 import { enrichLineupHandsStep } from "./steps/enrich-lineup-hands";
-import { persistFinishedGameStep } from "./steps/persist-finished-game";
 import { performGracefulExit, type GracefulExitReason } from "./lib/finalize-game";
 import { buildInningCapture } from "./capture-inning";
-import { buildPlayRows } from "../lib/history/build-plays";
+import {
+  upsertInningPrediction,
+  gameStubContextFromState,
+} from "../lib/db/inning-predictions";
 import { readMarkovStartState } from "./start-state";
 import { shouldSkipBottomNinth } from "./full-inning";
 import { getUpcomingForCurrentInning, lineupHash } from "../lib/mlb/lineup";
@@ -240,10 +242,10 @@ export async function runWatcher(
 
     // Best-effort cleanup invoked from every non-Final exit path: the budget
     // caps (max-loops / max-runtime), supervisor abort (SIGTERM), and any
-    // uncaught error in a step. Closure captures the latest
-    // `lastPublishedState`, `capturedInnings`, and the current
-    // `lastTimecode` / `prevDoc` for the final fetch attempt. Never throws —
-    // see `performGracefulExit` for the three outcomes.
+    // uncaught error in a step. Just publishes a synthetic-Final to the
+    // dashboard snapshot and clears the watcher-state Redis key. The
+    // supervisor sweep handles all DB persistence (`finalizeGame`) once MLB
+    // flips the game to Final per a fresh fetchLiveFull.
     const gracefulExit = async (reason: GracefulExitReason): Promise<void> => {
       try {
         await performGracefulExit(
@@ -251,19 +253,10 @@ export async function runWatcher(
             gamePk: input.gamePk,
             reason,
             lastPublishedState,
-            capturedInnings,
           },
           {
-            fetchLiveDiff: () =>
-              fetchLiveDiffStep({
-                gamePk: input.gamePk,
-                startTimecode: lastTimecode,
-                prevDoc,
-              }),
             publishUpdate: publishUpdateStep,
-            persistFinishedGame: persistFinishedGameStep,
             clearWatcherState,
-            buildPlayRows,
           },
         );
       } catch (err) {
@@ -706,6 +699,24 @@ export async function runWatcher(
         });
         if (captureCandidate && !capturedInnings[captureCandidate.key]) {
           capturedInnings[captureCandidate.key] = captureCandidate.capture;
+          // Fire-and-forget per-boundary write to Supabase. Failures are
+          // logged but never block the watcher tick — the supervisor sweep
+          // backstops any rows that don't make it. The in-memory map stays
+          // as a thin retry/dedup buffer; predictions are durable from the
+          // moment they're computed, no longer hostage to the watcher
+          // reaching Final.
+          const captureKey = captureCandidate.key;
+          const captureToWrite = captureCandidate.capture;
+          void upsertInningPrediction({
+            context: gameStubContextFromState(state),
+            capture: captureToWrite,
+          }).catch((err) =>
+            log.warn("watcher", "upsertInningPrediction:fail", {
+              gamePk: input.gamePk,
+              key: captureKey,
+              err: String(err),
+            }),
+          );
         }
 
         await withRetry(() => publishUpdateStep(state), { signal, label: "publishUpdate" });
@@ -717,10 +728,13 @@ export async function runWatcher(
 
         // Persist hoisted state once per tick. The trigger keys are deliberately
         // skipped (see watcher-state.ts) so a restart fires one Phase 1 reload.
+        // `capturedInnings` is intentionally NOT serialized — predictions are
+        // durable in Supabase from the moment they're computed (see the
+        // upsertInningPrediction call above). The map stays in-process as a
+        // thin retry/dedup buffer only.
         try {
           await saveWatcherState(input.gamePk, {
             ...emptyWatcherState(),
-            capturedInnings,
             lastEnrichedHash,
             lastLineups: lastLineups ?? null,
             lastNrXi,
@@ -745,22 +759,15 @@ export async function runWatcher(
         }
 
         if (status === "Final") {
-          // Build the per-play archive once from the terminal feed. The full
-          // game's allPlays array is in `tick.feed` here, so this is a pure
-          // transform with zero extra fetches. Persisted alongside
-          // capturedInnings; PK (game_pk, at_bat_index) keeps it idempotent if
-          // the watcher retries this branch.
-          const playRows = buildPlayRows(tick.feed, input.gamePk);
+          // No DB writes here — the supervisor's sweep-finalize handles
+          // games / plays / actual_runs from a fresh fetchLiveFull. The
+          // last publishUpdateStep above already pushed the real Final
+          // state to the dashboard snapshot; we just clear watcher state
+          // and exit.
           log.info("watcher", "final", {
             gamePk: input.gamePk,
             innings: Object.keys(capturedInnings).length,
-            plays: playRows.length,
           });
-          await withRetry(
-            () => persistFinishedGameStep({ finalState: state, capturedInnings, playRows }),
-            { signal, label: "persistFinishedGame" },
-          );
-          // Clear the watcher-state key — game is done, no resume needed.
           try {
             await clearWatcherState(input.gamePk);
           } catch (err) {

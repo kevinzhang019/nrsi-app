@@ -9,6 +9,11 @@ import {
   defaultStaleLiveCleanDeps,
   type StaleLiveCleanResult,
 } from "./lib/stale-live-detector";
+import {
+  sweepFinalize,
+  defaultSweepFinalizeDeps,
+  type SweepFinalizeResult,
+} from "./lib/sweep-finalize";
 import { todayInTz } from "../lib/utils";
 import { log } from "../lib/log";
 
@@ -44,6 +49,12 @@ export type SupervisorOpts = {
   // republishing a synthetic Final. The default closes over real Redis +
   // publisher; tests can supply a stub that records calls.
   detectStaleLiveFn?: () => Promise<StaleLiveCleanResult>;
+  // Override for tests — defaults to the centralized post-game persistence
+  // sweep that runs `finalizeGame` against any today-bucket game whose
+  // archive isn't fully written. Returns null when Supabase isn't
+  // configured (dev/preview), so the supervisor is unaffected without
+  // credentials.
+  sweepFinalizeFn?: ((gameDate: string) => Promise<SweepFinalizeResult>) | null;
   // Override for tests — defaults to "tomorrow at 06:00 UTC". Returning a Date
   // lets tests synthesise a deadline in the very-near future to verify the
   // idle-exit logic without sleeping for hours.
@@ -84,6 +95,15 @@ export async function runSupervisor(opts: SupervisorOpts = {}): Promise<{
   const runWatcherImpl = opts.runWatcherFn ?? runWatcher;
   const detectStaleLive =
     opts.detectStaleLiveFn ?? (() => detectAndCleanStaleLive({}, defaultStaleLiveCleanDeps()));
+  const sweepFinalizeImpl =
+    opts.sweepFinalizeFn !== undefined
+      ? opts.sweepFinalizeFn
+      : (() => {
+          const deps = defaultSweepFinalizeDeps();
+          return deps
+            ? (gameDate: string) => sweepFinalize({ gameDate }, deps)
+            : null;
+        })();
   const computeIdleDeadline = opts.computeIdleDeadlineFn ?? defaultIdleDeadline;
   const idleInterval = opts.idleCheckIntervalMs ?? IDLE_CHECK_INTERVAL_MS;
   const signal = opts.signal;
@@ -184,11 +204,32 @@ export async function runSupervisor(opts: SupervisorOpts = {}): Promise<{
     } catch (err) {
       log.warn("supervisor", "stale-live-detector:fail", { err: String(err) });
     }
+    // Centralized post-game persistence: pull any today-bucket game whose
+    // archive isn't fully written, fetch a fresh feed, and finalize if MLB
+    // has flipped to Final. Independent of stale-live (which only touches
+    // the dashboard snapshot). Skipped when Supabase isn't configured.
+    if (sweepFinalizeImpl) {
+      try {
+        await sweepFinalizeImpl(date);
+      } catch (err) {
+        log.warn("supervisor", "sweep-finalize:fail", { err: String(err) });
+      }
+    }
     try {
       await sleepMs(idleInterval, signal);
     } catch (err) {
       if (isAbortError(err)) break;
       throw err;
+    }
+  }
+
+  // One last sweep at exit before scaling to zero — any game that flipped
+  // to Final in the final minute won't have been picked up by the idle loop.
+  if (sweepFinalizeImpl) {
+    try {
+      await sweepFinalizeImpl(date);
+    } catch (err) {
+      log.warn("supervisor", "sweep-finalize:exit:fail", { err: String(err) });
     }
   }
 

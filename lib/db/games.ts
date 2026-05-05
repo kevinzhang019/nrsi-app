@@ -1,6 +1,4 @@
-import type { GameState, PitcherInfo } from "@/lib/state/game-state";
-import type { Linescore } from "@/lib/mlb/extract";
-import type { HistoricalGame, HistoricalInning, InningCapture, PlayRow } from "@/lib/types/history";
+import type { HistoricalGame, HistoricalInning, InningCapture } from "@/lib/types/history";
 import { supabaseAdmin } from "./supabase";
 
 // Bucket games by their venue-local game day (YYYY-MM-DD) so a 7pm PT start
@@ -9,7 +7,7 @@ import { supabaseAdmin } from "./supabase";
 // `dates[].date` in the schedule — both already in venue-local convention,
 // no timezone math needed. The ET fallback exists only for legacy snapshots
 // that pre-date the officialDate plumbing; new captures should always have it.
-function gameDateOf(officialDate: string | undefined, startTime: string | undefined): string {
+export function gameDateOf(officialDate: string | undefined, startTime: string | undefined): string {
   if (officialDate && /^\d{4}-\d{2}-\d{2}$/.test(officialDate)) return officialDate;
   const t = startTime ? new Date(startTime) : new Date();
   const ny = new Date(t.toLocaleString("en-US", { timeZone: "America/New_York" }));
@@ -17,118 +15,6 @@ function gameDateOf(officialDate: string | undefined, startTime: string | undefi
   const m = String(ny.getMonth() + 1).padStart(2, "0");
   const d = String(ny.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
-}
-
-// Pull all distinct pitchers seen in the live snapshots — used as a compact
-// audit trail. We just store both teams' last-known pitcher cores; the full
-// boxscore pitchers list isn't carried on GameState.
-function pitchersFromState(state: GameState): { away: PitcherInfo[]; home: PitcherInfo[] } {
-  return {
-    away: state.awayPitcher ? [state.awayPitcher] : [],
-    home: state.homePitcher ? [state.homePitcher] : [],
-  };
-}
-
-function actualRunsFor(linescore: Linescore | null, inning: number, half: "Top" | "Bottom"): number | null {
-  if (!linescore) return null;
-  const row = linescore.innings.find((i) => i.num === inning);
-  if (!row) return null;
-  return half === "Top" ? row.away.runs : row.home.runs;
-}
-
-export type SaveFinishedGameArgs = {
-  finalState: GameState;
-  capturedInnings: Record<string, InningCapture>;
-  // Built once at the watcher's Final exit by lib/history/build-plays.ts. May
-  // be empty on dev fixtures that don't carry liveData.plays.allPlays.
-  playRows: PlayRow[];
-};
-
-// Persist a finished game + its captured per-inning predictions. Idempotent:
-// the watcher's Final exit branch could fire twice if the workflow retries the
-// step, so we upsert on (game_pk) and (game_pk, inning, half).
-export async function saveFinishedGame(args: SaveFinishedGameArgs): Promise<void> {
-  const { finalState, capturedInnings, playRows } = args;
-  const sb = supabaseAdmin();
-
-  const gameDate = gameDateOf(finalState.officialDate, finalState.startTime);
-
-  const gameRow = {
-    game_pk: finalState.gamePk,
-    game_date: gameDate,
-    start_time: finalState.startTime ?? null,
-    status: finalState.status,
-    detailed_state: finalState.detailedState || null,
-    away_team_id: finalState.away.id,
-    away_team_name: finalState.away.name,
-    away_runs: finalState.away.runs,
-    home_team_id: finalState.home.id,
-    home_team_name: finalState.home.name,
-    home_runs: finalState.home.runs,
-    venue_id: finalState.venue?.id ?? null,
-    venue_name: finalState.venue?.name ?? null,
-    linescore: finalState.linescore,
-    weather: (finalState.env?.weather as Record<string, unknown> | undefined) ?? null,
-    env: finalState.env
-      ? { parkRunFactor: finalState.env.parkRunFactor, weatherRunFactor: finalState.env.weatherRunFactor }
-      : null,
-    lineups: finalState.lineups,
-    pitchers_used: pitchersFromState(finalState),
-    final_snapshot: finalState,
-  };
-
-  const { error: gameErr } = await sb.from("games").upsert(gameRow, { onConflict: "game_pk" });
-  if (gameErr) throw new Error(`saveFinishedGame: games upsert failed — ${gameErr.message}`);
-
-  const inningRows = Object.values(capturedInnings).map((cap) => ({
-    game_pk: finalState.gamePk,
-    inning: cap.inning,
-    half: cap.half,
-    p_no_run: cap.pNoRun,
-    p_run: cap.pRun,
-    break_even_american: cap.breakEvenAmerican,
-    per_batter: cap.perBatter,
-    pitcher: cap.pitcher,
-    env: cap.env,
-    lineup_stats: cap.lineupStats,
-    defense_key: cap.defenseKey,
-    actual_runs: actualRunsFor(finalState.linescore, cap.inning, cap.half),
-    captured_at: cap.capturedAt,
-  }));
-
-  if (inningRows.length > 0) {
-    const { error: innErr } = await sb
-      .from("inning_predictions")
-      .upsert(inningRows, { onConflict: "game_pk,inning,half" });
-    if (innErr) throw new Error(`saveFinishedGame: inning_predictions upsert failed — ${innErr.message}`);
-  }
-
-  if (playRows.length > 0) {
-    const dbRows = playRows.map((p) => ({
-      game_pk: p.gamePk,
-      at_bat_index: p.atBatIndex,
-      inning: p.inning,
-      half: p.half,
-      batter_id: p.batterId,
-      batter_name: p.batterName,
-      batter_side: p.batterSide,
-      pitcher_id: p.pitcherId,
-      pitcher_name: p.pitcherName,
-      pitcher_hand: p.pitcherHand,
-      event: p.event,
-      event_type: p.eventType,
-      rbi: p.rbi,
-      runs_on_play: p.runsOnPlay,
-      end_outs: p.endOuts,
-      away_score: p.awayScore,
-      home_score: p.homeScore,
-      raw: p.raw,
-    }));
-    const { error: playsErr } = await sb
-      .from("plays")
-      .upsert(dbRows, { onConflict: "game_pk,at_bat_index" });
-    if (playsErr) throw new Error(`saveFinishedGame: plays upsert failed — ${playsErr.message}`);
-  }
 }
 
 // Distinct game dates we have data for, latest first. Drives the date strip

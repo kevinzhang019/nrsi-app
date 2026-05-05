@@ -297,6 +297,8 @@ This is the only defense against the process-kill scenarios where no in-process 
 - The 60s `DEFAULT_STALE_AFTER_MS`. Raising it delays cleanup; lowering it risks racing the publish/exit gap inside a single tick. Don't try to use it to cover Delayed/Suspended games (300s polling) — those still have a live lock and the lock check filters them out before the threshold matters.
 - The detector running BEFORE the sleep but AFTER the break checks in `services/supervisor.ts`. Moving it before the break would run it on past-deadline supervisors (no Live games to clean — wasted call). Moving it after the sleep delays first-pass cleanup by 60s.
 
+**Later refactor (2026-05-04) — gracefulExit no longer touches Supabase.** The original Layer-1 fix above had `performGracefulExit` do one final feed fetch and either run the full Final-persist path OR republish-synthetic + persist captures. That coupling between watcher lifecycle and DB writes has been removed: post-game persistence now lives entirely in the supervisor's `services/lib/sweep-finalize.ts:sweepFinalize` (idle-loop + exit-time sweep). `performGracefulExit` is now dashboard-cleanup-only — it publishes `{ ...lastPublishedState, status: "Final" }` and clears `nrxi:watcher-state:{gamePk}`. `GracefulExitDeps` shrunk to `{ publishUpdate, clearWatcherState }`. The bug-#11 stuck-Live risk class is still covered: every non-Final exit still publishes the synthetic Final, so the dashboard moves on within one tick. The sweep handles all archive writes from a fresh `fetchLiveFull` once MLB flips the game to Final. See bug #12's later-refactor note for the full rationale.
+
 ## Bug 12: History missing per-inning predictions when the watcher exits via graceful-exit "abandoned"
 
 **Symptom:** users reported games on `/history` were often missing per-inning predictions seemingly at random — some games had every half captured, others were missing scattered halves with no pattern. The detail page silently degraded by falling back to the final-game state with no indicator (`components/historical-game-view.tsx:91-92`), so users saw *something* but not the prediction made at the start of that half.
@@ -335,8 +337,37 @@ The original code comment (lines 73-74 of the pre-fix `finalize-game.ts`) explai
 **Regression check:**
 - `services/lib/finalize-game.test.ts` — 6 new cases under `describe("abandoned path persistence (bug: missing inning_predictions)")`: persist with captures, persist on plays-only, skip when both empty, persist-error swallow, buildPlayRows-throws fallback, fetch-failed → no buildPlayRows. Existing 8 tests stay green (they all used `capturedInnings: {}` so the new skip-when-empty logic preserved the original assertions).
 
+**Original fix's invariants (now superseded — see "Later refactor" below):**
+- The persist call in the abandoned branch was BEFORE `publishUpdate`, not after. Reordering meant a publish failure (Redis hiccup) silently prevents the persist — and the persist was the load-bearing data, not the dashboard cleanup.
+- The skip-when-both-empty guard prevented an empty `games` row when a watcher crashed before its first half-boundary.
+- Independent try/catch around `persistFinishedGame` and `buildPlayRows` to keep `gracefulExit` "best-effort never throws."
+- `playRows` defaulted to `[]` when feed fetch failed — `inning_predictions` were independently valuable.
+
+---
+
+**Later refactor (2026-05-04) — predictions now write per-boundary; sweep finalizes archives.** The original abandoned-branch persist (above) was a tactical fix; the underlying coupling (predictions hostage to watcher reaching SOME exit point) was the real bug class. Reworked into a cleaner architecture:
+
+1. **Per-boundary write at clean-state moments.** `services/run-watcher.ts` calls `lib/db/inning-predictions.ts:upsertInningPrediction({context, capture})` fire-and-forget right after a fresh capture is added to the in-process `capturedInnings` map. Two sequential idempotent supabase-js calls in one function: `INSERT INTO games ... ON CONFLICT DO NOTHING` (lazy stub, just enough to satisfy the `inning_predictions.game_pk` FK) + `UPSERT INTO inning_predictions` keyed `(game_pk, inning, half)`. The watcher tick never blocks on the call — failures log + move on.
+2. **`capturedInnings` removed from `saveWatcherState`.** It was load-bearing in the original fix because predictions only landed in Supabase at exit; under per-boundary writes, the in-memory map is just a thin idempotency dedup buffer. Watcher death loses the map but loses no data — predictions are durable in Supabase from the moment they're computed.
+3. **All other post-game writes centralized in the supervisor.** New `services/lib/sweep-finalize.ts:sweepFinalize` runs every 60s in the supervisor's idle loop AND once at supervisor exit. Predicate query: today's games where `status != 'Final'` OR `linescore IS NULL` OR any `inning_predictions.actual_runs IS NULL`. For each, fetches fresh feed via `fetchLiveFull`; if MLB has flipped to Final, calls `lib/db/inning-predictions.ts:finalizeGame` (UPSERT `games` with full final shape + UPSERT `plays` from `buildPlayRows` + parallel UPDATE `actual_runs` from `linescore.innings[]`).
+4. **Watcher's Final branch and `performGracefulExit` no longer touch Supabase.** Watcher Final = `clearWatcherState` + return. Graceful exit = publish synthetic-Final + clear watcher state. All DB writes happen in the supervisor sweep.
+
+**Why this is better than the original tactical fix:**
+- Eliminates the bug class entirely. Predictions are durable from the moment they're computed; no exit path can lose them, including SIGKILL/OOM where no JS code runs at all.
+- Watcher Final-exit code path becomes trivial (~3 lines).
+- `saveWatcherState` payload shrinks (no `capturedInnings`) — smaller per-tick Redis serialization cost.
+- Single source of truth for end-of-game data: the sweep's `fetchLiveFull` is authoritative, eliminating any drift between the watcher's diff-applied in-memory feed and a fresh fetch.
+- One place to look for "why isn't this game in /history yet" — the sweep predicate and its retry loop, not five different exit branches.
+
+**Trade-off accepted:** ≤60s lag from MLB-Final → `/history` listing population (the next sweep iteration). Acceptable for once-per-game batch persistence. The dashboard is unaffected — the watcher's last `publishUpdateStep` already pushed `status: "Final"` to the snapshot, so the game moves out of Active immediately.
+
+**Regression check:**
+- `services/lib/finalize-game.test.ts` — assertions on the simplified shape (`{publishUpdate, clearWatcherState}` only, no DB calls).
+- `services/lib/sweep-finalize.test.ts` — happy path (Final candidates finalized), Live skip (still in progress), error-per-game tolerance, finalize throw doesn't escalate, idempotent re-run.
+
 **Don't change without thinking:**
-- The persist call in the abandoned branch is BEFORE `publishUpdate`, not after. Reordering means a publish failure (Redis hiccup) silently prevents the persist — and the persist is the load-bearing data, not the dashboard cleanup.
-- The skip-when-both-empty guard. Without it, a watcher that crashes before its first half-boundary writes an empty `games` row with `status: "Final"` and zero rows in `inning_predictions` — pollutes `/history` with games that have nothing to show.
-- The independent try/catch around `persistFinishedGame` and `buildPlayRows`. Folding either into the main flow lets a Supabase outage or a malformed feed escalate `gracefulExit` from "best-effort never throws" into a watcher crash.
-- `playRows` defaults to `[]` when feed fetch failed OR the transform throws. The `inning_predictions` are independently valuable — don't gate the persist on having a non-empty `playRows`.
+- Per-boundary `upsertInningPrediction` is **fire-and-forget** (`void upsertInningPrediction(...).catch(log.warn)`). Awaiting would couple watcher tick latency to Supabase response time. Sweep backstops gaps.
+- `capturedInnings` is in-process only — removing it from `saveWatcherState` is the load-bearing change. Re-adding it isn't harmful but defeats the bundle-size win.
+- `sweepFinalize` is wired into BOTH the idle loop (60s cadence) AND supervisor exit. Removing the exit-time call leaves the very last game-of-day's archive incomplete until tomorrow's cron.
+- The lazy stub `games` row in `upsertInningPrediction` uses `ignoreDuplicates: true` (= `ON CONFLICT DO NOTHING`). Switching to a regular UPSERT would clobber a partially-finalized row each time the next inning lands.
+- `performGracefulExit` does not touch Supabase. Reintroducing DB writes there couples the watcher's lifecycle to the archive — which was the bug-#11/#12 class. `GracefulExitDeps` shape is `{ publishUpdate, clearWatcherState }`; expanding it back to fetchLiveDiff/persistFinishedGame/buildPlayRows is the regression to watch for.
