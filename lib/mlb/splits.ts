@@ -106,27 +106,58 @@ export const LEAGUE_PA: { L: PaOutcomes; R: PaOutcomes } = {
   },
 };
 
-/**
- * Empirical-Bayes prior strength in PA. Observed rates are blended with the
- * league mean as: shrunken = (n*observed + n0*league) / (n + n0).
- * n0 ≈ 200 means a player with 200 PA contributes 50/50 with the league mean.
- */
-const SHRINK_N0 = 200;
-
-/** Default last-30-day weight when blending with season splits. */
-const RECENT_WEIGHT = 0.30;
-
 const RECENT_DAYS = 30;
 
 /**
- * Marcel-style recency multipliers on per-PA blending across current + prior
- * regular seasons. Current-year observations carry 1.5× the per-PA weight of
- * prior-year observations in the blended rate. Shrinkage strength (SHRINK_N0)
- * is applied against ACTUAL observed PA, not the weighted PA, so the existing
- * EB calibration stays grounded in real sample size.
+ * Per-role blend configuration. Five knobs:
+ *   wCurrent / wPrior — Marcel-style cross-season recency multipliers on per-PA
+ *     blending. Decay = wPrior / wCurrent (so 3:2 = 0.67, 2:1 = 0.5).
+ *   n0 — empirical-Bayes prior strength in PA against the league mean. n0 PA
+ *     means a player with that many PA contributes 50/50 with league.
+ *   recentWeight — share of the final blended rate carried by the L30 sample
+ *     (the rest is the season blend). Applied only when L30 PA ≥ recentMinPa.
+ *   recentMinPa — materiality gate for the L30 blend. Below this threshold,
+ *     L30 is dropped entirely.
+ *
+ * Hitter values: literature-aligned (Marcel hitters 5/4/3 → decay ≈ 0.75; our
+ *   2-year 3:2 = 0.67 sits in the published 0.6-0.8 band). n0 = 200 matches
+ *   composite-stat stabilization (~200-460 PA at split-half r ≈ 0.7).
+ *
+ * Pitcher values: Marcel splits hitters and pitchers (5/4/3 vs 4/3/2) because
+ *   pitcher rates are noisier year-to-year — collapsed to two seasons that's
+ *   roughly 2:1 (decay 0.5). Pitcher n0 is larger because batted-ball-driven
+ *   components (BABIP ~2000 BIP, HR ~1320 BF) need much more PA to stabilize
+ *   on the pitcher side; n0 = 500 is a single-knob compromise across the
+ *   per-PA outcome bundle (K%/BB% would prefer smaller, BABIP/HR much larger).
+ *
+ * L30 blend (shared): The Book + empirical replications find L7-L30 carries
+ *   ~5 wOBA points / 0.0-0.2% improvement — small but non-zero. Threshold 80
+ *   PA ≈ a month of starts; 0.10 weight keeps it from drowning the season
+ *   signal. No major published projection system uses an L30 component.
  */
-const W_CURRENT = 3;
-const W_PRIOR = 2;
+type BlendConfig = {
+  wCurrent: number;
+  wPrior: number;
+  n0: number;
+  recentWeight: number;
+  recentMinPa: number;
+};
+
+const BATTER_BLEND: BlendConfig = {
+  wCurrent: 3,
+  wPrior: 2,
+  n0: 200,
+  recentWeight: 0.10,
+  recentMinPa: 80,
+};
+
+const PITCHER_BLEND: BlendConfig = {
+  wCurrent: 2,
+  wPrior: 1,
+  n0: 500,
+  recentWeight: 0.10,
+  recentMinPa: 80,
+};
 
 // Default profile when a split is entirely absent (rare; fallback path).
 function defaultPa(hand: "L" | "R"): PaOutcomes {
@@ -179,20 +210,22 @@ function blendPa(a: PaOutcomes, b: PaOutcomes, bWeight: number): PaOutcomes {
 }
 
 /**
- * Combine current + prior regular-season per-PA outcomes with the W_CURRENT /
- * W_PRIOR recency multiplier on the blended rate. Returns the actual observed
- * PA (truePa) separately, so callers can shrink against true sample size while
- * still benefiting from the recency bias in the rates.
+ * Combine current + prior regular-season per-PA outcomes with role-specific
+ * recency multipliers (wCurrent / wPrior) on the blended rate. Returns the
+ * actual observed PA (truePa) separately, so callers can shrink against true
+ * sample size while still benefiting from the recency bias in the rates.
  */
 function combineSeasonsPa(
   current: { rates: PaOutcomes; pa: number } | null,
   prior: { rates: PaOutcomes; pa: number } | null,
+  wCurrent: number,
+  wPrior: number,
 ): { rates: PaOutcomes; truePa: number } | null {
   if (!current && !prior) return null;
   if (!current) return { rates: prior!.rates, truePa: prior!.pa };
   if (!prior) return { rates: current.rates, truePa: current.pa };
-  const wc = W_CURRENT * current.pa;
-  const wp = W_PRIOR * prior.pa;
+  const wc = wCurrent * current.pa;
+  const wp = wPrior * prior.pa;
   const denom = wc + wp;
   if (denom === 0) return null;
   const out = {} as PaOutcomes;
@@ -203,7 +236,7 @@ function combineSeasonsPa(
 }
 
 /** Empirical-Bayes shrinkage to the league mean. Preserves sum-to-1. */
-export function shrinkPa(observed: PaOutcomes, n: number, league: PaOutcomes, n0 = SHRINK_N0): PaOutcomes {
+export function shrinkPa(observed: PaOutcomes, n: number, league: PaOutcomes, n0 = BATTER_BLEND.n0): PaOutcomes {
   const w = n / (n + n0);
   const out = {} as PaOutcomes;
   (Object.keys(observed) as (keyof PaOutcomes)[]).forEach((key) => {
@@ -373,10 +406,13 @@ function buildSide(
   recentStat: Record<string, unknown> | null,
   league: PaOutcomes,
   hand: "L" | "R",
+  config: BlendConfig,
 ): SideResult {
   const baselineRaw = combineSeasonsPa(
     paFromStat(currentSeasonStat),
     paFromStat(priorSeasonStat),
+    config.wCurrent,
+    config.wPrior,
   );
   const recentRaw = paFromStat(recentStat);
 
@@ -385,18 +421,17 @@ function buildSide(
   }
 
   // Shrink the recency-weighted blend against the *actual* observed PA so the
-  // existing SHRINK_N0 calibration stays grounded in real sample size.
+  // EB calibration stays grounded in real sample size.
   const baselineShrunk = baselineRaw
-    ? shrinkPa(baselineRaw.rates, baselineRaw.truePa, league)
+    ? shrinkPa(baselineRaw.rates, baselineRaw.truePa, league, config.n0)
     : league;
   const recentShrunk = recentRaw
-    ? shrinkPa(recentRaw.rates, recentRaw.pa, league)
+    ? shrinkPa(recentRaw.rates, recentRaw.pa, league, config.n0)
     : null;
 
-  // Only blend in recent form if we actually have last-30 data with material PA.
-  const hasMaterialRecent = recentRaw && recentRaw.pa >= 20 && recentShrunk;
+  const hasMaterialRecent = recentRaw && recentRaw.pa >= config.recentMinPa && recentShrunk;
   const blended = hasMaterialRecent
-    ? blendPa(baselineShrunk, recentShrunk, RECENT_WEIGHT)
+    ? blendPa(baselineShrunk, recentShrunk, config.recentWeight)
     : baselineShrunk;
 
   return { rates: blended, pa: baselineRaw?.truePa ?? 0 };
@@ -420,8 +455,8 @@ export async function loadBatterPaProfile(playerId: number): Promise<BatterPaPro
   const recentVL = pickSplit(recent, "vl");
   const recentVR = pickSplit(recent, "vr");
 
-  const sideL = buildSide(currentVL, priorVL, recentVL, LEAGUE_PA.L, "L");
-  const sideR = buildSide(currentVR, priorVR, recentVR, LEAGUE_PA.R, "R");
+  const sideL = buildSide(currentVL, priorVL, recentVL, LEAGUE_PA.L, "L", BATTER_BLEND);
+  const sideR = buildSide(currentVR, priorVR, recentVR, LEAGUE_PA.R, "R", BATTER_BLEND);
 
   return {
     id: hand.id,
@@ -450,8 +485,8 @@ export async function loadPitcherPaProfile(playerId: number): Promise<PitcherPaP
   const recentVL = pickSplit(recent, "vl");
   const recentVR = pickSplit(recent, "vr");
 
-  const sideL = buildSide(currentVL, priorVL, recentVL, LEAGUE_PA.L, "L");
-  const sideR = buildSide(currentVR, priorVR, recentVR, LEAGUE_PA.R, "R");
+  const sideL = buildSide(currentVL, priorVL, recentVL, LEAGUE_PA.L, "L", PITCHER_BLEND);
+  const sideR = buildSide(currentVR, priorVR, recentVR, LEAGUE_PA.R, "R", PITCHER_BLEND);
 
   return {
     id: hand.id,
@@ -463,4 +498,12 @@ export async function loadPitcherPaProfile(playerId: number): Promise<PitcherPaP
 }
 
 // Internal helpers exported for tests.
-export const __testing = { paFromStat, blendPa, combineSeasonsPa, defaultPa, buildSide };
+export const __testing = {
+  paFromStat,
+  blendPa,
+  combineSeasonsPa,
+  defaultPa,
+  buildSide,
+  BATTER_BLEND,
+  PITCHER_BLEND,
+};

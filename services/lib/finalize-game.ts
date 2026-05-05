@@ -69,9 +69,13 @@ export type GracefulExitOutcome = "finalized" | "abandoned" | "skipped";
 //
 // 2. "abandoned" — feed still says Live (or fetch failed). Publishes a
 //    synthetic { ...lastPublishedState, status: "Final" } so the dashboard
-//    moves the game out of Active into Finished. We do NOT call
-//    persistFinishedGame here because we don't have a verified terminal feed
-//    and don't want to write half-baked rows into the archive.
+//    moves the game out of Active into Finished, AND persists the captured
+//    per-inning predictions so they don't evaporate with the watcher's
+//    24h Redis TTL. The synthetic state's score / linescore lag MLB's true
+//    final, but `actual_runs` is nullable in the schema and any future
+//    re-run cleanly overwrites the row via the `(game_pk)` /
+//    `(game_pk, inning, half)` upsert. Skipped entirely when there are no
+//    captures and no plays — no point creating an empty `games` row.
 //
 // 3. "skipped" — no lastPublishedState (we never even reached the first
 //    publish). Nothing to clean up; just log and return. The seeded "Pre"
@@ -148,16 +152,60 @@ export async function performGracefulExit(
   }
 
   // Abandoned: no verified Final, but we still have a published state. Flip
-  // its status to Final so the dashboard moves it out of Active.
+  // its status to Final so the dashboard moves it out of Active, and persist
+  // whatever per-inning predictions we captured so they survive the watcher's
+  // 24h Redis TTL. Skipped entirely when there's nothing to save.
+  const synthetic = buildSyntheticFinalState(lastPublishedState);
+
+  // Build playRows from the last successful feed fetch, if any. If we never
+  // got a feed (fetch threw above) or the transform throws on a partial feed,
+  // fall through with an empty array — the inning_predictions are the
+  // load-bearing data here.
+  let playRows: PlayRow[] = [];
+  if (feed) {
+    try {
+      playRows = deps.buildPlayRows(feed, gamePk);
+    } catch (err) {
+      log.warn("watcher", "graceful-exit:buildPlayRows-fail", {
+        gamePk,
+        reason,
+        err: String(err),
+      });
+    }
+  }
+
+  const inningCount = Object.keys(capturedInnings).length;
+
+  log.warn("watcher", "graceful-exit:abandoned", {
+    gamePk,
+    reason,
+    innings: inningCount,
+    plays: playRows.length,
+    lastInning: lastPublishedState.inning,
+    lastHalf: lastPublishedState.half,
+    lastStatus: lastPublishedState.status,
+  });
+
+  // Persist before publish: if both fail, we still want the inning data
+  // landed. Skip the persist call entirely when there's nothing to save —
+  // an empty `games` row is worse than no row.
+  if (inningCount > 0 || playRows.length > 0) {
+    try {
+      await deps.persistFinishedGame({
+        finalState: synthetic,
+        capturedInnings,
+        playRows,
+      });
+    } catch (err) {
+      log.warn("watcher", "graceful-exit:persist-fail", {
+        gamePk,
+        reason,
+        err: String(err),
+      });
+    }
+  }
+
   try {
-    const synthetic = buildSyntheticFinalState(lastPublishedState);
-    log.warn("watcher", "graceful-exit:abandoned", {
-      gamePk,
-      reason,
-      lastInning: lastPublishedState.inning,
-      lastHalf: lastPublishedState.half,
-      lastStatus: lastPublishedState.status,
-    });
     await deps.publishUpdate(synthetic);
     return "abandoned";
   } catch (err) {

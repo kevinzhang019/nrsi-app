@@ -273,7 +273,7 @@ The dashboard reads from `nrxi:snapshot` (a Redis hash with 24h TTL that gets re
 **Layer 1 — in-process gracefulExit** (`services/lib/finalize-game.ts:performGracefulExit`). New helper called from all four non-Final exit paths. Captures the last successfully-published state (hoisted `lastPublishedState: GameState | null` set after each `publishUpdateStep`), does one final `fetchLiveDiff` (best-effort, never throws), then:
 
 - If MLB has flipped to Final → run the existing Final logic (`buildPlayRows` + `persistFinishedGameStep` + `clearWatcherState`). Common case: MLB lags a few minutes between actual game end and flipping the status field.
-- Otherwise → republish `{ ...lastPublishedState, status: "Final" }` so the dashboard moves the game out of Active. Doesn't call `persistFinishedGame` here because we don't have a verified terminal feed and don't want to write half-baked rows into the archive.
+- Otherwise → republish `{ ...lastPublishedState, status: "Final" }` so the dashboard moves the game out of Active. *(Originally the abandoned branch did NOT persist captured innings out of caution about half-baked rows. That decision was reconsidered in **bug #12** — abandoned now also persists, because the captured per-inning predictions are real data and the schema accommodates partial finals.)*
 - If `lastPublishedState` is null (watcher never reached its first publish) → log and skip.
 
 The main loop body in `services/run-watcher.ts` is wrapped in a single try/catch so any thrown step routes into `gracefulExit("error")` instead of bubbling to the supervisor. The two abort returns (top-of-loop and sleep-catch) also call `gracefulExit("abort")` first.
@@ -296,3 +296,47 @@ This is the only defense against the process-kill scenarios where no in-process 
 - The stale-Live detector's `lock missing === watcher dead` premise. Any change to lock TTL (currently 30s) or refresher cadence (currently 10s in `services/lib/lock.ts`) must keep that invariant. If both move toward `TTL ≈ refresh interval`, a healthy watcher can briefly look "dead" between refreshes and the detector will false-positive-clean it.
 - The 60s `DEFAULT_STALE_AFTER_MS`. Raising it delays cleanup; lowering it risks racing the publish/exit gap inside a single tick. Don't try to use it to cover Delayed/Suspended games (300s polling) — those still have a live lock and the lock check filters them out before the threshold matters.
 - The detector running BEFORE the sleep but AFTER the break checks in `services/supervisor.ts`. Moving it before the break would run it on past-deadline supervisors (no Live games to clean — wasted call). Moving it after the sleep delays first-pass cleanup by 60s.
+
+## Bug 12: History missing per-inning predictions when the watcher exits via graceful-exit "abandoned"
+
+**Symptom:** users reported games on `/history` were often missing per-inning predictions seemingly at random — some games had every half captured, others were missing scattered halves with no pattern. The detail page silently degraded by falling back to the final-game state with no indicator (`components/historical-game-view.tsx:91-92`), so users saw *something* but not the prediction made at the start of that half.
+
+**Root cause:** bug #11's `performGracefulExit` (`services/lib/finalize-game.ts`) had three outcomes — `finalized`, `abandoned`, `skipped` — but only `finalized` called `persistFinishedGameStep`. When a watcher exited via any non-Final path AND MLB hadn't yet flipped the game to Final, the function:
+
+1. published a synthetic `{ ...lastPublishedState, status: "Final" }` so the dashboard cleaned up,
+2. left the in-memory `capturedInnings` in Redis under `nrxi:watcher-state:{gamePk}`,
+3. returned `"abandoned"` without writing to Supabase.
+
+The Redis key has a 24h TTL. After abandonment there's no automatic re-watch — the supervisor cron `0 12 * * *` only schedules *today's* games, the snapshot already says synthetic-Final so `pruneStaleSnapshots` will sweep it tomorrow, and nothing reads `nrxi:watcher-state:{gamePk}` again. The captures expired silently.
+
+The original code comment (lines 73-74 of the pre-fix `finalize-game.ts`) explained the conservative choice: "we don't have a verified terminal feed and don't want to write half-baked rows into the archive." But the captures themselves aren't half-baked — they're real per-inning predictions captured at real half-boundaries (the `outs===0 && (bases===0 || bases===2)` predicate is unchanged). Only the *terminal* status came from MLB's lag.
+
+**Why the misses looked random:** distribution depended on which run died.
+
+- A normal 3h game finishes well under both budgets, exits via the main-loop Final branch (`services/run-watcher.ts:747-772`), captures persisted. No data loss.
+- Long games (extras + delays, doubleheaders near 6h after the first), crashes (`error`), container evictions / SIGTERM (`abort`), supervisor restarts → `abandoned` → captures lost.
+- Same gamePk could have *some* halves persisted (captured before the run that abandoned) and *other* halves never persisted (captured during the abandoned run). End user sees "random" missing halves.
+
+**What was ruled out (worth knowing):**
+- Sleep cadence is fine — at 5s active-PA cadence the new half's clean-state window (outs=0, bases=0/2 until first batter reaches base) holds for the entire first PA (typically ≥1 minute). Many ticks land in the window.
+- `readMarkovStartState` (`services/start-state.ts:19-34`) short-circuit is correct — `{0,0}` (regulation) or `{0,2}` (Manfred extras) on `inningState ∈ middle/end` OR `outs >= 3`. Capture predicate accepts both.
+- Idempotency key `${inning}-${half}` is correct — skip-if-present prevents overwrite, doesn't drop rows.
+
+**Fix:** persist captured innings on every `gracefulExit` path. `services/lib/finalize-game.ts:154-218` — the abandoned branch now builds `playRows` from the last-fetched feed (defaults to `[]` if the fetch failed or the transform throws), then calls `deps.persistFinishedGame({ finalState: synthetic, capturedInnings, playRows })` wrapped in its own try/catch. The persist call is skipped only when both `capturedInnings` is empty AND `playRows` is empty — no point creating an empty `games` row for a watcher that died before any half-boundary. Publish runs after persist so a Supabase outage doesn't prevent dashboard cleanup.
+
+**Why this is safe:**
+- `inning_predictions.actual_runs` is nullable (`supabase/migrations/0001_history.sql:48`); halves whose linescore wasn't yet recorded persist with `actual_runs = null`, which the UI already handles.
+- Upsert is idempotent and last-write-wins — `lib/db/games.ts:80` (`onConflict: "game_pk"`) and `:102` (`onConflict: "game_pk,inning,half"`). If a future watcher gets a real Final for the same gamePk it cleanly overwrites the synthetic row with actual final score / linescore / actual_runs.
+- The synthetic `final_snapshot` blob mirrors the watcher's last successfully-published state with `status` flipped to "Final" — same shape the dashboard already received via `publishUpdate(synthetic)`.
+- `gracefulExit` is best-effort and never throws; the new persist call's try/catch preserves that invariant.
+
+**Trade-off accepted:** abandoned games now show in `/history` with a "Final" score that's actually mid-game (the score at the moment of abandonment), and `actual_runs = null` for halves whose linescore wasn't recorded. This is better than the prior behavior (whole game or scattered halves silently absent) and the upsert means a future re-run can correct it. If the lagged-final score becomes confusing in practice, the next iteration would add a `status_source: "synthetic" | "mlb_final"` column to `games` and surface a "result unverified" badge — out of scope here.
+
+**Regression check:**
+- `services/lib/finalize-game.test.ts` — 6 new cases under `describe("abandoned path persistence (bug: missing inning_predictions)")`: persist with captures, persist on plays-only, skip when both empty, persist-error swallow, buildPlayRows-throws fallback, fetch-failed → no buildPlayRows. Existing 8 tests stay green (they all used `capturedInnings: {}` so the new skip-when-empty logic preserved the original assertions).
+
+**Don't change without thinking:**
+- The persist call in the abandoned branch is BEFORE `publishUpdate`, not after. Reordering means a publish failure (Redis hiccup) silently prevents the persist — and the persist is the load-bearing data, not the dashboard cleanup.
+- The skip-when-both-empty guard. Without it, a watcher that crashes before its first half-boundary writes an empty `games` row with `status: "Final"` and zero rows in `inning_predictions` — pollutes `/history` with games that have nothing to show.
+- The independent try/catch around `persistFinishedGame` and `buildPlayRows`. Folding either into the main flow lets a Supabase outage or a malformed feed escalate `gracefulExit` from "best-effort never throws" into a watcher crash.
+- `playRows` defaults to `[]` when feed fetch failed OR the transform throws. The `inning_predictions` are independently valuable — don't gate the persist on having a non-empty `playRows`.

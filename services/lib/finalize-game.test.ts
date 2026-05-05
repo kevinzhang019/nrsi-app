@@ -6,6 +6,28 @@ import {
 } from "./finalize-game";
 import type { GameState } from "../../lib/state/game-state";
 import type { LiveFeed } from "../../lib/mlb/types";
+import type { InningCapture } from "../../lib/types/history";
+
+function makeInningCapture(
+  inning: number,
+  half: "Top" | "Bottom",
+  overrides: Partial<InningCapture> = {},
+): InningCapture {
+  return {
+    inning,
+    half,
+    pNoRun: 0.7,
+    pRun: 0.3,
+    breakEvenAmerican: -230,
+    perBatter: [],
+    pitcher: { active: null, away: null, home: null },
+    env: null,
+    lineupStats: null,
+    defenseKey: "",
+    capturedAt: "2026-05-03T19:00:00.000Z",
+    ...overrides,
+  };
+}
 
 function makeState(overrides: Partial<GameState> = {}): GameState {
   return {
@@ -190,5 +212,114 @@ describe("performGracefulExit", () => {
       expect(out).toBe("abandoned");
       expect(deps.publishUpdate).toHaveBeenCalledTimes(1);
     }
+  });
+
+  describe("abandoned path persistence (bug: missing inning_predictions)", () => {
+    it("persists captured innings on the abandoned path so they don't evaporate with the 24h Redis TTL", async () => {
+      const deps = makeDeps({
+        fetchLiveDiff: vi.fn().mockResolvedValue({ feed: makeFeed("In Progress", "Live") }),
+      });
+      const captured = {
+        "1-Top": makeInningCapture(1, "Top"),
+        "1-Bottom": makeInningCapture(1, "Bottom"),
+        "2-Top": makeInningCapture(2, "Top"),
+      };
+      const outcome = await performGracefulExit(
+        { ...baseInput, capturedInnings: captured, lastPublishedState: makeState() },
+        deps,
+      );
+      expect(outcome).toBe("abandoned");
+      expect(deps.persistFinishedGame).toHaveBeenCalledTimes(1);
+      const args = (deps.persistFinishedGame as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(args.finalState.status).toBe("Final");
+      expect(args.capturedInnings).toBe(captured);
+      expect(Object.keys(args.capturedInnings)).toHaveLength(3);
+      // Dashboard cleanup still happens too — both writes matter.
+      expect(deps.publishUpdate).toHaveBeenCalledTimes(1);
+      // Watcher state is NOT cleared on abandoned (24h TTL drains it),
+      // distinguishing this from the finalized path.
+      expect(deps.clearWatcherState).not.toHaveBeenCalled();
+    });
+
+    it("persists when there are play rows even with zero captured innings", async () => {
+      const deps = makeDeps({
+        fetchLiveDiff: vi.fn().mockResolvedValue({ feed: makeFeed("In Progress", "Live") }),
+        buildPlayRows: vi.fn().mockReturnValue([{ atBatIndex: 0 } as never, { atBatIndex: 1 } as never]),
+      });
+      const outcome = await performGracefulExit(
+        { ...baseInput, lastPublishedState: makeState() },
+        deps,
+      );
+      expect(outcome).toBe("abandoned");
+      expect(deps.persistFinishedGame).toHaveBeenCalledTimes(1);
+      const args = (deps.persistFinishedGame as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(args.playRows).toHaveLength(2);
+    });
+
+    it("skips persist entirely when there are no captures and no plays — no empty `games` row", async () => {
+      const deps = makeDeps({
+        fetchLiveDiff: vi.fn().mockResolvedValue({ feed: makeFeed("In Progress", "Live") }),
+      });
+      const outcome = await performGracefulExit(
+        { ...baseInput, lastPublishedState: makeState() },
+        deps,
+      );
+      expect(outcome).toBe("abandoned");
+      expect(deps.persistFinishedGame).not.toHaveBeenCalled();
+      // Dashboard still gets the synthetic Final.
+      expect(deps.publishUpdate).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns abandoned and still publishes when persistFinishedGame throws", async () => {
+      const deps = makeDeps({
+        fetchLiveDiff: vi.fn().mockResolvedValue({ feed: makeFeed("In Progress", "Live") }),
+        persistFinishedGame: vi.fn().mockRejectedValue(new Error("supabase down")),
+      });
+      const captured = { "1-Top": makeInningCapture(1, "Top") };
+      const outcome = await performGracefulExit(
+        { ...baseInput, capturedInnings: captured, lastPublishedState: makeState() },
+        deps,
+      );
+      expect(outcome).toBe("abandoned");
+      expect(deps.persistFinishedGame).toHaveBeenCalledTimes(1);
+      // Publish still fires — dashboard cleanup is independent of persist.
+      expect(deps.publishUpdate).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls back to empty playRows and still persists captures when buildPlayRows throws", async () => {
+      const deps = makeDeps({
+        fetchLiveDiff: vi.fn().mockResolvedValue({ feed: makeFeed("In Progress", "Live") }),
+        buildPlayRows: vi.fn().mockImplementation(() => {
+          throw new Error("malformed allPlays");
+        }),
+      });
+      const captured = { "1-Top": makeInningCapture(1, "Top") };
+      const outcome = await performGracefulExit(
+        { ...baseInput, capturedInnings: captured, lastPublishedState: makeState() },
+        deps,
+      );
+      expect(outcome).toBe("abandoned");
+      expect(deps.persistFinishedGame).toHaveBeenCalledTimes(1);
+      const args = (deps.persistFinishedGame as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(args.playRows).toEqual([]);
+      expect(Object.keys(args.capturedInnings)).toHaveLength(1);
+    });
+
+    it("persists captures even when the final feed fetch failed (no feed → empty plays)", async () => {
+      const deps = makeDeps({
+        fetchLiveDiff: vi.fn().mockRejectedValue(new Error("network blew up")),
+      });
+      const captured = { "1-Top": makeInningCapture(1, "Top") };
+      const outcome = await performGracefulExit(
+        { ...baseInput, capturedInnings: captured, lastPublishedState: makeState() },
+        deps,
+      );
+      expect(outcome).toBe("abandoned");
+      // buildPlayRows should NOT be called when feed fetch failed.
+      expect(deps.buildPlayRows).not.toHaveBeenCalled();
+      expect(deps.persistFinishedGame).toHaveBeenCalledTimes(1);
+      const args = (deps.persistFinishedGame as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(args.playRows).toEqual([]);
+    });
   });
 });
