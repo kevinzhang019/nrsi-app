@@ -2,8 +2,18 @@ import { z } from "zod";
 
 export const HandCode = z.enum(["L", "R", "S"]);
 export type HandCode = z.infer<typeof HandCode>;
+
+// Resolved throwing hand used by downstream model code — always L or R after
+// switch-thrower resolution in lib/mlb/splits.ts:loadHand.
 export const PitchHand = z.enum(["L", "R"]);
 export type PitchHand = z.infer<typeof PitchHand>;
+
+// Raw value returned by MLB's /people endpoint. Switch-throwers (rare; usually
+// position players doing mop-up duty) come back as "S". Use this for schema
+// parsing of API responses; resolveThrowsHand collapses "S" to "L"|"R" by
+// comparing per-side WHIP.
+export const PitchHandRaw = z.enum(["L", "R", "S"]);
+export type PitchHandRaw = z.infer<typeof PitchHandRaw>;
 
 export const ScheduleGame = z.object({
   gamePk: z.number(),
@@ -51,7 +61,7 @@ export const PersonResponse = z.object({
       id: z.number(),
       fullName: z.string(),
       batSide: z.object({ code: HandCode }).optional(),
-      pitchHand: z.object({ code: PitchHand }).optional(),
+      pitchHand: z.object({ code: PitchHandRaw }).optional(),
     }),
   ),
 });
@@ -108,7 +118,7 @@ export type PlayDoc = {
     batter?: { id?: number; fullName?: string };
     pitcher?: { id?: number; fullName?: string };
     batSide?: { code?: HandCode };
-    pitchHand?: { code?: PitchHand };
+    pitchHand?: { code?: PitchHandRaw };
   };
   result?: {
     event?: string;
@@ -200,7 +210,7 @@ export type LiveFeed = {
           batter?: { id: number };
           pitcher?: { id: number };
           batSide?: { code: HandCode };
-          pitchHand?: { code: PitchHand };
+          pitchHand?: { code: PitchHandRaw };
         };
       };
       // Full game play log. Present on full feeds; we only consume it once

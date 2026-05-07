@@ -2,7 +2,7 @@ import { fetchPerson, fetchSplits } from "./client";
 import { cacheJson } from "../cache/redis";
 import { k } from "../cache/keys";
 import { log } from "../log";
-import type { HandCode, PitchHand } from "./types";
+import type { HandCode, PitchHand, PitchHandRaw } from "./types";
 
 const STATSAPI = "https://statsapi.mlb.com";
 const UA = process.env.MLB_USER_AGENT || "nrxi-app/0.1";
@@ -253,13 +253,42 @@ export async function loadHand(playerId: number) {
   return cacheJson(k.hand(playerId), 60 * 60 * 24 * 30, async () => {
     const r = await fetchPerson(playerId);
     const p = r.people[0];
+    const throws = await resolveThrowsHand(p.id, p.pitchHand?.code);
     return {
       id: p.id,
       fullName: p.fullName,
       bats: p.batSide?.code ?? ("R" as HandCode),
-      throws: p.pitchHand?.code ?? ("R" as PitchHand),
+      throws,
     };
   });
+}
+
+// Collapses MLB's raw pitchHand to the L|R our model assumes. Most players
+// already come back as "L" or "R" and we pass through. Switch-throwers (rare;
+// almost always position players doing mop-up duty) return "S" — for those we
+// pick whichever side has the lower WHIP from their season pitching splits,
+// fall back to whichever side has stats, and default to "R" if neither does.
+async function resolveThrowsHand(
+  playerId: number,
+  raw: PitchHandRaw | undefined,
+): Promise<PitchHand> {
+  if (raw === "L" || raw === "R") return raw;
+  try {
+    let r = await loadPitchingSplitsRaw(playerId, SEASON);
+    let splits = r.stats[0]?.splits ?? [];
+    if (splits.length === 0) {
+      r = await loadPitchingSplitsRaw(playerId, FALLBACK_SEASON);
+      splits = r.stats[0]?.splits ?? [];
+    }
+    const whipL = num(pickSplit(splits, "vl")?.whip);
+    const whipR = num(pickSplit(splits, "vr")?.whip);
+    if (whipL != null && whipR != null) return whipL <= whipR ? "L" : "R";
+    if (whipL != null) return "L";
+    if (whipR != null) return "R";
+  } catch (err) {
+    log.warn("mlb", "resolveThrowsHand:fail", { playerId, err: String(err) });
+  }
+  return "R";
 }
 
 async function loadHittingSplitsRaw(playerId: number, season: number) {

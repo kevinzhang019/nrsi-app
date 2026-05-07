@@ -371,3 +371,53 @@ The original code comment (lines 73-74 of the pre-fix `finalize-game.ts`) explai
 - `sweepFinalize` is wired into BOTH the idle loop (60s cadence) AND supervisor exit. Removing the exit-time call leaves the very last game-of-day's archive incomplete until tomorrow's cron.
 - The lazy stub `games` row in `upsertInningPrediction` uses `ignoreDuplicates: true` (= `ON CONFLICT DO NOTHING`). Switching to a regular UPSERT would clobber a partially-finalized row each time the next inning lands.
 - `performGracefulExit` does not touch Supabase. Reintroducing DB writes there couples the watcher's lifecycle to the archive — which was the bug-#11/#12 class. `GracefulExitDeps` shape is `{ publishUpdate, clearWatcherState }`; expanding it back to fetchLiveDiff/persistFinishedGame/buildPlayRows is the regression to watch for.
+
+## Bug 13: Live game stuck "Scheduled" on dashboard for hours — `PitchHand` schema rejects switch-throwers
+
+**Symptom:** the Athletics @ Phillies game on 2026-05-06 (gamePk 823470, first pitch 22:40 UTC) was actively live in MLB's eyes (`abstractGameState: "Live"`, top of 6) but the dashboard's Upcoming section still showed it with `detailedState: "Scheduled"` ~2h after first pitch. Reading `nrxi:snapshot:823470` from Upstash showed the unmodified seed stub — `status: "Pre"`, `updatedAt` = `2026-05-06T12:01:00Z` (the supervisor's startup seed time). The watcher had never published a single tick.
+
+**Root cause:** the Phillies' lineup that day included Carlos Cortes (id 666126) as a position-player batter. Cortes is a switch-thrower, so `/api/v1/people/666126` returned `pitchHand.code: "S"`. The Zod schema in `lib/mlb/types.ts:5` defined `PitchHand = z.enum(["L", "R"])` — a holdover from when only major-league pitchers were touched by this code path. When `loadLineupSplits` → `loadBatterPaProfile` fired its 9 parallel `/people/{batterId}` fetches at tick 0, the Cortes call failed `PersonResponse.parse` with `Invalid option: expected one of "L"|"R"` at `["people",0,"pitchHand","code"]`. `withRetry` retried 3× (deterministically failing each time) and bubbled the error.
+
+The error landed in the watcher's main-loop try/catch which routes to `gracefulExit("error")`. But `lastPublishedState` was still `null` (no successful publish had happened yet), so `performGracefulExit` logged `graceful-exit:skipped: no lastPublishedState` and skipped the synthetic-Final publish. The 12:00 UTC seed stub stayed intact in Redis. Same crash hit the Railway watcher at gameDate−90s the same way; the supervisor caught the throw as `watcher-task:fail`, `pending.delete`d the gamePk, and moved on without ever spawning a replacement.
+
+**Why no detector caught it:**
+- `services/lib/stale-live-detector.ts` only scans `status === "Live"` entries — this snapshot was still `status: "Pre"`.
+- `services/lib/sweep-finalize.ts` only acts after MLB flips the game to Final.
+- The supervisor's idle loop never re-fetches the schedule or re-spawns failed watcher tasks.
+
+So absent intervention, the game would have stayed stuck until the next 12:00 UTC cron — at which point the same crash would have fired again. The bug class would only have surfaced when the offending switch-thrower was eventually benched.
+
+**Why this didn't surface earlier:** `enrichLineupHands` (which also fetches `/people/{id}` for every lineup batter) wraps each per-player call in a try/catch (`services/steps/enrich-lineup-hands.ts`, the `loadHand:fail` warn), so a Zod throw there is *soft* — the step continues with `hydrated: 17 of 18` and the missing batter falls through to a default `batSide: "R"`. Today's run actually showed that warn for Cortes seconds before the fatal crash. `loadLineupSplits` has no equivalent per-player catch — its 9 calls run inside one `Promise.all` and one schema failure rejects the whole step, so this particular batter put the entire watcher on the floor.
+
+**Fix:** split the schema into a wire-format type and a downstream-narrowed type (`lib/mlb/types.ts`):
+
+```ts
+// Resolved throwing hand used by downstream model code — always L or R after
+// switch-thrower resolution in lib/mlb/splits.ts:loadHand.
+export const PitchHand = z.enum(["L", "R"]);
+export type PitchHand = z.infer<typeof PitchHand>;
+
+// Raw value returned by MLB's /people endpoint. Switch-throwers (rare; usually
+// position players doing mop-up duty) come back as "S".
+export const PitchHandRaw = z.enum(["L", "R", "S"]);
+export type PitchHandRaw = z.infer<typeof PitchHandRaw>;
+```
+
+`PersonResponse`, `PlayDoc.matchup.pitchHand`, and `LiveFeed.plays.currentPlay.matchup.pitchHand` switch to `PitchHandRaw` so parsing tolerates "S". `loadHand` (`lib/mlb/splits.ts`) collapses raw → strict via the new `resolveThrowsHand(playerId, raw)`: for "S" it pulls the player's pitching splits (current season, with prior-season fallback if empty), reads WHIP for `vl` and `vr`, and picks the lower-WHIP side. If only one side has stats, that side wins. If neither side has stats (e.g., a position player who has never pitched), it defaults to "R" — the same value the prior fallback used for missing pitchHand. Cached values for the 99% of players who already came back as "L" or "R" are unaffected; the new resolver only runs on schema parse, on first cache miss for a given playerId.
+
+**Why this is safe:**
+- `PitcherProfile.throws: PitchHand` is unchanged downstream — every caller still sees `"L" | "R"`. Resolution happens at the boundary in `loadHand`.
+- The `as PitchHand` casts in `loadPitcherProfile` / `loadPitcherPaProfile` (`lib/mlb/splits.ts:384,494`) become redundant but stay correct (`hand.throws` is already `"L" | "R"`).
+- Nothing about pitcher-vs-batter platoon math changes: the model already assumes a binary throws hand, and switch-throwers are extremely rare in actual game pitching. The WHIP-based pick is a defensible "best face of the player" heuristic for the rare cases where a switch-thrower does take the mound.
+- For a player like Cortes who has never pitched in MLB, both `loadPitchingSplitsRaw(SEASON)` and `loadPitchingSplitsRaw(FALLBACK_SEASON)` return empty splits → both `whipL` and `whipR` are `null` → defaults to "R". The `enrichLineupHands` warn for that same player is also gone now because the schema accepts "S" up front.
+- Cache key isn't bumped: under the old schema `loadHand` *threw* before reaching the `cacheJson` write for any switch-thrower, so no stale "S" or default-"R" values are sitting in `nrxi:hand:{id}` for the 30-day TTL.
+
+**Don't change without thinking:**
+- `PitchHand` (strict `"L" | "R"`) and `PitchHandRaw` (`"L" | "R" | "S"`) are deliberately separate types. Reverting `PersonResponse.pitchHand.code` back to `PitchHand` would refire this exact crash whenever a switch-throwing position player appears in any lineup.
+- `resolveThrowsHand` runs inside `loadHand`'s `cacheJson` factory, so the WHIP-comparison fetch happens **once per player per 30 days**, not per tick. Moving it out of `cacheJson` would re-fetch pitching splits on every loadHand call for every position player whose profile hasn't been hydrated yet that tick.
+- The "S" → "R" default-when-no-stats branch is load-bearing: position players who have never pitched return empty splits on both sides, and the model still needs *some* throws value. Removing the default would surface as "what does throws default to for a player who happens to be at the plate during a structural reload?" — and the answer needs to stay deterministic.
+- The bug class (= "watcher dies on tick 0 with `lastPublishedState === null`, seed stub stays forever") is **not** addressed by this fix. The schema fix removes one trigger (switch-throwers in lineups), but any future deterministic crash before first publish — Zod schema gap, MLB API outage on the first `fetchLiveDiff`, malformed feed shape — leaves the same stuck-Pre snapshot with no auto-recovery. A supervisor-level "stuck-Pre detector" mirroring `detectAndCleanStaleLive` (scan snapshot for `status === "Pre"` AND `startTime` ≥ 5min in the past, `fetchLiveFull` once, spawn a fresh watcher task if MLB now reports Live, publish synthetic Final if MLB reports Final) is the right Phase-3 mitigation when this class hits again.
+
+**Regression check:**
+- `lib/mlb/splits.test.ts` and `lib/mlb/types.test.ts` (existing) — green; the new resolver path isn't exercised but the type/schema changes don't break existing tests.
+- Manual recovery against prod: ran `npx tsx bin/run-watcher-once.ts 823470` after the fix; tick 0 succeeded, snapshot moved Upcoming → Active within ~5s, watcher continued ticking at the adaptive 5–14s cadence with no warns.

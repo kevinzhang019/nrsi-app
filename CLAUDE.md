@@ -36,6 +36,7 @@ Full write-ups in `docs/BUGS.md`. Each line: bug # · symptom · primary file.
 | 10 | Rerunning the cron makes scheduled games disappear — pk-list discriminator wipes still-scheduled rows | `services/lib/prune-snapshots.ts`, `services/supervisor.ts` |
 | 11 | Snapshots stuck "Live" at varying innings after a watcher exits via budget cap / SIGTERM / error — silent return without publishing Final or clearing the field | `services/run-watcher.ts` (gracefulExit), `services/lib/finalize-game.ts`, `services/lib/stale-live-detector.ts` |
 | 12 | `/history` randomly missing per-inning predictions — captures lived in `capturedInnings` (in memory + Redis only) until the watcher's Final exit, evaporated with the 24h Redis TTL on any non-Final exit | `services/run-watcher.ts` (per-boundary `upsertInningPrediction`), `services/lib/sweep-finalize.ts` (supervisor sweep) |
+| 13 | Live game stuck "Scheduled" on dashboard for hours — `PitchHand` schema only allowed `"L"\|"R"`, MLB returns `"S"` for switch-throwers (Cortes-class position players), watcher crashes on tick 0 inside `loadLineupSplits` before `lastPublishedState` is set, `gracefulExit` no-ops, seed stub stays forever | `lib/mlb/types.ts` (split into `PitchHand` + `PitchHandRaw`), `lib/mlb/splits.ts` (`resolveThrowsHand`) |
 
 ## MLB Stats API gotchas
 
@@ -43,6 +44,7 @@ Full write-ups in `docs/BUGS.md`. Each line: bug # · symptom · primary file.
 - **Split sitCodes are `vl,vr`**, NOT `vsl,vsr`. The wrong codes return an empty `splits[]` array — silent failure, hardest kind of bug.
 - **Splits don't exist for players with no PAs in that split this season.** Legacy v1 (`loadBatterProfile`/`loadPitcherProfile`) falls back to prior season (`SEASON - 1`) only when `stats[0].splits` is empty. v2 (`loadBatterPaProfile`/`loadPitcherPaProfile`) goes further: always fetches **both** `SEASON` and `SEASON - 1` in parallel and PA-weighted-blends them with a role-specific Marcel-style multiplier on the rates (hitter `3:2`, pitcher `2:1`), then EB-shrinks the combined baseline against true PA (hitter `n0 = 200`, pitcher `n0 = 500`) and folds in a 10% last-30-day blend when L30 has ≥ 80 PA. `season=YYYY` aggregates exclude postseason for free.
 - **Switch-hitter platoon resolution defaults to canonical** (`actual` rule — bat opposite of pitcher hand). Legacy `max(L, R)` reachable via `NRXI_SWITCH_HITTER_RULE=max`. Implementation in `lib/prob/log5.ts:effectiveBatterStance` and `batterSideVs`.
+- **`/people/{id}.pitchHand.code` returns `"S"` for switch-throwers** (rare; usually position players who pitch in mop-up duty, e.g. Carlos Cortes). Schema parsing uses `PitchHandRaw` (`"L"|"R"|"S"`) at the wire boundary; downstream code uses `PitchHand` (`"L"|"R"`) after `lib/mlb/splits.ts:resolveThrowsHand` collapses `"S"` by picking the lower-WHIP side from the player's pitching splits (defaults to `"R"` when no stats). Tightening the wire schema back to `"L"|"R"` re-fires BUGS.md bug #13.
 - **`boxscore.teams.*.battingOrder` is empty until lineups post** (~30 min before first pitch). `getUpcomingForCurrentInning` returns `null` if the array is < 9 long.
 - **`outs === 3` flickers at half-inning transitions.** Don't use raw `outs` as the recompute trigger; use a composite `inningKey = "${inning}-${half}-${outs >= 3 ? 'end' : inningState || 'live'}"`.
 - **Respect `metaData.wait`.** The live feed includes a server-side hint (typically 10s). Polling faster wastes calls and risks rate limits.
@@ -162,6 +164,7 @@ Each line is a load-bearing invariant. Where there's deeper context, the parenth
 **Type-system guards:**
 - `LineupEntry.bats: HandCode | null` (`lib/mlb/extract.ts`) — narrowing back to non-null reintroduces the bug-#7 silent default-to-R lie
 - `pNoHitEventFullInning === null` when opposing pitcher unknown — UI renders `—`. **Do not** fall back to `pNoHitEvent` (UI.md → Settings panel)
+- `PitchHandRaw` (`"L"|"R"|"S"`, used by `PersonResponse` / `PlayDoc.matchup` / `LiveFeed.plays.currentPlay.matchup`) and `PitchHand` (`"L"|"R"`, used everywhere downstream) are deliberately separate types in `lib/mlb/types.ts`. The wire-format schema must accept `"S"` so switch-throwers don't crash `loadLineupSplits` on tick 0 (BUGS.md bug #13). The strict downstream form keeps platoon math typed and forces every consumer to go through `lib/mlb/splits.ts:resolveThrowsHand` (called once per player per 30 days inside `loadHand`'s `cacheJson` factory) for the L/R collapse.
 
 **UI structure:**
 - `layoutId={`card-${gamePk}`}` on the `motion.div` wrapper in `components/game-board.tsx` — without a stable `layoutId`, cards moving between section `<AnimatePresence>` parents would unmount and lose cross-section fade (UI.md → Dashboard sectioning)

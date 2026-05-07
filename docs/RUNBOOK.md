@@ -82,6 +82,34 @@ If a game shows on the dashboard as "Live" with stale data (no recent `updatedAt
 
 3. **Wait for tomorrow's cron firing.** `pruneStaleSnapshots` deletes any row whose `officialDate < todayET`, so all of yesterday's stuck-Live entries get wiped at the next 12:00 UTC supervisor boot. Cheapest, slowest.
 
+## Recovering from a stuck-Pre snapshot (live game still showing "Scheduled")
+
+Inverse of the stuck-Live class: MLB has the game in progress but the dashboard's Upcoming card still shows `detailedState: "Scheduled"`. Cause: the watcher crashed somewhere before its first `publishUpdateStep` call (BUGS.md bug #13's class). With `lastPublishedState === null`, `performGracefulExit` skips the synthetic-Final publish and the 12:00 UTC seed stub (`status: "Pre"`) stays untouched in `nrxi:snapshot:{gamePk}`. **No supervisor detector covers this** — `stale-live-detector` only scans `status === "Live"`, and the supervisor never re-fetches the schedule mid-day. Manual recovery is required until a stuck-Pre detector lands.
+
+1. **Confirm the diagnosis.**
+
+   ```bash
+   set -a; source .env.local; set +a
+   GAMEPK=<pk>
+   curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" \
+     "$KV_REST_API_URL/hget/nrxi:snapshot/$GAMEPK" \
+     | jq -r '.result' | jq '{status, detailedState, updatedAt, pitcher: .pitcher}'
+   curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" \
+     "$KV_REST_API_URL/get/nrxi:lock:$GAMEPK"
+   ```
+
+   If `status === "Pre"`, `pitcher === null`, `updatedAt` matches the supervisor's seed time (~12:01 UTC), and the lock is missing, this is a stuck-Pre. Cross-check MLB's view: `curl -s "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gamePk=$GAMEPK" | jq '.dates[].games[].status'`.
+
+2. **Run a one-off watcher locally.** Hits prod Upstash + Supabase via `.env.local`:
+
+   ```bash
+   npx tsx bin/run-watcher-once.ts $GAMEPK
+   ```
+
+   The dashboard moves Upcoming → Active within ~5s of the first successful tick. Leave the process running until the game ends — it'll publish Final and exit cleanly. Closing the terminal early just leaves the snapshot Live; the supervisor's `stale-live-detector` will clean it up at the next idle pass.
+
+3. **If `run-watcher-once` itself crashes,** the underlying bug class is back (deterministic Zod failure, MLB feed shape change, etc.). Read the log output for the schema path that failed (`["people", N, ...]` or similar), reproduce against the failing player id, and patch the schema. The Cortes/PitchHand fix in `lib/mlb/types.ts` is the model. Don't paper over by deleting the seed stub — that just hides the bug until tomorrow's cron rerun.
+
 ## Recovering from a missing /history entry
 
 A finished game whose `games` row is missing or whose `actual_runs` are NULL on `/history`. Causes: the supervisor died between MLB-flip-to-Final and its next `sweepFinalize` iteration, OR Supabase was unreachable during the sweep, OR the watcher never fired any `upsertInningPrediction` (no captures stored, no stub games row).
