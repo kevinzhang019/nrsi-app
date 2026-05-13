@@ -258,7 +258,7 @@ The frozen innings varied (6th, 7th, 9th), which ruled out an "all watchers hit 
 **Root cause:** the watcher had **four** non-Final exit paths in `services/run-watcher.ts`, all of which `return`ed without publishing a Final status, calling `persistFinishedGameStep`, or deleting the snapshot field:
 
 1. **`MAX_LOOPS`** (the 1500 cap) — `log.warn(...); return { reason: "max-loops" };` at the bottom of the loop. At 5s/loop active-PA cadence this fires after ≈2h, well within the runtime of a normal 9-inning game.
-2. **`MAX_RUNTIME_MS`** (the 6h wall-clock cap) — same shape: `log.warn(...); return { reason: "max-runtime" };`.
+2. **`MAX_RUNTIME_MS`** (the 6h wall-clock cap *at the time* — bumped to 20h when pre-game compute landed; see [ARCHITECTURE.md](ARCHITECTURE.md) for current value) — same shape: `log.warn(...); return { reason: "max-runtime" };`.
 3. **Abort signal (SIGTERM)** — both the top-of-loop `if (signal?.aborted) return { reason: "aborted" };` and the `await sleepMs(...)` catch. When Railway redeploys or kills the container, every in-flight watcher fires this path and freezes its snapshot.
 4. **Uncaught error** — any thrown step (Redis hiccup, MLB API parse error, etc.) propagated up to `services/supervisor.ts:138` which logged and removed from `pending`. The watcher exited, snapshot froze.
 
@@ -278,7 +278,7 @@ The dashboard reads from `nrxi:snapshot` (a Redis hash with 24h TTL that gets re
 
 The main loop body in `services/run-watcher.ts` is wrapped in a single try/catch so any thrown step routes into `gracefulExit("error")` instead of bubbling to the supervisor. The two abort returns (top-of-loop and sleep-catch) also call `gracefulExit("abort")` first.
 
-`MAX_LOOPS` was also bumped from 1500 to 5000 (≈7h at 5s/loop) so normal games never hit the budget. The 6h wall-clock `MAX_RUNTIME_MS` is the real ceiling now; MAX_LOOPS is just a defense against tight-loop bugs.
+`MAX_LOOPS` was also bumped from 1500 to 5000 (≈7h at 5s/loop) so normal games never hit the budget. The 6h wall-clock `MAX_RUNTIME_MS` was the real ceiling at the time of this fix; MAX_LOOPS is just a defense against tight-loop bugs. (The wall-clock cap was later bumped to 20h when pre-game compute landed under `PRE_GAME_LEAD_MS = 6h` — see [ARCHITECTURE.md](ARCHITECTURE.md) for the current rationale.)
 
 **Layer 2 — supervisor stale-Live detector** (`services/lib/stale-live-detector.ts:detectAndCleanStaleLive`). Called every `IDLE_CHECK_INTERVAL_MS` (60s) from the supervisor's idle loop. Scans `nrxi:snapshot`, and for each entry where `status === "Live"` AND `nrxi:lock:{gamePk}` is missing AND `updatedAt > 60s ago`, republishes a synthetic `{ ...state, status: "Final" }`. The lock check is the load-bearing signal — `startLockRefresher` keeps the lock fresh every 10s while a watcher is alive, so `lock missing === watcher dead`. The 60s threshold is just a safety margin against the brief publish/exit race within a single tick.
 
@@ -316,7 +316,7 @@ The original code comment (lines 73-74 of the pre-fix `finalize-game.ts`) explai
 **Why the misses looked random:** distribution depended on which run died.
 
 - A normal 3h game finishes well under both budgets, exits via the main-loop Final branch (`services/run-watcher.ts:747-772`), captures persisted. No data loss.
-- Long games (extras + delays, doubleheaders near 6h after the first), crashes (`error`), container evictions / SIGTERM (`abort`), supervisor restarts → `abandoned` → captures lost.
+- Long games (extras + delays, doubleheaders near 6h after the first under the *then-current* 6h `MAX_RUNTIME_MS` — now 20h), crashes (`error`), container evictions / SIGTERM (`abort`), supervisor restarts → `abandoned` → captures lost.
 - Same gamePk could have *some* halves persisted (captured before the run that abandoned) and *other* halves never persisted (captured during the abandoned run). End user sees "random" missing halves.
 
 **What was ruled out (worth knowing):**
