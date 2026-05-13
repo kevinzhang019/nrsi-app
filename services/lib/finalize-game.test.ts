@@ -105,6 +105,24 @@ describe("performGracefulExit", () => {
     expect(deps.clearWatcherState).not.toHaveBeenCalled();
   });
 
+  it("skips synthetic Final publish when lastPublishedState is still Pre but still clears watcher state", async () => {
+    // Regression guard for the pre-game-compute feature: a watcher that dies
+    // mid-pre-game (max-runtime under the long pre-game window, abort, error,
+    // max-loops) must NOT flip the Upcoming card to Finished. The next
+    // supervisor cron spawns a fresh watcher, so leaving the Pre stub in
+    // place is the correct UI signal. Watcher-state is still cleared so the
+    // replacement doesn't try to resume from stale hoisted caches.
+    const deps = makeDeps();
+    const last = makeState({ status: "Pre", inning: null, half: null });
+    const outcome = await performGracefulExit(
+      { ...baseInput, lastPublishedState: last },
+      deps,
+    );
+    expect(outcome).toBe("skipped");
+    expect(deps.publishUpdate).not.toHaveBeenCalled();
+    expect(deps.clearWatcherState).toHaveBeenCalledWith(823875);
+  });
+
   it("does not throw when publishUpdate itself throws", async () => {
     const deps = makeDeps({
       publishUpdate: vi.fn().mockRejectedValue(new Error("redis down")),

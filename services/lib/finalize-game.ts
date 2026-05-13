@@ -74,6 +74,31 @@ export async function performGracefulExit(
     return "skipped";
   }
 
+  // Don't synthetic-Final a game that's still in Pre. The pre-game compute
+  // path means a watcher dying via max-runtime / abort / error / max-loops
+  // during the long pre-game window would otherwise flip the Upcoming card
+  // to Finished hours before first pitch. Leaving the Pre stub in place is
+  // the correct UI signal: the game is still scheduled, and the next
+  // supervisor cron will spawn a fresh watcher. We still clear the
+  // watcher-state Redis key below so the next watcher rebuilds caches from
+  // scratch instead of trying to resume from a stale bundle.
+  if (lastPublishedState.status === "Pre") {
+    log.warn("watcher", "graceful-exit:skipped", {
+      gamePk,
+      reason,
+      detail: "lastPublishedState status=Pre — leaving stub in place",
+    });
+    try {
+      await deps.clearWatcherState(gamePk);
+    } catch (err) {
+      log.warn("watcher", "graceful-exit:clearWatcherState-fail", {
+        gamePk,
+        err: String(err),
+      });
+    }
+    return "skipped";
+  }
+
   const synthetic = buildSyntheticFinalState(lastPublishedState);
 
   log.warn("watcher", "graceful-exit:publish-synthetic", {

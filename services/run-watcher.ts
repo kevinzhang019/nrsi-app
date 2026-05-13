@@ -139,18 +139,25 @@ export type WatcherResult = {
 
 const SEASON = new Date().getUTCFullYear();
 // Loop ceiling sized to comfortably outlast a normal MLB game at the active
-// 5s PA-polling cadence: 5000 × 5s ≈ 7h, which covers 9 innings + extras +
-// a couple of rain delays without tripping. The actual ceiling is the 6h
-// wall-clock `MAX_RUNTIME_MS` below; MAX_LOOPS is just a defense against a
-// runaway tight-loop bug. Historically this was 1500 (≈2h) and watchers
-// hit it during the late innings, exiting silently and leaving the
-// dashboard's snapshot stuck on a "Live" 9th — see `services/lib/finalize-
-// game.ts` for the graceful-exit cleanup that the budget exits now run.
+// 5s PA-polling cadence: 5000 × 5s ≈ 7h. Pre-game ticks at 1800s/tick add
+// at most ~24 iterations across an entire 12h pre-game window, so this cap
+// is dominated by the live phase. Historically MAX_LOOPS was 1500 (≈2h)
+// and watchers hit it during the late innings, exiting silently and leaving
+// the dashboard's snapshot stuck on a "Live" 9th — see `services/lib/
+// finalize-game.ts` for the graceful-exit cleanup that the budget exits
+// now run.
 const MAX_LOOPS = 5000;
-// Hard wall-clock cap as the real ceiling. 6h covers extras + delays in any
-// reasonable scenario; anything past that is a scheduling bug that left a
-// watcher running past its game and we want it gone.
-const MAX_RUNTIME_MS = 6 * 60 * 60 * 1000;
+// Hard wall-clock cap. Sized to comfortably outlast the supervisor's own
+// lifetime (waking at 12:00 UTC, idle-exit deadline at 06:00 UTC next day
+// = 18h). With `PRE_GAME_LEAD_MS = 24h` in the supervisor, watchers spawn
+// at supervisor wake and need to stay alive through pre-game + game-end.
+// Anything past 20h is the supervisor parent process exiting, not this
+// cap; this cap exists only as a defense against a runaway watcher that
+// outlives its parent. The previous 6h cap was sized for the legacy 90s
+// pre-game lead and fires immediately under the new lead, flipping every
+// scheduled game to a synthetic Final via gracefulExit before games even
+// start — the regression that motivates this bump.
+const MAX_RUNTIME_MS = 20 * 60 * 60 * 1000;
 
 // Run a single game's watcher loop to completion (Final or abort). Designed
 // to live inside a long-running Node process (Railway, Fly.io, or local dev
@@ -550,6 +557,8 @@ export async function runWatcher(
                   framingTable: defense.framingTable,
                   catcherId: null,
                   fielderIds: [],
+                  inning: upcoming.inning,
+                  half: "Bottom",
                 }),
               { signal, label: "computeNrXi:oppHalf" },
             );
@@ -589,6 +598,8 @@ export async function runWatcher(
                 framingTable: defenseCache!.framingTable,
                 catcherId: alignment.catcherId,
                 fielderIds: alignment.fielderIds,
+                inning: upcoming.inning,
+                half: upcoming.half,
               }),
             { signal, label: "computeNrXi:play" },
           );
