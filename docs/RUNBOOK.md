@@ -66,6 +66,35 @@ Common log signatures to watch for:
 
 ---
 
+## Expected pre-game state
+
+Every today-game's watcher spawns immediately at supervisor wake (`PRE_GAME_LEAD_MS = 24h` resolves to `Date.now()` for all today rows). Pre-game ticks fire at 30-min cadence; once both lineups post and probable pitchers are known, the watcher runs the same Phase 1 + Phase 2 pipeline as live and surfaces a first-inning prediction on the dashboard. Persistence to Supabase is still gated on `status === "Live"`, so `inning_predictions` rows only land at first pitch.
+
+What a healthy pre-game snapshot looks like a few hours before first pitch:
+
+```bash
+set -a; source .env.local; set +a
+GAMEPK=<pk>
+curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" \
+  "$KV_REST_API_URL/hget/nrxi:snapshot/$GAMEPK" \
+  | jq -r '.result' \
+  | jq '{status, detailedState, updatedAt, pNoHitEvent, pitcher: .pitcher.id, lineups: (.lineups != null)}'
+```
+
+- **Before lineups post:** `{status: "Pre", pNoHitEvent: null, pitcher: null, lineups: false}`. Identical to the seeded `seedSnapshotStep` stub. The watcher publishes this every 30 min (refreshing `updatedAt`) until lineups arrive.
+- **After lineups post (~30 min before first pitch typically):** `{status: "Pre", pNoHitEvent: 0.6x, pitcher: <id>, lineups: true}`. The dashboard's Upcoming card shows a real `P(nr1i) / <odds>` pill, both lineup columns are populated, and the pitcher row carries the probable starter. Any lineup/pitcher change within 30 min triggers a Phase 1 reload on the next tick and a fresh prediction.
+- **At first pitch:** `status` flips to `"Live"`, `atBatIndex` becomes a real value, Phase 2 recomputes once more, and the `(gamePk, 1, "Top")` row appears in `inning_predictions` — that row is the live recompute, not any earlier preview.
+
+If a pre-game card on the dashboard is still showing the empty `nrXi / —` pill within 30 min of first pitch, check that lineups have actually posted on MLB's side (`curl -s "https://statsapi.mlb.com/api/v1.1/game/$GAMEPK/feed/live" | jq '.liveData.boxscore.teams.away.battingOrder | length'`). A length of 0 means MLB hasn't published the lineup yet — wait. A length of 9 with no prediction on our side means the watcher is stuck or crashed; see "Recovering from a stuck-Pre snapshot" below.
+
+Log signatures while pre-game compute is healthy:
+- `watcher:tick {gamePk, status: "Pre", shouldReloadStructure: true, shouldRecomputePlay: true}` on the first tick after lineups post.
+- `step:loadLineupSplits:ok` / `step:loadParkFactor:ok` / `step:loadWeather:ok` / `step:loadDefense:ok` blocks running during pre-game ticks — same shape as live ticks.
+- `watcher:tick {status: "Pre", shouldReloadStructure: false, shouldRecomputePlay: false}` on subsequent ticks where nothing changed. The 30-min sleep follows.
+- Absence of `watcher:upsertInningPrediction:fail` during Pre — the capture block is short-circuited entirely while `status !== "Live"`, so no Supabase calls run yet.
+
+---
+
 ## Recovering from a stuck-Live snapshot
 
 If a game shows on the dashboard as "Live" with stale data (no recent `updatedAt`, frozen inning), the watcher exited without publishing Final. Three layers of recovery, in order of effort:
@@ -98,7 +127,7 @@ Inverse of the stuck-Live class: MLB has the game in progress but the dashboard'
      "$KV_REST_API_URL/get/nrxi:lock:$GAMEPK"
    ```
 
-   If `status === "Pre"`, `pitcher === null`, `updatedAt` matches the supervisor's seed time (~12:01 UTC), and the lock is missing, this is a stuck-Pre. Cross-check MLB's view: `curl -s "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gamePk=$GAMEPK" | jq '.dates[].games[].status'`.
+   If `status === "Pre"`, the lock is missing, and `updatedAt` is stale (older than ~30 min — pre-game ticks refresh it every 30 min), this is a stuck-Pre. Note: `pitcher === null` is NOT the diagnostic anymore — a healthy pre-game snapshot has `pitcher` and `pNoHitEvent` populated once lineups post (see "Expected pre-game state" above). Stale-`updatedAt`-with-missing-lock is the real signal: it means the watcher process is dead but the seed/preview row is still in `nrxi:snapshot`. Cross-check MLB's view: `curl -s "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gamePk=$GAMEPK" | jq '.dates[].games[].status'`.
 
 2. **Run a one-off watcher locally.** Hits prod Upstash + Supabase via `.env.local`:
 

@@ -16,7 +16,7 @@ Picks which probability `<ProbabilityPill>` shows.
 - `half` → `pNoHitEvent` / `breakEvenAmerican` — P(no run scored in the current half-inning).
 - `full` → `pNoHitEventFullInning` / `breakEvenAmericanFullInning` — P(no run scored across BOTH halves of the current inning).
 
-The pill's label substitutes the predicted inning into the brand: `P(nr{N}i)` where `N = game.inning`. `<GameCard>` threads `game.inning` into `<ProbabilityPill>`. Pre-game cards (`game.inning === null`) fall back to literal `nrXi`. On the historical detail page, `buildFrozenState` / `buildFullInningFrozenState` already write the selected inning into `game.inning`, so the same path renders `P(nr5i)`, `P(nr7i)`, etc., as the user clicks through the line-score cells.
+The pill's label substitutes the predicted inning into the brand: `P(nr{N}i)` where `N = game.inning`. `<GameCard>` threads `game.inning` into `<ProbabilityPill>`. Pre-game cards (`game.inning === null`) fall back to literal `nrXi`. Note that scheduled-game cards now also show a real prediction (`P(nr1i) / <odds>`) once both lineups post and probable pitchers are known — see "Pre-game compute" below for the data flow. On the historical detail page, `buildFrozenState` / `buildFullInningFrozenState` already write the selected inning into `game.inning`, so the same path renders `P(nr5i)`, `P(nr7i)`, etc., as the user clicks through the line-score cells.
 
 **Empty-state label is always `nrXi`, never `nr{N}i`.** When `pNoHitEvent` or `breakEvenAmerican` is `null` (the pill renders the `—` placeholder), the label is hardcoded to the project name `nrXi` regardless of `game.inning`. This matters for the dashboard Finished section and `/history` listing: both pass `pNoHitEvent={null}` (no inning-specific prediction is being shown), so without this branch a Final game with `inning = 9` would surface "nr9i" on a card that has nothing to do with the 9th inning specifically. The non-null branch (live cards + the wide `/history/[pk]` detail page) still substitutes the actual inning, since there `nr{N}i` accurately labels the captured prediction.
 
@@ -56,10 +56,32 @@ The dashboard groups today's games into four sections in fixed order: **Highligh
 
 Two things make this work end-to-end:
 
-1. **`services/steps/seed-snapshot.ts`** runs at the top of the supervisor (Railway cron `0 12 * * *`) and writes a `Pre` stub `GameState` into `nrxi:snapshot` for every scheduled game via `hsetnx`. This is what populates the Upcoming section before any per-game watcher starts (~90s pre-game). When a watcher's first `publishGameState` lands, the `hset` overwrites the stub atomically — same `gamePk` → same `layoutId` → card stays mounted, fields fill in.
+1. **`services/steps/seed-snapshot.ts`** runs at the top of the supervisor (Railway cron `0 12 * * *`) and writes a `Pre` stub `GameState` into `nrxi:snapshot` for every scheduled game via `hsetnx`. This is what populates the Upcoming section before any per-game watcher starts. The watcher itself spawns immediately at supervisor wake (`PRE_GAME_LEAD_MS = 24h` → `Math.max(now, gameDate - LEAD) = now` for all today-games) and starts publishing real state on its first tick — empty preview until lineups + pitchers post, then a populated state with a real prediction once `isPregameReady` flips true. When the first `publishGameState` lands, the `hset` overwrites the stub atomically — same `gamePk` → same `layoutId` → card stays mounted, fields fill in.
 2. **`useGameStream` keeps a stable `Map<gamePk, GameState>`.** SSE updates merge into the map; `<GameBoard>` re-derives sections via `useMemo`; cards already in flight finish their layout animation while still receiving fresh props. Don't add a section-name suffix to the `key` or `layoutId` — that would force remounts on section changes.
 
 If you ever need to suppress the fade for a specific case (e.g. initial paint), use `<AnimatePresence initial={false}>` (already set in `game-board.tsx`).
+
+---
+
+## Pre-game compute
+
+A scheduled card in the Upcoming section is not just a stub anymore — it computes and surfaces a real first-inning prediction as soon as the inputs are available. The data flow:
+
+1. `services/supervisor.ts` spawns a watcher for every today-game immediately at supervisor wake (`PRE_GAME_LEAD_MS = 24h`). Each watcher polls MLB at 30-min cadence while `status === "Pre"`.
+2. Each tick refetches the live feed and recomputes `structuralKey` (lineup hash, defense alignment, both pitcher ids, upcoming half/inning, score-dependent bottom-9 skip flag). The compute predicate is `canCompute = isLive || isPregameReady`, where `isPregameReady = status === "Pre" && upcoming !== null && upcoming.pitcherId !== null` — true once both teams have a 9-deep `battingOrder` and probable pitchers are known.
+3. When `isPregameReady` is true AND `structuralKey` changed, the watcher runs the same Phase 1 + Phase 2 pipeline used for live ticks: `loadLineupSplits` + `loadParkFactor` + `loadWeather` + `loadDefense` → `computeNrXi` → `lastNrXi` updated → `state` built with non-null `pNoHitEvent` / `breakEvenAmerican` / `lineups` / `lineupStats` / `awayPitcher` / `homePitcher` / `env` → `publishUpdateStep` pushes to `nrxi:snapshot`.
+4. The dashboard's `useGameStream` SSE merges the new state into its `Map<gamePk, GameState>`, the Upcoming-section card re-renders, and the `<ProbabilityPill>` switches from the empty `nrXi / —` placeholder to `P(nr1i) / <odds>`. The `<LineupColumn>` rows populate, the pitcher row shows the probable starter, the park / weather chips fill in.
+5. Any change to lineups (a starter scratched 45 min before first pitch) or to the probable starter (announced mid-afternoon) flips `structuralKey` on the next 30-min tick → Phase 1 reload → fresh prediction. Within ≤ 30 min, the dashboard reflects the change.
+
+**Persistence to Supabase still waits for first pitch.** The `buildInningCapture` + `upsertInningPrediction` block in `services/run-watcher.ts` is wrapped in `if (status === "Live")` so pre-game previews never write to `inning_predictions`. When status flips Pre → Live, `playStateKey` changes (atBatIndex goes from `-1` to `0`), Phase 2 recomputes once more with current inputs, and the capture fires with that recompute as the persisted value — the row in `inning_predictions` reflects the prediction at the moment the inning actually began, not anything computed hours earlier. This guarantees that pre-game preview updates can't pollute the historical archive.
+
+**Why 30 minutes?** Lineups and probable pitchers don't change every 30 seconds; a tighter cadence would burn polls for no signal. A late lineup change inside the 30-min window still gets surfaced — at worst, the dashboard shows the previous prediction for up to 30 minutes, then the very first live tick after status flip catches the new inputs anyway. Trade-off explicit in `services/run-watcher.ts`'s sleep switch.
+
+### Don't change without thinking
+
+- `if (status === "Live")` wrapping the `buildInningCapture` + `upsertInningPrediction` block in `services/run-watcher.ts` — relaxing this to `canCompute` would persist pre-game preview predictions to Supabase, defeating REQ-5 ("the prediction at the moment the inning begins is the one persisted"). Tightening it to `status === "Live" && some additional condition` could miss the first live tick's capture and leave inning 1 missing from `/history`.
+- The `isPregameReady = status === "Pre" && upcoming !== null && upcoming.pitcherId !== null` predicate — `upcoming` requires both 9-deep batting orders + probable pitchers, so this is the minimum complete-input gate. Loosening it (e.g., allowing `upcoming.pitcherId === null`) would surface a partial prediction with `pitcher === null` in the card, which `<PitcherRow>` would render as a broken placeholder.
+- The 30-min pre-game cadence (hard-coded `1800` in `services/run-watcher.ts`'s sleep switch) — see "Why 30 minutes?" above. Tightening to 30s (the legacy pre-game value) makes every today-game's watcher poll ~1440 times instead of ~24 times across its pre-game window, for no real signal gain.
 
 ---
 
