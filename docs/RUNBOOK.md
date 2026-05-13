@@ -68,7 +68,9 @@ Common log signatures to watch for:
 
 ## Expected pre-game state
 
-Every today-game's watcher spawns immediately at supervisor wake (`PRE_GAME_LEAD_MS = 24h` resolves to `Date.now()` for all today rows). Pre-game ticks fire at 30-min cadence; once both lineups post and probable pitchers are known, the watcher runs the same Phase 1 + Phase 2 pipeline as live and surfaces a first-inning prediction on the dashboard. Persistence to Supabase is still gated on `status === "Live"`, so `inning_predictions` rows only land at first pitch.
+Watchers spawn at `gameDate − 6h` (`PRE_GAME_LEAD_MS = 6h`). Day games (start ≤ 18:00 UTC) hit `Math.max(now, gameDate - 6h)` resolving to supervisor wake and start watching immediately; night games sit in `setTimeout` (zero resource cost — no Redis, no MLB calls, no lock) until their slot arrives. Pre-game ticks fire at 30-min cadence; once both lineups post and probable pitchers are known, the watcher runs the same Phase 1 + Phase 2 pipeline as live and surfaces a first-inning prediction on the dashboard. Persistence to Supabase is still gated on `status === "Live"`, so `inning_predictions` rows only land at first pitch.
+
+The 6h window is the resource-efficiency knob: lineups typically post 30min-3h before first pitch, and probable pitchers are usually locked by T-6h. A wider lead would just burn Redis lock-refresh ops (10s cadence × extra hours) and MLB feed polls during the long stretch where MLB hasn't published anything yet.
 
 What a healthy pre-game snapshot looks like a few hours before first pitch:
 

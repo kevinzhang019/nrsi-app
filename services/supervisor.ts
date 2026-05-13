@@ -17,18 +17,25 @@ import {
 import { todayInTz } from "../lib/utils";
 import { log } from "../lib/log";
 
-// Pre-game lead time. Watchers spawn at gameDate - PRE_GAME_LEAD_MS so today's
-// games start being watched immediately at supervisor wake. The 24h lead means
-// `Math.max(now, gameDate - LEAD)` always resolves to `now` for any game on
-// today's schedule, so every scheduled game gets pre-game ticks throughout the
-// day. Pre-game cadence in run-watcher.ts is 30 min, so this is ~24 ticks per
-// game even for the latest west-coast night game — cheap. Watchers compute
-// first-inning predictions as soon as probable pitchers + posted lineups are
-// available, refreshing on any lineup/pitcher/defense/env change. Persistence
-// to Supabase still only fires once status flips to Live (see run-watcher's
-// `if (status === "Live")` guard around the buildInningCapture call), so
-// pre-game previews never land in inning_predictions.
-const PRE_GAME_LEAD_MS = 24 * 60 * 60 * 1000;
+// Pre-game lead time. Watchers spawn at gameDate - PRE_GAME_LEAD_MS so they
+// cover the window during which MLB actually publishes lineups + probable
+// pitchers. 6h is the conservative tail of that distribution — lineups
+// typically post 30min-3h before first pitch, and probable pitchers are
+// usually locked in by T-6h. Going longer (e.g., 24h) burns resources for
+// games far in the future where nothing useful is happening yet: every
+// running watcher holds a Redis lock that refreshes every 10s (8,640 ops/h
+// × 15 games × extra hours = real cost on Upstash), plus 30-min ticks fetch
+// MLB feeds + Redis state for no signal. Going shorter (e.g., 2h) risks
+// missing early lineup posts on weekend afternoon games. Watchers compute
+// first-inning predictions as soon as probable pitchers + posted lineups
+// are available, refresh on any change, and persistence to Supabase still
+// only fires once status flips to Live (see run-watcher's
+// `if (status === "Live")` guard around the buildInningCapture call).
+//
+// Concrete cost reduction vs. 24h lead: a 02:00-UTC late-night game now
+// has its watcher idle in setTimeout from supervisor wake (12:00 UTC)
+// until 20:00 UTC instead of polling for 14 hours of useless ticks.
+const PRE_GAME_LEAD_MS = 6 * 60 * 60 * 1000;
 
 // Idle-exit poll cadence. Cheap — every minute we check whether we can shut
 // the supervisor down.

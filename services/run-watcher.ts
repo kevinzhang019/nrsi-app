@@ -147,16 +147,15 @@ const SEASON = new Date().getUTCFullYear();
 // finalize-game.ts` for the graceful-exit cleanup that the budget exits
 // now run.
 const MAX_LOOPS = 5000;
-// Hard wall-clock cap. Sized to comfortably outlast the supervisor's own
-// lifetime (waking at 12:00 UTC, idle-exit deadline at 06:00 UTC next day
-// = 18h). With `PRE_GAME_LEAD_MS = 24h` in the supervisor, watchers spawn
-// at supervisor wake and need to stay alive through pre-game + game-end.
-// Anything past 20h is the supervisor parent process exiting, not this
-// cap; this cap exists only as a defense against a runaway watcher that
-// outlives its parent. The previous 6h cap was sized for the legacy 90s
-// pre-game lead and fires immediately under the new lead, flipping every
-// scheduled game to a synthetic Final via gracefulExit before games even
-// start — the regression that motivates this bump.
+// Hard wall-clock cap. With `PRE_GAME_LEAD_MS = 6h` in the supervisor, a
+// realistic max watcher lifetime is ~11h (6h pre-game + 5h game with
+// extras/delays). The supervisor's own idle-exit deadline (06:00 UTC next
+// day = ~18h after wake) caps any decoupled scenario. 20h leaves
+// comfortable margin without being absurd; the cap exists only as a
+// defense against a runaway watcher that outlives its parent. The
+// historical 6h cap fired immediately under the previous 24h pre-game
+// lead, flipping every scheduled game to synthetic Final via gracefulExit
+// before games even started — the regression that motivated this bump.
 const MAX_RUNTIME_MS = 20 * 60 * 60 * 1000;
 
 // Run a single game's watcher loop to completion (Final or abort). Designed
