@@ -348,9 +348,19 @@ export async function runWatcher(
 
         const isLive =
           status === "Live" && upcoming !== null && upcoming.pitcherId !== null;
-        const shouldReloadStructure = isLive && structuralKey !== lastStructuralKey;
+        // Pre-game compute path: lineups are posted (upcoming non-null) and
+        // probable pitchers are known, so the same Phase 1 / Phase 2 pipeline
+        // that the live watcher runs can produce a half-inning prediction now.
+        // Persistence is still gated on `status === "Live"` further down — the
+        // pre-game preview updates `lastNrXi` (so the dashboard sees it) but
+        // never writes to Supabase. The first live tick re-runs Phase 1 with
+        // current inputs and the capture fires from there.
+        const isPregameReady =
+          status === "Pre" && upcoming !== null && upcoming.pitcherId !== null;
+        const canCompute = isLive || isPregameReady;
+        const shouldReloadStructure = canCompute && structuralKey !== lastStructuralKey;
         const shouldRecomputePlay =
-          isLive && (shouldReloadStructure || playStateKey !== lastPlayStateKey);
+          canCompute && (shouldReloadStructure || playStateKey !== lastPlayStateKey);
 
         log.info("watcher", "tick", {
           gamePk: input.gamePk,
@@ -686,37 +696,45 @@ export async function runWatcher(
           officialDate: tick.feed.gameData.datetime?.officialDate,
         };
 
-        const captureCandidate = buildInningCapture({
-          inning,
-          half,
-          nrXi: lastNrXi,
-          pitcher: state.pitcher,
-          awayPitcher: state.awayPitcher,
-          homePitcher: state.homePitcher,
-          env: state.env,
-          lineupStats: state.lineupStats,
-          defenseKey: dk,
-        });
-        if (captureCandidate && !capturedInnings[captureCandidate.key]) {
-          capturedInnings[captureCandidate.key] = captureCandidate.capture;
-          // Fire-and-forget per-boundary write to Supabase. Failures are
-          // logged but never block the watcher tick — the supervisor sweep
-          // backstops any rows that don't make it. The in-memory map stays
-          // as a thin retry/dedup buffer; predictions are durable from the
-          // moment they're computed, no longer hostage to the watcher
-          // reaching Final.
-          const captureKey = captureCandidate.key;
-          const captureToWrite = captureCandidate.capture;
-          void upsertInningPrediction({
-            context: gameStubContextFromState(state),
-            capture: captureToWrite,
-          }).catch((err) =>
-            log.warn("watcher", "upsertInningPrediction:fail", {
-              gamePk: input.gamePk,
-              key: captureKey,
-              err: String(err),
-            }),
-          );
+        // Persist only once status flips to Live. Pre-game ticks still run
+        // Phase 1 / Phase 2 to surface a preview prediction on the dashboard,
+        // but Supabase rows must hold the prediction at the moment the inning
+        // actually begins — not whatever we computed hours earlier. The first
+        // live tick recomputes (atBatIndex flips, structuralKey changes) and
+        // the capture fires from that recompute.
+        if (status === "Live") {
+          const captureCandidate = buildInningCapture({
+            inning,
+            half,
+            nrXi: lastNrXi,
+            pitcher: state.pitcher,
+            awayPitcher: state.awayPitcher,
+            homePitcher: state.homePitcher,
+            env: state.env,
+            lineupStats: state.lineupStats,
+            defenseKey: dk,
+          });
+          if (captureCandidate && !capturedInnings[captureCandidate.key]) {
+            capturedInnings[captureCandidate.key] = captureCandidate.capture;
+            // Fire-and-forget per-boundary write to Supabase. Failures are
+            // logged but never block the watcher tick — the supervisor sweep
+            // backstops any rows that don't make it. The in-memory map stays
+            // as a thin retry/dedup buffer; predictions are durable from the
+            // moment they're computed, no longer hostage to the watcher
+            // reaching Final.
+            const captureKey = captureCandidate.key;
+            const captureToWrite = captureCandidate.capture;
+            void upsertInningPrediction({
+              context: gameStubContextFromState(state),
+              capture: captureToWrite,
+            }).catch((err) =>
+              log.warn("watcher", "upsertInningPrediction:fail", {
+                gamePk: input.gamePk,
+                key: captureKey,
+                err: String(err),
+              }),
+            );
+          }
         }
 
         await withRetry(() => publishUpdateStep(state), { signal, label: "publishUpdate" });
@@ -781,7 +799,7 @@ export async function runWatcher(
 
         let waitSec = 30;
         if (status === "Live") waitSec = tick.recommendedWaitSeconds;
-        else if (status === "Pre") waitSec = 30;
+        else if (status === "Pre") waitSec = 1800;
         else if (status === "Delayed" || status === "Suspended") waitSec = 300;
 
         // sleepMs throws AbortError on abort — caught by the outer try/catch

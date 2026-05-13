@@ -17,11 +17,18 @@ import {
 import { todayInTz } from "../lib/utils";
 import { log } from "../lib/log";
 
-// Pre-game lead time. Watchers spawn at gameDate - PRE_GAME_LEAD_MS so they
-// have a few ticks to acquire the lock and seed before first pitch. 90s is
-// tighter than the WDK scheduler's 5min lead, saving ~135 unnecessary polls
-// per slate (15 games × ~9 saved 30s polls each).
-const PRE_GAME_LEAD_MS = 90 * 1000;
+// Pre-game lead time. Watchers spawn at gameDate - PRE_GAME_LEAD_MS so today's
+// games start being watched immediately at supervisor wake. The 24h lead means
+// `Math.max(now, gameDate - LEAD)` always resolves to `now` for any game on
+// today's schedule, so every scheduled game gets pre-game ticks throughout the
+// day. Pre-game cadence in run-watcher.ts is 30 min, so this is ~24 ticks per
+// game even for the latest west-coast night game — cheap. Watchers compute
+// first-inning predictions as soon as probable pitchers + posted lineups are
+// available, refreshing on any lineup/pitcher/defense/env change. Persistence
+// to Supabase still only fires once status flips to Live (see run-watcher's
+// `if (status === "Live")` guard around the buildInningCapture call), so
+// pre-game previews never land in inning_predictions.
+const PRE_GAME_LEAD_MS = 24 * 60 * 60 * 1000;
 
 // Idle-exit poll cadence. Cheap — every minute we check whether we can shut
 // the supervisor down.
