@@ -1,0 +1,17 @@
+# Railway service config for the nrXi "web" service.
+#
+# Always-on Node HTTP server hosting the SSE stream (/stream), JSON snapshot
+# (/snapshot), and history reads (/history/*). Separate Railway service from
+# the supervisor (railway.toml) — both point at the same repo.
+#
+# Point the Railway dashboard at this file via:
+#   Web service → Settings → Source → Config-as-Code File Path: railway.web.toml
+#
+# Without this override, Railway would read the root railway.toml — which
+# starts the supervisor on a 12:00 UTC cron with restartPolicy=NEVER — and
+# the always-on HTTP server would never come up, producing 502s on every
+# request to nrxi-web-production.up.railway.app.
+
+[deploy]
+startCommand = "npx tsx bin/web.ts"
+restartPolicyType = "ALWAYS"
