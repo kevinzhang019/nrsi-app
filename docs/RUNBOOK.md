@@ -98,6 +98,32 @@ Log signatures while pre-game compute is healthy:
 
 ---
 
+## Recovering from a deploy-during-cron kill
+
+Pushing to git triggers a Railway build, and when the new image becomes ready, Railway **SIGTERMs the currently-running cron container** to swap in the new deployment. The supervisor's `handleSignal` calls `ac.abort()`, the idle loop exits cleanly with `reason: "aborted"`, and every watcher task that was still in `sleepMs(delayMs, signal)` (waiting for its pre-game window) bails before `runWatcher` is ever called. **The new image does not run** — cron services only execute at the scheduled time. Net effect: today's seeded snapshots stay frozen at `status: "Pre"` with the seed `updatedAt`, no watchers run, and the dashboard's Active section stays empty for the rest of the day.
+
+**How to tell this happened:**
+
+```bash
+set -a; source .env.local; set +a
+# All today's snapshots Pre with the same seed updatedAt, no locks, no watcher-state
+npx tsx bin/inspect-snapshot.ts
+curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/keys/nrxi:lock:*"
+curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/keys/nrxi:watcher-state:*"
+```
+
+If all three of (a) snapshots all Pre with the seed timestamp, (b) zero locks, (c) zero watcher-state keys, AND you pushed code earlier today, this is the deploy-during-cron pattern.
+
+**Recovery (in order of effort):**
+
+1. **Re-trigger the supervisor on Railway.** Dashboard → Deployments → ⋮ → Run Now. Runs the latest image immediately and is idempotent — `pruneStaleSnapshots` discriminates on each row's own `officialDate` so seeded "Pre" rows for today survive, and `acquireWatcherLock` ensures no double-watchers if anything is still racing.
+2. **Or run locally.** `npx tsx bin/supervisor.ts` from your machine — picks up any games still pending and runs until you Ctrl-C or the natural 06:00 UTC cutoff.
+3. **Or wait for the next 12:00 UTC cron firing.** Cheapest but loses the rest of today's games.
+
+**Avoidance.** Batch your pushes — don't push between 12:00 UTC (supervisor wake) and the last game's natural exit (~05:00 UTC the next day). The MLB-quiet window is roughly **05:00 UTC – 12:00 UTC** (after the late West Coast game and before the next cron). Pushing inside that gap costs nothing because no supervisor is running. Outside it, every push kills the active supervisor and abandons watcher setTimeouts. A future fix is to persist the scheduled-game list to Redis on supervisor start and re-hydrate setTimeouts on the next cron firing if the previous run was interrupted — see `services/supervisor.ts` for the spawn loop.
+
+---
+
 ## Recovering from a stuck-Live snapshot
 
 If a game shows on the dashboard as "Live" with stale data (no recent `updatedAt`, frozen inning), the watcher exited without publishing Final. Three layers of recovery, in order of effort:
