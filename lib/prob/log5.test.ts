@@ -95,6 +95,7 @@ function makeBatter(bats: "L" | "R" | "S", hr: number): BatterPaProfile {
     bats,
     paVs: { L: { ...base }, R: { ...base } },
     paCounts: { L: 300, R: 300 },
+    gidpRate: 0.10,
   };
 }
 

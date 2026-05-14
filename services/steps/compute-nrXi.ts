@@ -48,6 +48,10 @@ export async function computeNrXiStep(opts: {
   framingTable?: FramingTable;
   catcherId?: number | null;
   fielderIds?: number[]; // 7 non-battery fielders
+  // v2.2 — inning/half feed the stratified calibrator (lib/prob/calibration.ts).
+  // When absent the calibrator falls back to a global table, then identity.
+  inning?: number;
+  half?: "Top" | "Bottom" | string | null;
 }): Promise<NrXiResult> {
   const {
     gamePk,
@@ -61,6 +65,8 @@ export async function computeNrXiStep(opts: {
     framingTable,
     catcherId,
     fielderIds,
+    inning,
+    half,
   } = opts;
 
   log.info("step", "computeNrXi:start", {
@@ -83,6 +89,7 @@ export async function computeNrXiStep(opts: {
 
   const perBatter: NrXiPerBatter[] = [];
   const lineup: PaOutcomes[] = [];
+  const gidpRates: number[] = [];
 
   for (let i = 0; i < batters.length; i++) {
     const b = batters[i];
@@ -93,6 +100,7 @@ export async function computeNrXiStep(opts: {
     const framed = applyFraming(ttoAdjusted, framingF);
     const defended = applyDefense(framed, defenseF);
     lineup.push(defended);
+    gidpRates.push(b.gidpRate);
     perBatter.push({
       id: b.id,
       name: b.fullName,
@@ -103,8 +111,8 @@ export async function computeNrXiStep(opts: {
     });
   }
 
-  const rawPHit = pAtLeastOneRun(startState, lineup);
-  const pHit = calibrate(rawPHit);
+  const rawPHit = pAtLeastOneRun(startState, lineup, { gidpRates });
+  const pHit = calibrate(rawPHit, { inning, half });
   const pNo = 1 - pHit;
 
   const result: NrXiResult = {

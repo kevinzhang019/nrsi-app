@@ -62,6 +62,10 @@ export const PersonResponse = z.object({
       fullName: z.string(),
       batSide: z.object({ code: HandCode }).optional(),
       pitchHand: z.object({ code: PitchHandRaw }).optional(),
+      // MLB returns `currentAge` (number) directly. `birthDate` is also present
+      // (YYYY-MM-DD); fall back to it if needed.
+      currentAge: z.number().optional(),
+      birthDate: z.string().optional(),
     }),
   ),
 });

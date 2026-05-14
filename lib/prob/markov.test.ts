@@ -78,6 +78,26 @@ describe("transitionsForOutcome — IPout", () => {
   });
 });
 
+describe("transitionsForOutcome — IPout per-batter GIDP override", () => {
+  const stateB1: GameState = { outs: 0, bases: 1 as Bases };
+
+  it("higher gidpRate increases GIDP branch weight", () => {
+    const defaultTrs = transitionsForOutcome("ipOut", stateB1);
+    const highTrs = transitionsForOutcome("ipOut", stateB1, { gidpRate: 0.18 });
+    const defaultGidp = defaultTrs.find((t) => t.next.outs === 2)?.weight ?? 0;
+    const highGidp = highTrs.find((t) => t.next.outs === 2)?.weight ?? 0;
+    expect(defaultGidp).toBeCloseTo(0.10, 6);
+    expect(highGidp).toBeCloseTo(0.18, 6);
+  });
+
+  it("rate is clamped into [0.03, 0.20]", () => {
+    const tooLow = transitionsForOutcome("ipOut", stateB1, { gidpRate: 0.001 });
+    const tooHigh = transitionsForOutcome("ipOut", stateB1, { gidpRate: 0.95 });
+    expect(tooLow.find((t) => t.next.outs === 2)?.weight).toBeCloseTo(0.03, 6);
+    expect(tooHigh.find((t) => t.next.outs === 2)?.weight).toBeCloseTo(0.20, 6);
+  });
+});
+
 describe("pAtLeastOneRun — sanity bounds", () => {
   it("returns 0 when nobody can do anything (all ipOut)", () => {
     const lineup = Array(9).fill(only("ipOut"));

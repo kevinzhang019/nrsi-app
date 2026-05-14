@@ -5,8 +5,13 @@ export const k = {
     `pit:split:${id}:${season}:${sit}`,
   hand: (id: number) => `hand:${id}`,
   parkFactors: (season: number) => `park:factors:${season}`,
+  parkFactorsHand: (season: number, batSide: "L" | "R") =>
+    `park:factors:${season}:${batSide}`,
   oaa: (season: number) => `oaa:${season}`,
   framing: (season: number) => `framing:${season}`,
+  expectedStats: (season: number) => `xstats:${season}`,
+  workload: (playerId: number) => `workload:${playerId}`,
+  stuff: (season: number) => `stuff:${season}`,
   venue: (id: number) => `venue:${id}`,
   // v2: added windCardinal field (commit c9320bc). Bumped to invalidate
   // pre-deploy entries that lack the field — without this, workers running

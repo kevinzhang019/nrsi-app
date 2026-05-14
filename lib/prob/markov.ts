@@ -31,8 +31,20 @@ const P_2_HOME_ON_1B: readonly [number, number, number] = [0.30, 0.45, 0.55];
 /** P(runner on 1st scores on a double) by outs at the start of the PA. */
 const P_1_HOME_ON_2B: readonly [number, number, number] = [0.40, 0.60, 0.70];
 
-/** P(in-play out is a GIDP) when 1st is occupied AND outs < 2. */
-const P_GIDP = 0.10;
+/**
+ * P(in-play out is a GIDP) when 1st is occupied AND outs < 2.
+ *
+ * League-mean default (per The Book / Retrosheet aggregates ≈ 10% of eligible
+ * ipOuts turn double). Per-batter override threaded through `pAtLeastOneRun` —
+ * see `gidpRateFromBatter` in `lib/mlb/splits.ts`. High-GB hitters (e.g.,
+ * Castellanos-era ~16-18%) deviate materially from the mean; high-FB sluggers
+ * are nearer 4%.
+ */
+const P_GIDP_DEFAULT = 0.10;
+
+/** Clamp band for per-batter GIDP rate — defends against feed glitches. */
+const P_GIDP_FLOOR = 0.03;
+const P_GIDP_CEIL = 0.20;
 
 /** P(in-play out is a sacrifice fly that scores 3rd) when 3rd is occupied AND outs < 2. */
 const P_SF = 0.20;
@@ -167,7 +179,7 @@ function transSingle(state: GameState): Transition[] {
   ];
 }
 
-function transIpOut(state: GameState): Transition[] {
+function transIpOut(state: GameState, gidpRate: number): Transition[] {
   const b1 = state.bases & ON_1ST ? 1 : 0;
   const b2 = state.bases & ON_2ND ? 1 : 0;
   const b3 = state.bases & ON_3RD ? 1 : 0;
@@ -189,9 +201,9 @@ function transIpOut(state: GameState): Transition[] {
       // Clear 1st (the lead runner) since they were forced out at 2nd.
       next: { outs: gidpOuts, bases: makeBases(0, b2, b3) },
       runs: 0,
-      weight: P_GIDP,
+      weight: gidpRate,
     });
-    plainWeight -= P_GIDP;
+    plainWeight -= gidpRate;
   }
 
   // Sac fly: requires runner on 3rd AND outs < 2. Runner from 3rd scores.
@@ -216,9 +228,17 @@ function transIpOut(state: GameState): Transition[] {
   return branches;
 }
 
+function clampGidp(rate: number | undefined): number {
+  if (rate === undefined || !Number.isFinite(rate)) return P_GIDP_DEFAULT;
+  if (rate < P_GIDP_FLOOR) return P_GIDP_FLOOR;
+  if (rate > P_GIDP_CEIL) return P_GIDP_CEIL;
+  return rate;
+}
+
 export function transitionsForOutcome(
   outcome: keyof PaOutcomes,
   state: GameState,
+  opts?: { gidpRate?: number },
 ): Transition[] {
   switch (outcome) {
     case "k":
@@ -235,7 +255,7 @@ export function transitionsForOutcome(
     case "single":
       return transSingle(state);
     case "ipOut":
-      return transIpOut(state);
+      return transIpOut(state, clampGidp(opts?.gidpRate));
   }
 }
 
@@ -265,19 +285,27 @@ function stateKey(outs: number, bases: Bases): number {
  * The chain runs forward up to lineup.length PAs. In practice the inning
  * absorbs (3 outs) within ~5–8 PAs. If the lineup runs out before absorption,
  * the remaining "alive" mass is treated as no-runs (conservative).
+ *
+ * `options.gidpRates`: optional parallel array (same length as lineup) of
+ * per-batter GIDP rates — the probability that an in-play out by THAT batter
+ * is a double play when 1st is occupied and outs < 2. Missing entries (and
+ * the entire missing-array case) fall back to the league mean (0.10).
  */
 export function pAtLeastOneRun(
   start: GameState,
   lineup: PaOutcomes[],
+  options?: { gidpRates?: ReadonlyArray<number | undefined> },
 ): number {
   if (start.outs >= 3) return 0;
   let alive = new Map<number, number>([[stateKey(start.outs, start.bases), 1]]);
   let pHasRun = 0;
+  const gidpRates = options?.gidpRates;
 
   for (let i = 0; i < lineup.length; i++) {
     if (alive.size === 0) break;
     const pa = lineup[i];
     const next = new Map<number, number>();
+    const gidpForBatter = gidpRates?.[i];
 
     for (const [key, mass] of alive) {
       if (mass <= 0) continue;
@@ -288,7 +316,7 @@ export function pAtLeastOneRun(
       for (const oc of OUTCOME_KEYS) {
         const p = pa[oc];
         if (p <= 0) continue;
-        const transitions = transitionsForOutcome(oc, state);
+        const transitions = transitionsForOutcome(oc, state, { gidpRate: gidpForBatter });
         for (const tr of transitions) {
           const m = mass * p * tr.weight;
           if (m <= 0) continue;

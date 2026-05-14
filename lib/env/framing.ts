@@ -40,16 +40,30 @@ const SHRINK_N0 = 2000;
  * From FanGraphs / Baseball Prospectus framing-runs research, roughly 0.13
  * runs per stolen strike, distributed across K bumps and BB suppressions.
  *
- * In rate terms a top framer (+20 strikes / ~9000 pitches = +0.0022 strikes/pitch)
- * shifts K-rate by ~+1.5pp and BB-rate by ~-0.7pp. Multiplier coefficients are
- * tuned so that a +0.005 strikes/pitch (≈ extreme top of league) maps to
- * ~+5% K and -5% BB — the boundary of our clamp.
+ * 2026 ABS context: each team gets 2 challenges per game (retained on success);
+ * walk rate has climbed from 8.4% (2025) to 9.6% (2026 YTD), the highest in over
+ * a decade, and the umpire-called zone has shrunk (Statcast vs. ABS comparison
+ * via baseballsavant.mlb.com/abs). Framing variance is collapsing toward the
+ * Hawk-Eye truth — coefficients are halved and the clamp tightened from the
+ * pre-ABS regime [0.95, 1.05] to [0.97, 1.03]. The kill switch
+ * (NRXI_DISABLE_FRAMING=1) remains for full-ABS adoption (likely 2027+).
+ *
+ * NRXI_FRAMING_CLAMP env override: an explicit half-width (e.g. 0.04) replaces
+ * the [1 - x, 1 + x] band. Set to 0 to effectively zero the effect without
+ * branching through the disable path.
  */
-const K_MULT_PER_RATE = 10.0;   // 0.005 × 10 = +0.05
-const BB_MULT_PER_RATE = -8.0;  // 0.005 × -8 = -0.04
+const K_MULT_PER_RATE = 5.0;
+const BB_MULT_PER_RATE = -4.0;
 
-const FACTOR_CLAMP_LO = 0.95;
-const FACTOR_CLAMP_HI = 1.05;
+const DEFAULT_CLAMP_HALF_WIDTH = 0.03;
+
+function clampHalfWidth(): number {
+  const raw = process.env.NRXI_FRAMING_CLAMP;
+  if (raw === undefined) return DEFAULT_CLAMP_HALF_WIDTH;
+  const v = parseFloat(raw);
+  if (!Number.isFinite(v) || v < 0 || v > 0.2) return DEFAULT_CLAMP_HALF_WIDTH;
+  return v;
+}
 
 function num(v: unknown): number | null {
   if (v === undefined || v === null) return null;
@@ -142,8 +156,11 @@ export function framingFactors(
     return { ...NEUTRAL_FRAMING_FACTORS };
   }
   const { strikesPerPitch } = shrinkFraming(table.get(catcherId));
-  const k = clamp(1 + strikesPerPitch * K_MULT_PER_RATE, FACTOR_CLAMP_LO, FACTOR_CLAMP_HI);
-  const bb = clamp(1 + strikesPerPitch * BB_MULT_PER_RATE, FACTOR_CLAMP_LO, FACTOR_CLAMP_HI);
+  const halfWidth = clampHalfWidth();
+  const lo = 1 - halfWidth;
+  const hi = 1 + halfWidth;
+  const k = clamp(1 + strikesPerPitch * K_MULT_PER_RATE, lo, hi);
+  const bb = clamp(1 + strikesPerPitch * BB_MULT_PER_RATE, lo, hi);
   return { k, bb };
 }
 

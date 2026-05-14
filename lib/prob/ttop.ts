@@ -1,33 +1,51 @@
 import type { PaOutcomes } from "../mlb/splits";
 
 /**
- * Times-Through-the-Order Penalty (TTOP).
+ * Times-Through-the-Order Penalty (TTOP) — smooth pitch-/PA-count spec.
  *
- * Tango/Lichtman/Dolphin (The Book, Ch 9) and Carleton (Baseball Prospectus,
- * "Times Through the Order Penalty") show that starting pitchers get
- * progressively worse each time they cycle through the lineup — more contact,
- * harder contact, slightly more walks, slightly fewer strikeouts.
+ * Two-literature problem:
  *
- * Approximate published deltas relative to the 1st time through:
- *   1st TTO (PA 1–9):    baseline
- *   2nd TTO (PA 10–18):  K -1.0pp, BB +0.3pp, HR +0.4pp
- *   3rd TTO (PA 19–27):  K -2.0pp, BB +0.5pp, HR +0.7pp
- *   4th+ TTO (PA 28+):   K -2.5pp, BB +0.8pp, HR +1.0pp
+ *   - Tango/Lichtman/Dolphin (The Book, Ch 9) and Carleton (Baseball Prospectus)
+ *     document a progressive degradation each time a starter cycles through —
+ *     more contact, harder contact, slightly more walks, slightly fewer Ks.
+ *     Approximate published deltas relative to the 1st pass:
+ *       end of 2nd pass:  K -1.0pp, BB +0.3pp, HR +0.4pp
+ *       end of 3rd pass:  K -2.0pp, BB +0.5pp, HR +0.7pp
+ *       4th+ pass:        K -2.5pp, BB +0.8pp, HR +1.0pp
+ *     vs league means K%≈22.5%, BB%≈8.3%, HR/PA≈3.0%.
  *
- * Converted to multiplicative factors over league-mean baselines of
- * K%≈22.5%, BB%≈8.3%, HR%≈3.0% — and clamped to be safe.
+ *   - Brill, Deshpande & Wyner ("Bayesian analysis of the times through the
+ *     order penalty", JQAS 2023) controlled for batter/pitcher quality and
+ *     home-field and found the apparent *discontinuous* jump between the 2nd
+ *     and 3rd time through largely disappears. What remains is a smooth
+ *     within-game decline that Carleton's later work attributes to pitch count.
+ *
+ * Resolution: we keep the magnitudes from the consensus literature but ditch
+ * the step function. The multiplicative factor on each rate is a linear
+ * function of `paInGameForPitcher`, fit to land on Lichtman's values at the
+ * midpoints of the old buckets (PA 13 / 22 / 31). Clamped so a pitcher who
+ * keeps getting trotted out into the 5th time through doesn't run away.
+ *
+ * Slopes:
+ *   K:  -0.0040 / PA   → at PA 22 (mid-3rd-pass) factor ≈ 0.912 (matches old 0.911)
+ *   BB: +0.0030 / PA   → at PA 22 factor ≈ 1.066 (matches old 1.060)
+ *   HR: +0.0110 / PA   → at PA 22 factor ≈ 1.242 (matches old 1.233)
+ *
+ * Clamps: K ∈ [0.85, 1.0], BB ∈ [1.0, 1.15], HR ∈ [1.0, 1.45].
  */
 
-const K_FACTORS = [1.0, 0.956, 0.911, 0.889] as const; // 1st, 2nd, 3rd, 4th+
-const BB_FACTORS = [1.0, 1.036, 1.060, 1.096] as const;
-const HR_FACTORS = [1.0, 1.133, 1.233, 1.333] as const;
+const K_SLOPE = -0.0040;
+const BB_SLOPE = 0.0030;
+const HR_SLOPE = 0.0110;
+
+const K_FLOOR = 0.85;
+const BB_CEIL = 1.15;
+const HR_CEIL = 1.45;
 
 /**
- * Time-through-the-order index for a PA.
- *
- * @param paInGameForPitcher  Cumulative batters faced by THIS pitcher in this
- *   game *before* this PA starts. 0 = first PA of his outing. Reset for
- *   relievers when they enter the game.
+ * Coarse 1/2/3/4 bucket label, retained for display and back-compat callers
+ * (e.g. log lines and the legacy ttop.test.ts). The probability model itself
+ * no longer steps off these bucket boundaries — see `ttopFactors`.
  */
 export function ttoIndex(paInGameForPitcher: number): 1 | 2 | 3 | 4 {
   if (paInGameForPitcher < 9) return 1;
@@ -41,8 +59,11 @@ export function ttopFactors(paInGameForPitcher: number): {
   bb: number;
   hr: number;
 } {
-  const i = ttoIndex(paInGameForPitcher) - 1;
-  return { k: K_FACTORS[i], bb: BB_FACTORS[i], hr: HR_FACTORS[i] };
+  const pa = Math.max(0, paInGameForPitcher);
+  const k = Math.max(K_FLOOR, 1 + K_SLOPE * pa);
+  const bb = Math.min(BB_CEIL, 1 + BB_SLOPE * pa);
+  const hr = Math.min(HR_CEIL, 1 + HR_SLOPE * pa);
+  return { k, bb, hr };
 }
 
 /**
@@ -70,3 +91,5 @@ export function applyTtop(pa: PaOutcomes, paInGameForPitcher: number): PaOutcome
   });
   return adj;
 }
+
+export const __testing = { K_SLOPE, BB_SLOPE, HR_SLOPE, K_FLOOR, BB_CEIL, HR_CEIL };

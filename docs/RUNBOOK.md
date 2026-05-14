@@ -23,6 +23,7 @@ Tail logs from the Railway dashboard → service → Logs. Logs are structured J
 - `scope:stale-live-detector` — supervisor's idle-loop snapshot scanner. `pass {total, staleLive, cleaned}` summary; `cleaning {gamePk, lastInning, lastHalf, ageMs}` per cleaned entry.
 - `scope:sweep-finalize` — supervisor's idle-loop + exit-time post-game persistence sweep. `pass {gameDate, candidates, finalized, errors}` summary; `game:fail {gamePk, err}` per-game errors.
 - `scope:finalizeGame` — the actual Supabase finalize call invoked by the sweep. `ok {gamePk, plays, innings}` on success; `actual_runs:fail` on a non-fatal per-half UPDATE error.
+- `scope:xstats` / `scope:stuff` / `scope:workload` — v2.2 model-input scrapes. `scrape:failed` / `fail` means the model is running without that denoiser/bias on this cache window — never fatal. The watcher continues with identity factors. Sustained failures suggest upstream URL drift (FG especially) or rate-limit; cache-flush + retry once upstream is healthy. See [One-time cache flush after scraper deploys](#one-time-cache-flush-after-scraper-deploys).
 
 JSON shape: `{t, level, scope, msg, ...payload}`. `gamePk` is in payload for per-game events.
 
@@ -257,6 +258,7 @@ If rows with stale `officialDate` keep appearing, something is writing to `nrxi:
 **Optional:**
 - `MLB_USER_AGENT` — defaults to `nrxi-app/0.1`. Only set for MLB-side request attribution.
 - `NRXI_DISABLE_FRAMING=1` — robo-ump kill switch (zeroes the framing factor).
+- `NRXI_FRAMING_CLAMP=0.02` — override the framing-factor half-width (default `0.03`). Useful mid-season if ABS adoption keeps shrinking the human zone faster than the default clamp tightening anticipated. Range `[0, 0.2]`; out-of-range values fall back to the default.
 - `NRXI_SWITCH_HITTER_RULE=max` — revives v1's `max(L, R)` switch-hitter rule (default is canonical platoon `actual`).
 
 **Required on Vercel** (after unpause): same `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` + `KV_REST_API_*`. Both providers read from the same data plane.
@@ -286,6 +288,29 @@ If costs creep above ~$15/mo for three consecutive months, the migration plan ca
 
 ---
 
+## Vercel function memory
+
+Fluid Compute bills `provisioned_memory × instance_lifetime`. Defaults are wildly oversized for nrXi's thin RSC + Redis/Supabase workload, so `vercel.ts` declares explicit ceilings:
+
+```ts
+functions: {
+  "app/**/*": { memory: 512 },
+  "app/api/stream/route.ts": { memory: 256, maxDuration: 300 },
+}
+```
+
+- **512 MB default** for all RSC pages and route handlers (down from 2048 MB). Page routes do thin Redis/Supabase reads + RSC render; 512 leaves cold-start headroom on React 19 + motion + tailwind.
+- **256 MB on `/api/stream`** because the SSE route is held open ~290s per connection and the memory × wall-time product dominates its bill. The route does almost no allocation per connection — one Upstash subscription + a `TextEncoder`.
+
+**Check in Vercel dashboard:** Project → Functions tab shows each route's memory tier on the latest deployment. Compare provisioned-memory line in Usage → Invocations week-over-week after a config change.
+
+**If you add new routes / fire-and-forget work:**
+- New `app/**` routes inherit the 512 MB default automatically (glob match).
+- Adding `waitUntil(...)` or `after(...)` extends instance lifetime past the response — re-size the affected route in `vercel.ts` at the same time. There's currently **zero `waitUntil` / `after()` on the Vercel side**; it's audited and recorded in CLAUDE.md.
+- If a page route OOMs (visible in function logs as `Process exited`), bump that specific glob to 1024 MB rather than the whole project.
+
+---
+
 ## One-time cache flush after scraper deploys
 
 When fixing a park or weather scraper bug ([BUGS.md](BUGS.md) bug #6), the bad `[]` / `DEFAULT` value is cached under the working keys. Flush so the next watcher tick re-fetches fresh data:
@@ -293,8 +318,19 @@ When fixing a park or weather scraper bug ([BUGS.md](BUGS.md) bug #6), the bad `
 ```bash
 set -a; source .env.local; set +a
 
-# Park factors (24h TTL)
+# Park factors (24h TTL) — combined + per-handedness (v2.2)
 curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/park:factors:2026"
+curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/park:factors:2026:L"
+curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/park:factors:2026:R"
+
+# v2.2 scrapes — Savant xstats and FanGraphs Stuff+ (24h TTL each)
+curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/xstats:2026"
+curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/stuff:2026"
+
+# Reliever 7-day pitch counts (6h TTL, per-player — usually faster to wait)
+curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/keys/workload:*" \
+  | python3 -c 'import sys,json; [print(k) for k in json.load(sys.stdin).get("result",[])]' \
+  | xargs -I{} curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/del/{}"
 
 # All weather keys (30 min TTL — could also just wait it out)
 curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/keys/weather:*" \
@@ -303,6 +339,8 @@ curl -s -H "Authorization: Bearer $KV_REST_API_TOKEN" "$KV_REST_API_URL/keys/wea
 ```
 
 Most other caches (`hand:*`, `bat:splitsraw:*`, `pit:splitsraw:*`, `oaa:*`, `framing:*`, `venue:*`) are safe to leave — their data shape didn't change in the bug fix. See [ARCHITECTURE.md → caching layout](ARCHITECTURE.md#caching-layout) for the full key inventory.
+
+**Note on v2.2 scrape failures.** `xstats:*` and `stuff:*` both degrade to identity on failure — so a sustained `xstats:scrape:failed` / `stuff:scrape:failed` log signature means the model is running without those denoisers but is otherwise correct. The watcher will not crash. Re-running the scrape via cache flush is the right recovery once upstream is healthy.
 
 ---
 

@@ -7,6 +7,8 @@ const SAVANT_URL =
 
 const UA = process.env.MLB_USER_AGENT || "nrxi-app/0.1";
 
+type BatSide = "L" | "R" | "all";
+
 type ParkRow = {
   team: string;
   runsIndex: number;
@@ -34,8 +36,14 @@ export function parseSavantHtml(html: string): ParkRow[] {
   return regexParseTable(html);
 }
 
-async function scrapeParkFactors(season: number): Promise<ParkRow[]> {
-  const url = `${SAVANT_URL}${season}&batSide=&stat=index_runs&condition=All&rolling=`;
+async function scrapeParkFactors(season: number, batSide: BatSide = "all"): Promise<ParkRow[]> {
+  // Savant accepts `batSide=L` or `batSide=R` for handedness-controlled park
+  // factors; empty / `all` returns the combined index. Per FanGraphs' spray-angle
+  // work and Savant's own park-factor methodology, the HR component swings ≫20%
+  // by handedness in extreme parks (Yankees RF, Fenway LF), so per-side factors
+  // are not optional for a serious model.
+  const sideParam = batSide === "all" ? "" : batSide;
+  const url = `${SAVANT_URL}${season}&batSide=${sideParam}&stat=index_runs&condition=All&rolling=`;
   const res = await fetch(url, { headers: { "User-Agent": UA, Accept: "text/html" } });
   if (!res.ok) throw new Error(`Savant park factors HTTP ${res.status}`);
   const html = await res.text();
@@ -107,9 +115,21 @@ function regexParseTable(html: string): ParkRow[] {
 export async function loadParkFactors(season: number): Promise<ParkRow[]> {
   return cacheJson(k.parkFactors(season), 60 * 60 * 24, async () => {
     try {
-      return await scrapeParkFactors(season);
+      return await scrapeParkFactors(season, "all");
     } catch (e) {
       log.warn("park", "scrape:failed", { season, err: String(e) });
+      return [];
+    }
+  });
+}
+
+/** Per-handedness park factors (scraped with `batSide=L` / `batSide=R`). */
+async function loadParkFactorsByHand(season: number, batSide: "L" | "R"): Promise<ParkRow[]> {
+  return cacheJson(k.parkFactorsHand(season, batSide), 60 * 60 * 24, async () => {
+    try {
+      return await scrapeParkFactors(season, batSide);
+    } catch (e) {
+      log.warn("park", "scrape:hand-failed", { season, batSide, err: String(e) });
       return [];
     }
   });
@@ -178,16 +198,18 @@ export async function getParkRunFactor(homeTeamName: string, season: number): Pr
 }
 
 /**
- * Per-outcome park factors. Same factor applied to L and R for v1 (Savant
- * scrape currently returns combined indices). Future revision can fetch
- * `batSide=L` / `batSide=R` separately for true handedness-controlled factors.
+ * Per-outcome park factors keyed by hitter handedness. When the Savant scrape
+ * returns full per-component fields, those are used directly. When only the
+ * runs index is published, components are derived per-side from runs via
+ * published per-outcome sensitivities (HR most park-sensitive; K/BB park-independent).
  *
- * When the scrape returns only `index_runs`, components are derived from runs
- * via published per-outcome park-factor sensitivities (HR is the most
- * leverage-sensitive component; K/BB are essentially park-independent).
+ * Source for derivation exponents: FanGraphs 5-year regressed PFs by component,
+ * https://library.fangraphs.com/park-factors-5-year-regressed/.
  *
- * Source for derivation exponents: FanGraphs 5-year regressed PFs by
- * component, https://library.fangraphs.com/park-factors-5-year-regressed/.
+ * Source for the handedness split: Savant publishes `batSide=L|R` variants of
+ * the same leaderboard. HR especially swings >20% by handedness in extreme
+ * parks (Yankees short porch RF for LHB, Fenway monster LF for RHB) —
+ * per-side factors are mandatory for an accurate HR-rate adjustment.
  */
 export type ParkComponentFactors = {
   hr: { L: number; R: number };
@@ -212,33 +234,58 @@ function deriveFromRuns(runs: number, exponent: number): number {
   return clampIdx(Math.pow(runs, exponent));
 }
 
+type SideComponents = {
+  hr: number;
+  triple: number;
+  double: number;
+  single: number;
+  k: number;
+  bb: number;
+};
+
+function componentsFromRow(row: ParkRow): SideComponents {
+  const runs = clampIdx(row.runsIndex);
+  return {
+    hr: clampIdx(row.hrIndex ?? deriveFromRuns(runs, 1.5)),
+    triple: clampIdx(row.tripleIndex ?? deriveFromRuns(runs, 1.0)),
+    double: clampIdx(row.doubleIndex ?? deriveFromRuns(runs, 0.7)),
+    single: clampIdx(row.singleIndex ?? deriveFromRuns(runs, 0.4)),
+    k: clampIdx(row.kIndex ?? 1),
+    bb: clampIdx(row.bbIndex ?? 1),
+  };
+}
+
+const NEUTRAL_SIDE: SideComponents = { hr: 1, triple: 1, double: 1, single: 1, k: 1, bb: 1 };
+
 export async function getParkComponentFactors(
   homeTeamName: string,
   season: number,
 ): Promise<ParkComponentFactors> {
-  const table = await loadParkFactors(season);
-  if (table.length === 0) return NEUTRAL_PARK;
-  const match = findRow(table, homeTeamName);
-  if (!match) return NEUTRAL_PARK;
-  const runs = clampIdx(match.runsIndex);
+  // Fetch combined + both handedness tables in parallel. Either side may be
+  // empty (scrape failure or seasonally-thin data); fall back to combined,
+  // then to neutral.
+  const [combined, leftTable, rightTable] = await Promise.all([
+    loadParkFactors(season),
+    loadParkFactorsByHand(season, "L"),
+    loadParkFactorsByHand(season, "R"),
+  ]);
 
-  // HR is the most park-sensitive component (~1.5x runs sensitivity in physics
-  // terms). Doubles/triples scale with field dimensions but less strongly.
-  // Singles barely move. K/BB are essentially park-independent — pitch-by-pitch
-  // outcomes between battery and hitter dominate.
-  const hr = clampIdx(match.hrIndex ?? deriveFromRuns(runs, 1.5));
-  const triple = clampIdx(match.tripleIndex ?? deriveFromRuns(runs, 1.0));
-  const dbl = clampIdx(match.doubleIndex ?? deriveFromRuns(runs, 0.7));
-  const single = clampIdx(match.singleIndex ?? deriveFromRuns(runs, 0.4));
-  const k = clampIdx(match.kIndex ?? 1);
-  const bb = clampIdx(match.bbIndex ?? 1);
+  const combinedMatch = combined.length > 0 ? findRow(combined, homeTeamName) : null;
+  const leftMatch = leftTable.length > 0 ? findRow(leftTable, homeTeamName) : null;
+  const rightMatch = rightTable.length > 0 ? findRow(rightTable, homeTeamName) : null;
+
+  if (!combinedMatch && !leftMatch && !rightMatch) return NEUTRAL_PARK;
+
+  const fallback = combinedMatch ? componentsFromRow(combinedMatch) : NEUTRAL_SIDE;
+  const left = leftMatch ? componentsFromRow(leftMatch) : fallback;
+  const right = rightMatch ? componentsFromRow(rightMatch) : fallback;
 
   return {
-    hr: { L: hr, R: hr },
-    triple: { L: triple, R: triple },
-    double: { L: dbl, R: dbl },
-    single: { L: single, R: single },
-    k: { L: k, R: k },
-    bb: { L: bb, R: bb },
+    hr: { L: left.hr, R: right.hr },
+    triple: { L: left.triple, R: right.triple },
+    double: { L: left.double, R: right.double },
+    single: { L: left.single, R: right.single },
+    k: { L: left.k, R: right.k },
+    bb: { L: left.bb, R: right.bb },
   };
 }

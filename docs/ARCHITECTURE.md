@@ -199,27 +199,33 @@ All bin scripts import `services/lib/load-env` first to pick up `.env.local` for
 GET. Reads `nrxi:snapshot` via `lib/pubsub/publisher.ts:getSnapshot`, sorts (Live > Delayed > Suspended > Pre > Final, then by inning desc), returns `{ games, ts }`. Used by the SSR initial paint.
 
 #### `app/api/stream/route.ts`
-GET. Server-Sent Events stream. On connect, sends a `snapshot` event with current state, then enters a `while !abort` loop polling `nrxi:snapshot` every 2s and emitting `update` events for any changed `gamePk`. 15s heartbeat prevents proxy timeouts. EventSource auto-reconnects on Vercel's ~300s function lifecycle boundary.
+GET. Server-Sent Events stream. On connect, sends a `snapshot` event with current state, then enters a `while !abort` loop polling `nrxi:snapshot` every 2s and emitting `update` events for any changed `gamePk`. 15s heartbeat prevents proxy timeouts. EventSource auto-reconnects on Vercel's ~300s function lifecycle boundary — in-route `setTimeout(cleanup, 290_000)` closes gracefully 10s early so the browser reconnects via its retry hint instead of seeing a "Task timed out" error.
 
 The two old WDK-era routes (`/api/cron/start-day` and `/api/workflows/*`) are gone — Railway is the cron source now, and there's no manual-trigger HTTP surface.
+
+**Memory ceilings** (declared in `vercel.ts` `functions` map): all routes default to **512 MB** (down from the Vercel default of 2048 MB). `app/api/stream/route.ts` runs on **256 MB** with `maxDuration: 300` because it holds one Upstash subscription open for ~290s per connection — memory × wall-time dominates cost on the SSE route, so it gets the lowest practical tier. No `waitUntil` / `after()` / fire-and-forget patterns anywhere on the Vercel side — adding any would extend the billed instance lifetime past the response, so re-size the affected route in `vercel.ts` at the same time.
 
 ### Libraries
 
 #### `lib/mlb/`
 - `client.ts` — typed wrappers for `statsapi.mlb.com`. `fetchSchedule`, `fetchLiveFull`, `fetchLiveDiff`, `fetchPerson`, `fetchSplits`, `fetchVenue`. Sets `User-Agent` from `MLB_USER_AGENT` env (defaults to `nrxi-app/0.1`).
-- `types.ts` — Zod schemas (`ScheduleResponse`, `PersonResponse`, `SplitsResponse`) and a `LiveFeed` TypeScript type. Includes `gameData.datetime.officialDate` (venue-local YYYY-MM-DD, the canonical history bucket key).
+- `types.ts` — Zod schemas (`ScheduleResponse`, `PersonResponse`, `SplitsResponse`) and a `LiveFeed` TypeScript type. `PersonResponse` carries `currentAge` + `birthDate` (both optional) for aging projection. Includes `gameData.datetime.officialDate` (venue-local YYYY-MM-DD, the canonical history bucket key).
+- `aging.ts` — v2.2 Marcel-style aging projection. `agingMultipliers(currentAge, role)` returns per-outcome 1-year multipliers; `applyAging(pa, age, role)` multiplies + renormalizes; `ageFromBirthDate(...)` is a fallback when only `birthDate` is exposed. Role-specific peaks (batter 27, pitcher 28); slopes derived from FanGraphs aging-curve work; multipliers clamped `[0.85, 1.15]`. Called from `combineSeasonsPa` to project prior-season rates forward 1 year.
 - `splits.ts` — Two parallel loader sets:
   - **v1 legacy** — `loadBatterProfile` / `loadPitcherProfile` return scalar `obpVs` / `whipVs`. Retained for the deprecated `pReach` path.
-  - **v2** — `loadBatterPaProfile` / `loadPitcherPaProfile` return per-handedness `paVs: PaOutcomes` (8-outcome multinomial). Pulls **current + prior regular-season splits in parallel**, blends them via a **role-specific** Marcel-style multiplier on PA (hitter `3:2`, pitcher `2:1`), EB-shrinks the combined baseline against true PA at a **role-specific** `n0` (hitter `200`, pitcher `500`), then folds in a 10% last-30-day blend when L30 has ≥ 80 PA. Constants live in `BATTER_BLEND` / `PITCHER_BLEND` configs.
+  - **v2.2** — `loadBatterPaProfile` / `loadPitcherPaProfile` return per-handedness `paVs: PaOutcomes` (8-outcome multinomial). Pulls **current + prior regular-season splits in parallel**, applies 1-year aging to the prior-season rates, blends them via a **role-specific** Marcel-style multiplier on PA (hitter `3:2`, pitcher `2:1`), EB-shrinks the combined baseline against true PA at a **role-specific** `n0` (hitter `200`, pitcher `500`), then folds in a 10% last-30-day blend when L30 has ≥ 80 PA. Constants live in `BATTER_BLEND` / `PITCHER_BLEND` configs. Batter loader also pulls the Savant `expected_statistics` table and applies an xHR denoiser to both L/R sides; pitcher loader pulls 7-day pitch count + Stuff+ and applies workload K-drag + Pitching+ K↑/HR↓ bias. Batter profile also carries a per-batter `gidpRate` for Markov.
 - `lineup.ts` — `getUpcomingForCurrentInning(feed)` extracts the next 9 upcoming batters and their pitcher. Handles `Middle`/`End`/`outs===3` half-boundary advancement. Returns `null` if `boxscore.battingOrder` < 9.
 - `extract.ts` — `extractLineups`, `extractLinescore`, `extractBatterFocus(feed, lastBatterIds?)`. The last function returns `{ battingTeam, currentBatterId, nextHalfLeadoffId }` for the lineup highlight; `nextHalfLeadoffId` requires per-team `lastBatterIds` (tracked by the watcher across ticks) to resolve to the actual on-deck spot — without it, MLB's live feed only exposes offense state for the team currently batting, so the leadoff falls back to `order[0]`.
 
 #### `lib/env/`
-- `park.ts` — Baseball Savant scraper. `getParkRunFactor` (legacy), `getParkComponentFactors` (per-outcome handedness-keyed factors).
+- `park.ts` — Baseball Savant scraper. `getParkRunFactor` (legacy), `getParkComponentFactors` (per-outcome handedness-keyed factors). v2.2: fetches `batSide=L|R` in parallel with the combined index; populates `ParkComponentFactors.L/R` distinctly.
 - `park-orientation.ts` — outfield bearing per park, used to classify wind direction.
 - `weather.ts` — covers.com HTML scraper. `parseCoversHtml(html, awayTeam, homeTeam)` is the testable seam. Returns `WeatherInfo` consumed by `weatherRunFactor` (legacy) and `weatherComponentFactors` (per-outcome).
 - `defense.ts` — Statcast OAA leaderboard scraper. `loadOaaTable(season)` (24h cache). `defenseFactor(fielderIds, table)` ∈ `[0.90, 1.10]`.
-- `framing.ts` — Statcast catcher framing leaderboard. `loadFramingTable(season)` (24h cache). `framingFactors(catcherId, table)` returns `{k, bb}` ∈ `[0.95, 1.05]`. `NRXI_DISABLE_FRAMING=1` is the robo-ump kill switch.
+- `framing.ts` — Statcast catcher framing leaderboard. `loadFramingTable(season)` (24h cache). `framingFactors(catcherId, table)` returns `{k, bb}` ∈ `[0.97, 1.03]` (v2.2 ABS-tightened — was `[0.95, 1.05]`). `NRXI_DISABLE_FRAMING=1` is the robo-ump kill switch; `NRXI_FRAMING_CLAMP` env override sets a custom half-width.
+- `expected-stats.ts` — v2.2 Savant expected-statistics scraper (`expected_statistics?type=batter`). Returns per-batter `{pa, bbe, hr, xHr, xwOba, barrelRate}`. `hrRateMultiplier(row)` EB-shrinks the xHR/observed-HR ratio with `n0 = 50 BBE`, clamped `[0.7, 1.3]`. Hitter-side only.
+- `workload.ts` — v2.2 reliever 7-day workload loader. `loadRecentPitchCount(playerId, days=7)` queries MLB `byDateRange&group=pitching` and sums `numberOfPitches`. `workloadKFactor(pitches)` ramps `1.00 → 0.97` between 120 and 200 pitches; `applyWorkload(pa, factor)` reweights + renormalizes the K cell.
+- `stuff.ts` — v2.2 FanGraphs Stuff+/Pitching+ scraper. `loadStuffPlusTable(season)` (24h cache, best-effort). `stuffFactors(row)` returns K + HR multipliers clamped `[0.95, 1.05]`. Joined to MLB Stats API id via FG's `xmlbamid` field; degrades to identity when missing.
 - `venues.ts` — venue metadata cache.
 - `__fixtures__/` — captured HTML for parser regression tests.
 
@@ -238,12 +244,12 @@ Team logo asset path + metadata.
 #### `lib/prob/`
 Pure, fully unit-tested math.
 - `log5.ts` — generalized multinomial Log5, switch-hitter routing, matchup builder, env scaling.
-- `markov.ts` — 24-state base-out Markov chain. `pAtLeastOneRun(start, lineup)`.
-- `ttop.ts` — Times-Through-the-Order Penalty.
+- `markov.ts` — 24-state base-out Markov chain. `pAtLeastOneRun(start, lineup, options?)` — v2.2 `options.gidpRates: number[]` parallel-array threads per-batter GIDP rates into the in-play-out branch.
+- `ttop.ts` — Times-Through-the-Order Penalty. v2.2 smooth linear slopes (`K_SLOPE`, `BB_SLOPE`, `HR_SLOPE`); `ttoIndex(pa)` retained for display only.
 - `framing.ts` — `applyFraming(pa, {k, bb})` reweights K and BB cells.
 - `defense.ts` — `applyDefense(pa, factor)` reweights the in-play block.
-- `calibration.ts` — Identity calibrator + isotonic loader.
-- `expected-stats.ts` — `xObpFromPa`, `xSlgFromPa`.
+- `calibration.ts` — v2.2 stratified-by-`(inning_bucket, half)` lookup. `calibrate(p, ctx?)` falls back bucket-half → bucket → `"global"` → identity. `loadCalibrator(table | map | null)` accepts single-table (global default) or per-bucket map.
+- `expected-stats.ts` — `xObpFromPa`, `xSlgFromPa`. (Display rate stats — NOT the new env-side `lib/env/expected-stats.ts` Savant scraper.)
 - `odds.ts` — `americanBreakEven`, `impliedProb`, `roundOdds`.
 - **Legacy v1** — `reach-prob.ts:pReach`, `inning-dp.ts:pAtLeastTwoReach`. Not used by the watcher.
 
@@ -275,10 +281,14 @@ All keys come from `lib/cache/keys.ts`.
 |---|---|---|---|
 | `bat:splitsraw:{playerId}:{season}` | `lib/mlb/splits.ts` | raw `SplitsResponse` JSON | 12h |
 | `pit:splitsraw:{playerId}:{season}` | `lib/mlb/splits.ts` | raw `SplitsResponse` JSON | 12h |
-| `hand:{playerId}` | `lib/mlb/splits.ts:loadHand` | `{ id, fullName, bats, throws }` | 30d |
-| `park:factors:{season}` | `lib/env/park.ts` | `ParkRow[]` from Baseball Savant | 24h |
+| `hand:{playerId}` | `lib/mlb/splits.ts:loadHand` | `{ id, fullName, bats, throws, age }` | 30d |
+| `park:factors:{season}` | `lib/env/park.ts` | combined `ParkRow[]` from Baseball Savant | 24h |
+| `park:factors:{season}:{L\|R}` | `lib/env/park.ts` | per-handedness `ParkRow[]` (v2.2) | 24h |
 | `oaa:{season}` | `lib/env/defense.ts` | `OaaTable` | 24h |
 | `framing:{season}` | `lib/env/framing.ts` | `FramingTable` | 24h |
+| `xstats:{season}` | `lib/env/expected-stats.ts` | hitter `ExpectedStatsTable` (v2.2) | 24h |
+| `stuff:{season}` | `lib/env/stuff.ts` | pitcher `StuffTable` from FanGraphs (v2.2) | 24h |
+| `workload:{playerId}` | `lib/env/workload.ts` | total 7-day pitch count (v2.2) | 6h |
 | `venue:{venueId}` | `lib/env/venues.ts` | `VenueInfo` | 30d |
 | `weather:{gamePk}` | `lib/env/weather.ts` | `WeatherInfo` | 30 min |
 | `nrxi:lock:{gamePk}` | `services/lib/lock.ts` | watcher `ownerId` | 30s |
@@ -344,6 +354,6 @@ Cost: every dynamic data access must be wrapped in `<Suspense>` and call `connec
 - **Park + weather double-counting** is now mitigated. v2 applies park factors per outcome (HR most, K/BB not at all) and weather likewise.
 - **HTML scraping fragility.** Both Baseball Savant and covers.com return HTML. Scrapers wrap try/catch with neutral fallbacks. Captured fixtures in `lib/env/__fixtures__/` give regression tests.
 - **Switch hitters use canonical platoon advantage** (v2 `actual` rule). `NRXI_SWITCH_HITTER_RULE=max` revives v1's generous `max(L, R)`.
-- **Calibration shim is identity.** Needs ≥1k production `(predicted, actual)` pairs before isotonic regression can be fit.
+- **Calibration shim is identity.** v2.2 wired in per-(inning_bucket, half) stratification but ships all bins as identity. Needs ≥1k production `(predicted, actual)` pairs per stratum before isotonic regression can be fit per-bin. The post-fit swap is a one-line `loadCalibrator(map)` call at app boot.
 - **MAX_LOOPS = 5000 + 20h wall-clock cap.** Realistic max watcher lifetime under `PRE_GAME_LEAD_MS = 6h` is ~11h (6h pre-game + 5h game with extras). The 20h cap is defense-only — the supervisor's idle-exit deadline (06:00 UTC next day = ~18h after wake) caps any decoupled scenario in practice. The pre-pre-game-compute cap was 6h, which fired before games even started once watchers spawned earlier; the bump to 20h fixed that regression. MAX_LOOPS (≈7h at 5s active cadence) is a defense against tight-loop bugs; with pre-game cadence at 1800s, it accrues only ~12 iterations across the 6h pre-game window. Non-Final exits run `gracefulExit`, which skips the synthetic-Final publish when `lastPublishedState.status === "Pre"` so a watcher dying mid-pre-game leaves the Upcoming card intact instead of moving it to Finished. See BUGS.md bug #11.
 - **Supabase Marketplace is a convenience layer, not a runtime requirement.** Both Vercel and Railway connect to Supabase directly via the same `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` from the Supabase dashboard. If you ever rotate the key, manually re-sync to both. See [RUNBOOK.md](RUNBOOK.md#supabase-key-rotation).

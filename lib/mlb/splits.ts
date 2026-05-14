@@ -3,6 +3,10 @@ import { cacheJson } from "../cache/redis";
 import { k } from "../cache/keys";
 import { log } from "../log";
 import type { HandCode, PitchHand, PitchHandRaw } from "./types";
+import { ageFromBirthDate, applyAging, type Role } from "./aging";
+import { hrRateMultiplier, loadExpectedStatsTable } from "../env/expected-stats";
+import { applyWorkload, loadRecentPitchCount, workloadKFactor } from "../env/workload";
+import { applyStuff, loadStuffPlusTable, stuffFactors } from "../env/stuff";
 
 const STATSAPI = "https://statsapi.mlb.com";
 const UA = process.env.MLB_USER_AGENT || "nrxi-app/0.1";
@@ -60,6 +64,14 @@ export type BatterPaProfile = {
   bats: HandCode;
   paVs: { L: PaOutcomes; R: PaOutcomes };
   paCounts: { L: number; R: number };
+  /**
+   * P(in-play out is a GIDP | runner on 1st AND outs < 2) for this batter.
+   * EB-shrunk per-batter rate, clamped to [0.03, 0.20]. League mean ≈ 0.10.
+   * High-GB hitters drift up (~0.14-0.18); high-FB/fast hitters drift down
+   * (~0.05-0.07). Threads into the Markov chain via
+   * `pAtLeastOneRun(start, lineup, { gidpRates })`.
+   */
+  gidpRate: number;
 };
 
 export type PitcherPaProfile = {
@@ -214,25 +226,37 @@ function blendPa(a: PaOutcomes, b: PaOutcomes, bWeight: number): PaOutcomes {
  * recency multipliers (wCurrent / wPrior) on the blended rate. Returns the
  * actual observed PA (truePa) separately, so callers can shrink against true
  * sample size while still benefiting from the recency bias in the rates.
+ *
+ * Aging: when `age`/`role` are provided, the prior-year rates are projected
+ * forward 1 year before blending. Marcel-style adjustment — see `lib/mlb/aging.ts`.
+ * Falls through to the legacy (age-blind) behavior when age is unknown so
+ * unit tests and missing-birthDate callers stay correct.
  */
 function combineSeasonsPa(
   current: { rates: PaOutcomes; pa: number } | null,
   prior: { rates: PaOutcomes; pa: number } | null,
   wCurrent: number,
   wPrior: number,
+  age?: number | null,
+  role?: Role,
 ): { rates: PaOutcomes; truePa: number } | null {
   if (!current && !prior) return null;
-  if (!current) return { rates: prior!.rates, truePa: prior!.pa };
-  if (!prior) return { rates: current.rates, truePa: current.pa };
+  // Project prior-year rates forward to current age before any combine.
+  const priorAged =
+    prior && age != null && role
+      ? { rates: applyAging(prior.rates, age, role), pa: prior.pa }
+      : prior;
+  if (!current) return { rates: priorAged!.rates, truePa: priorAged!.pa };
+  if (!priorAged) return { rates: current.rates, truePa: current.pa };
   const wc = wCurrent * current.pa;
-  const wp = wPrior * prior.pa;
+  const wp = wPrior * priorAged.pa;
   const denom = wc + wp;
   if (denom === 0) return null;
   const out = {} as PaOutcomes;
   (Object.keys(current.rates) as (keyof PaOutcomes)[]).forEach((key) => {
-    out[key] = (wc * current.rates[key] + wp * prior.rates[key]) / denom;
+    out[key] = (wc * current.rates[key] + wp * priorAged.rates[key]) / denom;
   });
-  return { rates: out, truePa: current.pa + prior.pa };
+  return { rates: out, truePa: current.pa + priorAged.pa };
 }
 
 /** Empirical-Bayes shrinkage to the league mean. Preserves sum-to-1. */
@@ -245,6 +269,73 @@ export function shrinkPa(observed: PaOutcomes, n: number, league: PaOutcomes, n0
   return out;
 }
 
+/**
+ * Multiply the HR cell of a per-PA distribution by `mult` and renormalize so
+ * the result still sums to 1. Used by the hitter Barrel/xwOBA denoiser
+ * (`lib/env/expected-stats.ts`). Identity when mult === 1.
+ */
+function scaleHrInPa(pa: PaOutcomes, mult: number): PaOutcomes {
+  if (mult === 1 || !Number.isFinite(mult) || mult <= 0) return pa;
+  const adj: PaOutcomes = { ...pa, hr: pa.hr * mult };
+  const total =
+    adj.single + adj.double + adj.triple + adj.hr + adj.bb + adj.hbp + adj.k + adj.ipOut;
+  if (total <= 0) return pa;
+  (Object.keys(adj) as (keyof PaOutcomes)[]).forEach((key) => {
+    adj[key] = adj[key] / total;
+  });
+  return adj;
+}
+
+// =========================================================================
+// GIDP rate per batter — feeds Markov's transIpOut (P(GIDP | runner on 1st,
+// outs < 2) per Tier 3 #10 in the probability-model review). League-mean
+// values calibrated against Retrosheet aggregates (≈ 10% of eligible ipOuts).
+// =========================================================================
+
+/** League mean P(GIDP | eligible) — runner on 1st, outs < 2, in-play out. */
+export const LEAGUE_GIDP_RATE = 0.10;
+/** League mean GIDP per PA — used to translate per-PA rate → per-eligible rate. */
+const LEAGUE_GIDP_PER_PA = 0.015;
+/** Multiplicative bridge from GIDP/PA → GIDP/eligible-ipOut (≈ 6.67). */
+const GIDP_PER_PA_TO_RATE = LEAGUE_GIDP_RATE / LEAGUE_GIDP_PER_PA;
+/** EB shrinkage prior (PA). Small — GIDP/PA stabilizes faster than HR/PA. */
+const GIDP_SHRINK_N0 = 250;
+
+/**
+ * Aggregate GIDP / PA across the season-split rows we already fetch for splits
+ * blending (vL + vR). Returns total GIDP and total PA so the caller can shrink
+ * and convert in one step.
+ */
+function sumGidpAndPa(
+  stats: Array<Record<string, unknown> | null>,
+): { gidp: number; pa: number } {
+  let gidp = 0;
+  let pa = 0;
+  for (const s of stats) {
+    if (!s) continue;
+    const g = num(s.groundIntoDoublePlay);
+    const p = num(s.plateAppearances) ?? num(s.battersFaced);
+    if (g != null) gidp += g;
+    if (p != null && p > 0) pa += p;
+  }
+  return { gidp, pa };
+}
+
+/**
+ * Per-batter `P(GIDP | runner on 1st AND outs < 2 AND in-play out)`, derived
+ * from raw GIDP counts and PA totals via EB shrinkage and the league-wide
+ * per-PA → per-eligible bridge. Always returns a value in [0.03, 0.20].
+ */
+export function gidpRateFromCounts(gidpCount: number, pa: number): number {
+  if (pa <= 0) return LEAGUE_GIDP_RATE;
+  const shrunkGidpPerPa =
+    (gidpCount + GIDP_SHRINK_N0 * LEAGUE_GIDP_PER_PA) / (pa + GIDP_SHRINK_N0);
+  const rate = shrunkGidpPerPa * GIDP_PER_PA_TO_RATE;
+  if (rate < 0.03) return 0.03;
+  if (rate > 0.20) return 0.20;
+  return rate;
+}
+
 // =========================================================================
 // Raw split fetchers — shared between v1 and v2. Already cached.
 // =========================================================================
@@ -254,11 +345,13 @@ export async function loadHand(playerId: number) {
     const r = await fetchPerson(playerId);
     const p = r.people[0];
     const throws = await resolveThrowsHand(p.id, p.pitchHand?.code);
+    const age = p.currentAge ?? ageFromBirthDate(p.birthDate);
     return {
       id: p.id,
       fullName: p.fullName,
       bats: p.batSide?.code ?? ("R" as HandCode),
       throws,
+      age: age ?? null,
     };
   });
 }
@@ -436,12 +529,16 @@ function buildSide(
   league: PaOutcomes,
   hand: "L" | "R",
   config: BlendConfig,
+  age?: number | null,
+  role?: Role,
 ): SideResult {
   const baselineRaw = combineSeasonsPa(
     paFromStat(currentSeasonStat),
     paFromStat(priorSeasonStat),
     config.wCurrent,
     config.wPrior,
+    age,
+    role,
   );
   const recentRaw = paFromStat(recentStat);
 
@@ -467,11 +564,12 @@ function buildSide(
 }
 
 export async function loadBatterPaProfile(playerId: number): Promise<BatterPaProfile> {
-  const [hand, currentRaw, priorRaw, recent] = await Promise.all([
+  const [hand, currentRaw, priorRaw, recent, xstats] = await Promise.all([
     loadHand(playerId),
     loadHittingSplitsRaw(playerId, SEASON),
     loadHittingSplitsRaw(playerId, SEASON - 1),
     loadHittingSplitsRecentRaw(playerId, RECENT_DAYS),
+    loadExpectedStatsTable(SEASON),
   ]);
 
   const currentSplits = currentRaw.stats[0]?.splits ?? [];
@@ -484,24 +582,39 @@ export async function loadBatterPaProfile(playerId: number): Promise<BatterPaPro
   const recentVL = pickSplit(recent, "vl");
   const recentVR = pickSplit(recent, "vr");
 
-  const sideL = buildSide(currentVL, priorVL, recentVL, LEAGUE_PA.L, "L", BATTER_BLEND);
-  const sideR = buildSide(currentVR, priorVR, recentVR, LEAGUE_PA.R, "R", BATTER_BLEND);
+  const sideL = buildSide(currentVL, priorVL, recentVL, LEAGUE_PA.L, "L", BATTER_BLEND, hand.age, "batter");
+  const sideR = buildSide(currentVR, priorVR, recentVR, LEAGUE_PA.R, "R", BATTER_BLEND, hand.age, "batter");
+
+  // GIDP rate folds current + prior season splits unweighted — GIDP is a
+  // slow-changing batted-ball tendency, recency multipliers add little signal.
+  const gidp = sumGidpAndPa([currentVL, currentVR, priorVL, priorVR]);
+  const gidpRate = gidpRateFromCounts(gidp.gidp, gidp.pa);
+
+  // Apply Savant xHR denoiser to BOTH sides' HR rate. Savant doesn't publish
+  // handedness-split expected stats, so the same multiplier is applied to L/R.
+  // Identity (mult === 1) when the row is missing or below BBE threshold.
+  const hrMult = hrRateMultiplier(xstats.get(playerId));
+  const ratesL = scaleHrInPa(sideL.rates, hrMult);
+  const ratesR = scaleHrInPa(sideR.rates, hrMult);
 
   return {
     id: hand.id,
     fullName: hand.fullName,
     bats: hand.bats,
-    paVs: { L: sideL.rates, R: sideR.rates },
+    paVs: { L: ratesL, R: ratesR },
     paCounts: { L: sideL.pa, R: sideR.pa },
+    gidpRate,
   };
 }
 
 export async function loadPitcherPaProfile(playerId: number): Promise<PitcherPaProfile> {
-  const [hand, currentRaw, priorRaw, recent] = await Promise.all([
+  const [hand, currentRaw, priorRaw, recent, recentPitches, stuff] = await Promise.all([
     loadHand(playerId),
     loadPitchingSplitsRaw(playerId, SEASON),
     loadPitchingSplitsRaw(playerId, SEASON - 1),
     loadPitchingSplitsRecentRaw(playerId, RECENT_DAYS),
+    loadRecentPitchCount(playerId, 7),
+    loadStuffPlusTable(SEASON),
   ]);
 
   const currentSplits = currentRaw.stats[0]?.splits ?? [];
@@ -514,14 +627,24 @@ export async function loadPitcherPaProfile(playerId: number): Promise<PitcherPaP
   const recentVL = pickSplit(recent, "vl");
   const recentVR = pickSplit(recent, "vr");
 
-  const sideL = buildSide(currentVL, priorVL, recentVL, LEAGUE_PA.L, "L", PITCHER_BLEND);
-  const sideR = buildSide(currentVR, priorVR, recentVR, LEAGUE_PA.R, "R", PITCHER_BLEND);
+  const sideL = buildSide(currentVL, priorVL, recentVL, LEAGUE_PA.L, "L", PITCHER_BLEND, hand.age, "pitcher");
+  const sideR = buildSide(currentVR, priorVR, recentVR, LEAGUE_PA.R, "R", PITCHER_BLEND, hand.age, "pitcher");
+
+  // Reliever workload drag — high acute load (last 7 days) shaves up to 3%
+  // off K rate. Identity (factor === 1) below 120 pitches.
+  const wK = workloadKFactor(recentPitches);
+  // Stuff+/Pitching+ pitcher-quality bias — small K↑/HR↓ for high-Pitching+
+  // pitchers, inverse for low. Identity when the row isn't joined to this
+  // pitcher (no MLBAMID exposed by FanGraphs or the scrape fell back).
+  const sFactors = stuffFactors(stuff.get(playerId));
+  const ratesL = applyStuff(applyWorkload(sideL.rates, wK), sFactors);
+  const ratesR = applyStuff(applyWorkload(sideR.rates, wK), sFactors);
 
   return {
     id: hand.id,
     fullName: hand.fullName,
     throws: hand.throws as PitchHand,
-    paVs: { L: sideL.rates, R: sideR.rates },
+    paVs: { L: ratesL, R: ratesR },
     paCounts: { L: sideL.pa, R: sideR.pa },
   };
 }
