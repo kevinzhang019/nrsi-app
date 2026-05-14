@@ -140,6 +140,7 @@ export function GameCard({
           outs={game.outs}
           bases={game.bases}
           detailed={game.detailedState}
+          startTime={game.startTime}
         />
       </header>
 

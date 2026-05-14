@@ -421,3 +421,69 @@ export type PitchHandRaw = z.infer<typeof PitchHandRaw>;
 **Regression check:**
 - `lib/mlb/splits.test.ts` and `lib/mlb/types.test.ts` (existing) — green; the new resolver path isn't exercised but the type/schema changes don't break existing tests.
 - Manual recovery against prod: ran `npx tsx bin/run-watcher-once.ts 823470` after the fix; tick 0 succeeded, snapshot moved Upcoming → Active within ~5s, watcher continued ticking at the adaptive 5–14s cadence with no warns.
+
+## Bug 14: Scheduled-but-watcher-touched game cards render an empty inning strip on the dashboard
+
+**Symptom:** on 2026-05-14 the Padres @ Brewers card in the Upcoming section displayed the full `<LineScore>` strip — `1 2 3 4 5 6 7 8 9 | R H E` with all zeros — while sitting under the "SCHEDULED" status, hours before first pitch. The Mariners @ Astros card on the same dashboard correctly hid the strip. Both were Pre-status; both were sourced from the same Redis snapshot hash.
+
+**Root cause:** the v2.2 pre-game-compute feature has the watcher run its full Phase 1 / Phase 2 pipeline at 30-min cadence while `status === "Pre"` (see UI.md → "Pre-game compute"). Every tick rebuilds the published `GameState` from scratch and unconditionally sets
+
+```ts
+linescore: extractLinescore(tick.feed),
+```
+
+at `services/run-watcher.ts:696`. `lib/mlb/extract.ts:extractLinescore` **never returns `null`** — for a pre-game feed `liveData.linescore.innings` is `[]`, but the function still returns a fully-shaped `{ innings: [], totals: { away: {R:0,H:0,E:0}, home: {R:0,H:0,E:0} } }` object. That object is truthy.
+
+`<GameCard>` (`components/game-card.tsx:146`) gates the line-score row on a plain truthiness check:
+
+```tsx
+{game.linescore && (
+  <section ...>
+    <LineScore ... />
+  </section>
+)}
+```
+
+So the moment the first pre-game tick ran for the Padres game (= once both lineups + the probable starter were available, ~T-3h), the snapshot in Redis flipped from `linescore: null` (seed stub from `services/steps/seed-snapshot.ts:39`) to the empty-but-truthy linescore object, and the card grew an inning strip full of zeros. The Mariners game's first watcher tick hadn't fired yet (lineups not posted), so it kept the seed stub's `linescore: null` and rendered correctly. The visual divergence between the two cards was the tell.
+
+The same Redis snapshot is what the always-on Railway web service serves over `/stream` + `/snapshot`, and what `app/page.tsx` reads directly via `getSnapshot()`. The web service isn't the source of the bug; it just faithfully transports the bad state.
+
+**Why this didn't surface in the pre-Railway era:** before pre-game compute, the watcher only ran while the game was Live. Pre-status snapshots stayed as the supervisor-seeded stub with `linescore: null` from seed time until first pitch. The empty-truthy return from `extractLinescore` existed in the codebase but was never invoked against a pre-game feed.
+
+**Fix:** gate the call by status at the publish site (`services/run-watcher.ts:696`):
+
+```ts
+linescore: status === "Pre" ? null : extractLinescore(tick.feed),
+```
+
+This makes the published pre-game shape identical to the seed-snapshot stub — `linescore: null` — so the GameCard's truthiness gate works as intended without touching the component or the extractor.
+
+**Adjacent UX change shipped with the fix:** the same pre-game cards previously rendered `<InningState>` as the uppercase string from `detailedState` ("SCHEDULED" most of the day, "Warmup" / "Pre-Game" closer to first pitch). On the dashboard that string is low-signal — the viewer already knows the game hasn't started. Replaced with the venue-relevant **local start time** formatted in the viewer's own timezone (e.g. "7:10 PM"):
+
+```tsx
+// components/inning-state.tsx
+const [mounted, setMounted] = useState(false);
+useEffect(() => setMounted(true), []);
+if (status === "Pre") {
+  const localTime = mounted && startTime ? formatStartTime(startTime) : "";
+  return <div>{localTime || detailed || "Pre-game"}</div>;
+}
+```
+
+`startTime` is the UTC ISO from `gameData.datetime.dateTime` already on every `GameState`. `<GameCard>` plumbs it through. The `mounted` flag is **load-bearing for SSR**: `app/page.tsx` is a server component that renders `<InningState>` as a "use client" placeholder during SSR. Without the flag, the server would format the time in the server's timezone (UTC on Vercel) and the client would format in the viewer's local timezone, producing a hydration-mismatch warning and a flicker. With the flag, server + client first-render both fall through to `detailed || "Pre-game"`; the time string only appears after `useEffect` runs.
+
+**Why this is safe:**
+- The pre-game `linescore: null` matches the existing seed-stub shape — nothing downstream of `GameState` treats the two cases differently.
+- `extractLinescore` is unchanged; live ticks still go through the same code path. Only the Pre branch was suppressed.
+- `<LineScore>` itself never has to render against an empty `innings: []` array, removing an undefined-behavior edge case (`<LineScore>` was never written with that case in mind — see UI.md → "History page — wide game card").
+- The `startTime` display only adds information when the viewer's browser is mounted; SSR output stays exactly the same as before the fix, so static HTML cache shape is unchanged.
+
+**Don't change without thinking:**
+- The `status === "Pre" ? null : extractLinescore(...)` gate at `services/run-watcher.ts:696`. Removing the ternary reintroduces the empty-zero inning strip on every pre-game-tick-touched card. Restoring "publish always" would also require either making `extractLinescore` return `null` for empty innings (changes the function's contract everywhere) OR adding a status gate to the GameCard component (couples the render-layer to game lifecycle knowledge it doesn't otherwise need).
+- The `mounted` flag in `components/inning-state.tsx` — required to keep SSR and client first render in sync. Inlining `toLocaleTimeString(...)` directly into the JSX without the gate refires hydration warnings + a UI flicker. Replacing with `suppressHydrationWarning` would silence the warning but the flicker remains visible.
+- The `localTime || detailed || "Pre-game"` fallback chain — `detailed` ("Scheduled" / "Warmup" / "Pre-Game" depending on how close to first pitch) is the right pre-hydration label because it's what was there before, and "Pre-game" is the final fallback when `startTime` and `detailed` are both absent (e.g., a malformed seed stub).
+
+**Regression check:**
+- `npx tsc --noEmit` clean (unrelated pre-existing duplicate-prop warnings in `lib/history/rollup-plays.test.ts` and `services/lib/stale-live-detector.test.ts`).
+- `npx vitest run` — 299/299 passing.
+- Manual: confirmed no fixture / test references `state.linescore` truthiness for a Pre-status game; `<GameCard>` snapshot tests don't exercise the pre-game line-score branch.

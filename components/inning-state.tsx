@@ -1,7 +1,14 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import type { GameStatus } from "@/lib/mlb/types";
 import { BasesDiamond } from "@/components/bases-diamond";
+
+function formatStartTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
 
 export function InningState({
   status,
@@ -10,6 +17,7 @@ export function InningState({
   outs,
   bases,
   detailed,
+  startTime,
 }: {
   status: GameStatus;
   inning: number | null;
@@ -17,12 +25,17 @@ export function InningState({
   outs: number | null;
   bases: number | null;
   detailed?: string;
+  startTime?: string;
 }) {
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
   if (status === "Pre") {
+    const localTime = mounted && startTime ? formatStartTime(startTime) : "";
     return (
       <div className="text-right">
         <div className="text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
-          {detailed || "Pre-game"}
+          {localTime || detailed || "Pre-game"}
         </div>
       </div>
     );

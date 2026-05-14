@@ -693,7 +693,7 @@ export async function runWatcher(
           env,
           lineups: lastLineups ?? extractLineups(tick.feed),
           lineupStats: lastLineupStats,
-          linescore: extractLinescore(tick.feed),
+          linescore: status === "Pre" ? null : extractLinescore(tick.feed),
           ...extractBatterFocus(tick.feed, { away: lastAwayBatterId, home: lastHomeBatterId }),
           updatedAt: new Date().toISOString(),
           // Carry venue-local game day + UTC start time straight off the live
