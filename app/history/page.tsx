@@ -4,25 +4,53 @@ import { connection } from "next/server";
 import { HistoryDateStrip } from "@/components/history-date-strip";
 import { HistoricalCardLink } from "@/components/historical-card-link";
 import { SettingsProvider } from "@/lib/hooks/use-settings";
-import { isSupabaseConfigured } from "@/lib/db/supabase";
-import { listGameDates, listGamesByDate } from "@/lib/db/games";
+import type { HistoricalGame } from "@/lib/types/history";
 import type { GameState } from "@/lib/state/game-state";
 
 type SearchParams = Record<string, string | string[] | undefined>;
+
+// Vercel-side history pages no longer import @supabase/supabase-js — the
+// read path lives on the Railway "web" service (services/web/handlers/history.ts)
+// to keep the Vercel function bundle slim. NRXI_API_BASE is the Railway host
+// (server-side env var; not exposed to the client).
+function apiBase(): string | null {
+  return process.env.NRXI_API_BASE || null;
+}
+
+async function fetchDates(base: string): Promise<string[]> {
+  const res = await fetch(`${base}/history/dates`, { next: { revalidate: 30 } });
+  if (!res.ok) throw new Error(`dates: ${res.status}`);
+  const json = (await res.json()) as { dates?: string[] };
+  return json.dates ?? [];
+}
+
+async function fetchGamesByDate(base: string, date: string): Promise<HistoricalGame[]> {
+  const res = await fetch(`${base}/history/games?date=${encodeURIComponent(date)}`, {
+    next: { revalidate: 30 },
+  });
+  if (!res.ok) throw new Error(`games: ${res.status}`);
+  const json = (await res.json()) as { games?: HistoricalGame[] };
+  return json.games ?? [];
+}
 
 async function HistoryBody({ searchParams }: { searchParams: Promise<SearchParams> }) {
   await connection();
   const params = await searchParams;
 
-  if (!isSupabaseConfigured()) {
+  const base = apiBase();
+  if (!base) return <NotConfigured />;
+
+  let dates: string[];
+  try {
+    dates = await fetchDates(base);
+  } catch {
     return <NotConfigured />;
   }
 
-  const dates = await listGameDates();
   const requested = typeof params.date === "string" ? params.date : null;
   const selectedDate = requested && dates.includes(requested) ? requested : dates[0] ?? "";
 
-  const games = selectedDate ? await listGamesByDate(selectedDate) : [];
+  const games = selectedDate ? await fetchGamesByDate(base, selectedDate) : [];
 
   return (
     <div className="space-y-6">
@@ -41,7 +69,6 @@ async function HistoryBody({ searchParams }: { searchParams: Promise<SearchParam
           {games.map((g) => {
             const snapshot = g.finalSnapshot;
             if (!snapshot) return null;
-            // Stored snapshot is exactly a GameState shape; round-trip via JSONB.
             return <HistoricalCardLink key={g.gamePk} game={snapshot as GameState} />;
           })}
         </div>
@@ -53,17 +80,10 @@ async function HistoryBody({ searchParams }: { searchParams: Promise<SearchParam
 function NotConfigured() {
   return (
     <div className="space-y-3 rounded-md border border-[var(--color-border)] bg-[var(--color-card)] p-8 text-sm text-[var(--color-muted)]">
-      <p className="text-[var(--color-fg)]">History database not configured.</p>
+      <p className="text-[var(--color-fg)]">History service unavailable.</p>
       <p>
-        Install the Supabase integration via the Vercel Marketplace, then run
-        <code className="ml-1 rounded bg-[var(--color-subtle)] px-1.5 py-0.5 font-mono text-xs">
-          supabase/migrations/0001_history.sql
-        </code>{" "}
-        in the Supabase SQL editor.
-      </p>
-      <p>
-        Required env vars: <code className="font-mono text-xs">SUPABASE_URL</code> and{" "}
-        <code className="font-mono text-xs">SUPABASE_SERVICE_ROLE_KEY</code>.
+        Set <code className="font-mono text-xs">NRXI_API_BASE</code> on Vercel to the Railway web
+        service URL (e.g. <code className="font-mono text-xs">https://nrxi-web.up.railway.app</code>).
       </p>
     </div>
   );

@@ -67,27 +67,42 @@
               │   - nrxi:lock:{pk}   │         │  - plays           │
               │                      │         └─────────┬────────┘
               │   - nrxi:watcher-    │                   │
-              │     state:{pk}       │                   │ server-component
-              │   - cached splits/   │                   │ reads
-              │     park/weather/    │                   ▼
-              │     defense          │         ┌──────────────────┐
-              └──────────┬───────────┘         │  Vercel SSR      │
-                         │ poll every 2s        │  /history pages   │
-                         ▼                       └──────────────────┘
-              ┌──────────────────────┐
-              │  Vercel /api/stream  │   app/api/stream/route.ts (SSE)
-              │  fan-out to N clients│
-              └──────────┬───────────┘
-                         │ EventSource
-                         ▼
-              ┌──────────────────────┐
-              │  React client        │   components/game-board.tsx
-              │  Map<gamePk, State>  │   useGameStream hook
-              │  sort + render cards │
-              └──────────────────────┘
+              │     state:{pk}       │                   │
+              │   - cached splits/   │                   │
+              │     park/weather/    │                   │
+              │     defense          │                   │
+              └──────────┬───────────┘                   │
+                         │                               │
+                         │ Upstash REST subscribe        │
+                         │ + Supabase service-role reads │
+                         ▼                               ▼
+              ┌──────────────────────────────────────────────┐
+              │  Railway "web" service  (always-on, separate │
+              │  from the cron supervisor)                   │
+              │    bin/web.ts → services/web/server.ts       │
+              │    GET /stream          (SSE multiplexer)    │
+              │    GET /snapshot        (JSON)               │
+              │    GET /history/dates                        │
+              │    GET /history/games?date=YYYY-MM-DD        │
+              │    GET /history/game/:pk                     │
+              │    GET /healthz                              │
+              └──────────┬─────────────────┬─────────────────┘
+                         │                 │
+                         │ EventSource     │ RSC fetch
+                         │ (browser)       │ (Vercel server)
+                         ▼                 ▼
+              ┌──────────────────────┐  ┌──────────────────┐
+              │  React client        │  │  Vercel SSR      │
+              │  Map<gamePk, State>  │  │  /history pages  │
+              │  useGameStream hook  │  │  /, /games/[pk]  │
+              │  components/         │  │  (also reads     │
+              │  game-board.tsx      │  │   Redis directly │
+              │                      │  │   for initial    │
+              │                      │  │   paint)         │
+              └──────────────────────┘  └──────────────────┘
 ```
 
-**The migration that shaped this diagram:** the watcher used to run as a Vercel Workflow DevKit (WDK) orchestrator on the same Vercel deployment as the frontend, kicked daily by a Vercel Cron. That was burning the Fluid Compute free-tier cap. The new design splits compute: the watcher is a Railway-hosted Node supervisor that scales to zero outside MLB hours; the frontend stays on Vercel free-tier serving SSR + the SSE fan-out. Same Upstash Redis, same Supabase — both providers connect to the same data plane.
+**The migration that shaped this diagram:** the watcher used to run as a Vercel Workflow DevKit (WDK) orchestrator on the same Vercel deployment as the frontend, kicked daily by a Vercel Cron. That was burning the Fluid Compute free-tier cap. The new design splits compute three ways: (a) the **Railway cron "supervisor"** runs daily, schedules watchers, and scales to zero outside MLB hours; (b) the **Railway always-on "web" service** owns the SSE multiplexer + JSON snapshot + history reads — Vercel Fluid Compute's per-connection provisioned-memory billing made the long-lived `/api/stream` socket the dominant memory-time cost, so it moved off Vercel; (c) **Vercel** keeps RSC rendering for the page shells. Same Upstash Redis + same Supabase across all three, all reading from the same data plane.
 
 ## Activity-window mitigation
 
@@ -193,17 +208,38 @@ What used to be WDK `"use step"` functions, now plain async functions called via
 
 All bin scripts import `services/lib/load-env` first to pick up `.env.local` for local dev (no-op on Railway).
 
+### Railway "web" service
+
+Always-on HTTP service running alongside the cron supervisor on Railway. Entry point `bin/web.ts` boots a plain Node `http.createServer` from `services/web/server.ts`. Independent of the cron container — restartPolicy `ALWAYS`, no scale-to-zero. The supervisor service (cron `0 12 * * *`, restart `NEVER`) is untouched by this service's lifecycle.
+
+#### `services/web/server.ts`
+Route table + CORS. Allow-list defaults to `https://nrsi-app.vercel.app` + `http://localhost:3000` / `127.0.0.1:3000`; override via `NRXI_ALLOWED_ORIGINS` (comma-separated) for preview deploys. Requests with no `Origin` header (RSC server-to-server fetches, curl) get a wildcard `Access-Control-Allow-Origin: *` — safe because no endpoint uses credentials. Preflight (`OPTIONS`) returns 204 with `Allow-Methods: GET, OPTIONS`.
+
+#### `services/web/handlers/stream.ts`
+SSE multiplexer. On connect, writes `retry: 1000\n\n`, emits an `event: snapshot` with the initial `nrxi:snapshot` hash contents, then forwards every Upstash pub/sub message on `nrxi:games` to the client as `event: update`. 15s heartbeat (`: ping\n\n`) keeps proxies awake. Reuses `lib/pubsub/subscriber.ts:subscribeToChannel` and `lib/pubsub/publisher.ts:getSnapshot` unchanged — both are framework-agnostic. **No 290s pre-timeout** like the old Vercel route had: this is a long-lived Node process, not a Fluid Compute function. Aborts on `req.on("close")` / `req.on("error")` so a single-page-app reload tears down cleanly.
+
+#### `services/web/handlers/snapshot.ts`
+JSON `GET /snapshot`. Reads `nrxi:snapshot` via `getSnapshot`, sorts (Live > Delayed > Suspended > Pre > Final, then by inning desc), returns `{ games, ts }`. Same wire shape the old `/api/snapshot/route.ts` returned — kept for parity if anything ever needs a one-shot fetch.
+
+#### `services/web/handlers/history.ts`
+History reads. Three endpoints, all idempotent JSON:
+- `GET /history/dates` → `{ dates: string[] }` via `lib/db/games.ts:listGameDates`
+- `GET /history/games?date=YYYY-MM-DD` → `{ games: HistoricalGame[] }` via `listGamesByDate`
+- `GET /history/game/:pk` → `{ game, innings, plays }` via `Promise.all` over `getGame` + `getInningPredictions` + `lib/db/plays.ts:getGamePlays`
+
+`Cache-Control: public, max-age=10, s-maxage=10` on every response — past-date history is effectively immutable; today's bucket updates as `sweepFinalize` lands games. The Supabase service-role key only lives on Railway now (small security improvement vs. shipping it to Vercel for the history pages).
+
+#### `bin/web.ts`
+Entry point. Imports `services/lib/load-env` first to pick up `.env.local` for local-dev runs. `process.env.PORT` (Railway-provided); local dev defaults to 3001. SIGTERM/SIGINT call `server.close(...)` then `process.exit(0)`; a 10s force-exit timer (`.unref()`-d) guards against hung SSE connections during deploy.
+
+#### Why move SSE off Vercel
+Vercel Fluid Compute bills `provisioned_memory × instance_lifetime`. `/api/stream` allocated **256 MB held open ~290s per connection × concurrent viewers** — the worst-fit shape for that pricing model. Railway runs persistent Node processes that multiplex thousands of SSE connections in a single ~512 MB container, billed once per hour regardless of connection count. Same pub/sub bus (Upstash) on both sides; only the fan-out moved.
+
 ### API routes (Vercel)
 
-#### `app/api/snapshot/route.ts`
-GET. Reads `nrxi:snapshot` via `lib/pubsub/publisher.ts:getSnapshot`, sorts (Live > Delayed > Suspended > Pre > Final, then by inning desc), returns `{ games, ts }`. Used by the SSR initial paint.
+None for live data anymore. `app/api/stream/route.ts` and `app/api/snapshot/route.ts` were deleted as part of the Railway-web migration; the `app/api/` directory is empty.
 
-#### `app/api/stream/route.ts`
-GET. Server-Sent Events stream. On connect, sends a `snapshot` event with current state, then enters a `while !abort` loop polling `nrxi:snapshot` every 2s and emitting `update` events for any changed `gamePk`. 15s heartbeat prevents proxy timeouts. EventSource auto-reconnects on Vercel's ~300s function lifecycle boundary — in-route `setTimeout(cleanup, 290_000)` closes gracefully 10s early so the browser reconnects via its retry hint instead of seeing a "Task timed out" error.
-
-The two old WDK-era routes (`/api/cron/start-day` and `/api/workflows/*`) are gone — Railway is the cron source now, and there's no manual-trigger HTTP surface.
-
-**Memory ceilings** (declared in `vercel.ts` `functions` map): all routes default to **512 MB** (down from the Vercel default of 2048 MB). `app/api/stream/route.ts` runs on **256 MB** with `maxDuration: 300` because it holds one Upstash subscription open for ~290s per connection — memory × wall-time dominates cost on the SSE route, so it gets the lowest practical tier. No `waitUntil` / `after()` / fire-and-forget patterns anywhere on the Vercel side — adding any would extend the billed instance lifetime past the response, so re-size the affected route in `vercel.ts` at the same time.
+**Memory ceiling** (declared in `vercel.ts` `functions` map): all routes default to **512 MB** (down from the Vercel default of 2048 MB). The remaining Vercel routes are all thin RSC renders — `/` reads `nrxi:snapshot` once for initial paint, `/games/[pk]` does one Redis lookup, `/history/*` does one `fetch()` to the Railway web service. No `waitUntil` / `after()` / fire-and-forget patterns anywhere on the Vercel side — adding any would extend the billed instance lifetime past the response, so re-size the affected route in `vercel.ts` at the same time.
 
 ### Libraries
 
@@ -257,17 +293,18 @@ See [PROBABILITY_MODEL.md](PROBABILITY_MODEL.md) for the full math.
 
 #### `lib/pubsub/`
 - `publisher.ts` — `publishGameState(state)` does three things atomically (best-effort): publish to channel, hset to snapshot, expire snapshot. `getSnapshot()` reads the hash and tolerates both string and auto-parsed-object values (BUGS.md bug #4).
-- `subscriber.ts` — `iterateSnapshotChanges(redis, intervalMs, abort)` async generator polled by the SSE route.
+- `subscriber.ts` — `subscribeToChannel(channel, abort)` async generator wrapping Upstash's REST `/subscribe/{channel}` SSE endpoint; consumed by the Railway web service's stream handler. `iterateSnapshotChanges` (legacy hash-poll fallback) is retained but unused.
 
 #### `lib/cache/`
 - `redis.ts` — singleton Upstash `Redis`. Reads `KV_REST_API_*` first, falls back to `UPSTASH_REDIS_REST_*`. **Use the read/write token, NOT `KV_REST_API_READ_ONLY_TOKEN`** — the watcher writes constantly. `cacheJson(key, ttl, loader)` is a small read-through helper.
 - `keys.ts` — every Redis key shape lives here. Don't hardcode key strings elsewhere.
 
 #### `lib/db/`
+**Railway-only after the web-service migration.** Vercel-side pages no longer import any `lib/db/*` module — they `fetch()` the Railway web service instead, so `@supabase/supabase-js` is gone from Vercel function bundles. Confirmed by `grep -r "supabase\|SupabaseClient\|createClient" .next/server/app` returning zero matches after `next build`.
 - `supabase.ts` — service-role client (no auth/cookies). `isSupabaseConfigured()` guard makes the persist paths a clean no-op when env vars are missing.
-- `games.ts` — read helpers: `listGameDates`, `listGamesByDate`, `getGame`, `getInningPredictions`. Plus `gameDateOf(officialDate, startTime)` (exported) for bucketing by venue-local day.
+- `games.ts` — read helpers: `listGameDates`, `listGamesByDate`, `getGame`, `getInningPredictions`. Plus `gameDateOf(officialDate, startTime)` (exported) for bucketing by venue-local day. Consumed by `services/web/handlers/history.ts` and `services/lib/sweep-finalize.ts`.
 - `inning-predictions.ts` — write paths used by both the watcher and the supervisor sweep. `upsertInningPrediction({context, capture})` is the watcher's per-boundary fire-and-forget call: idempotent stub `games` UPSERT (`ON CONFLICT DO NOTHING`) + `inning_predictions` UPSERT keyed `(game_pk, inning, half)`. `finalizeGame({gamePk, freshFeed})` is the sweep's centralized finalization: UPSERT `games` (full final shape) + UPSERT `plays` (via `buildPlayRows`) + parallel UPDATE `inning_predictions.actual_runs` from `linescore.innings[]`. All idempotent.
-- `plays.ts` — `getGamePlays(gamePk)` returns the per-PA archive ordered by `at_bat_index`, used by the history detail page for per-inning hitter / pitcher rollups.
+- `plays.ts` — `getGamePlays(gamePk)` returns the per-PA archive ordered by `at_bat_index`, served by the Railway web service to the history detail page for per-inning hitter / pitcher rollups.
 
 #### `lib/history/`
 - `build-plays.ts` — pure transform `buildPlayRows(feed, gamePk): PlayRow[]`. Iterates `liveData.plays.allPlays`, keeps only `about.isComplete === true`, resolves batter / pitcher names from the boxscore players map (`ID${id}`) with `matchup.{batter,pitcher}.fullName` as a fallback, sums `runs_on_play` from `runners[]` with `movement.end === 'score'`. Called once per game from the supervisor's `sweepFinalize` against a fresh `fetchLiveFull` — zero per-tick cost.
@@ -314,15 +351,15 @@ Per-game card. Header is a 3-column grid `[logo | team name | runs]` × 2 rows (
 Drilldown. Full upcoming-lineup table with `pReach`%, plus the three-column nrXi/odds/env summary.
 
 #### `app/history/`
-Server-component-only routes for the persisted-games archive.
-- `page.tsx` — date strip + calendar popover (only data-days enabled). Lists games via `lib/db/games.ts:listGamesByDate`.
-- `[pk]/page.tsx` — single wide frozen-state `<GameCard wide>` whose `<LineScore>` cells are themselves the inning picker (no separate selector). Inning *number* click → full-inning composition; runs cell click → that half-inning. State lives in `<HistoricalGameView>` and is forwarded into `<GameCard>` → `<LineScore>`. Below the card, `<HistoricalPlaysPanel>` renders per-tab Batters / Pitchers / play-log tables sourced from `lib/db/plays.ts:getGamePlays`. The `/history` listing page wraps `<GameCard>` in a Next `<Link>` and uses `<SuppressPlayerLinks>` (defined in `components/lineup-column.tsx`) to prevent nested-`<a>` hydration errors. See [UI.md](UI.md) for details.
+Server-component-only routes for the persisted-games archive. Both pages **fetch from the Railway web service** rather than calling Supabase directly — `NRXI_API_BASE` env var on Vercel points at the Railway host. Each `fetch()` uses `{ next: { revalidate: 30 } }` so the Vercel data cache absorbs duplicate hits while staying fresh enough for today's bucket.
+- `page.tsx` — date strip + calendar popover (only data-days enabled). Calls `GET /history/dates` + `GET /history/games?date=...`. Renders a `<NotConfigured />` shell when `NRXI_API_BASE` is missing or the Railway service is down.
+- `[pk]/page.tsx` — single wide frozen-state `<GameCard wide>` whose `<LineScore>` cells are themselves the inning picker (no separate selector). One bundled `GET /history/game/:pk` fetch returns `{ game, innings, plays }` in one round-trip (replaces the old three-call `Promise.all` over `lib/db/*`). Inning *number* click → full-inning composition; runs cell click → that half-inning. State lives in `<HistoricalGameView>` and is forwarded into `<GameCard>` → `<LineScore>`. Below the card, `<HistoricalPlaysPanel>` renders per-tab Batters / Pitchers / play-log tables. The `/history` listing page wraps `<GameCard>` in a Next `<Link>` and uses `<SuppressPlayerLinks>` (defined in `components/lineup-column.tsx`) to prevent nested-`<a>` hydration errors. See [UI.md](UI.md) for details.
 
 #### `components/park-outline.tsx`
 Inline SVG glyph rendering each home park's silhouette. Reads `lib/parks/shapes.json` keyed by `game.venue.id`. Hairline 1.25px stroke that transitions to the accent color on `highlighted=true`.
 
 #### `lib/hooks/use-game-stream.ts`
-Client hook. Opens an `EventSource` to `/api/stream`, listens for `snapshot` and `update` events, dispatches into a `useReducer`. Auto-reconnects.
+Client hook. Opens an `EventSource` to `${NEXT_PUBLIC_NRXI_API_BASE}/stream` (the Railway web service), listens for `snapshot` and `update` events, dispatches into a `useReducer`. Auto-reconnects via EventSource's built-in retry. The env var is baked into the client bundle at build time — a deploy is required after changing it.
 
 ## Why these decisions
 
@@ -340,7 +377,11 @@ What we gave up vs. WDK: durable `sleep()` and free crash-replay. Replaced with 
 
 ### Why we kept Vercel for the frontend
 
-Free SSR + the SSE fan-out + Cache Components partial prerendering — all the things the watcher doesn't need but the dashboard does. Splitting compute lets each provider do what it's good at, and both connect to the same Upstash + Supabase data plane with no coordination.
+Free RSC rendering + Cache Components partial prerendering on the static-shell side, where Vercel's per-pageview cost model is excellent. The two workload shapes that *didn't* fit (long-lived SSE connections, Supabase reads on history pages) moved to the Railway web service. Both providers connect to the same Upstash + Supabase data plane with no coordination.
+
+### Why two Railway services (cron + web)
+
+The cron supervisor needs `restartPolicyType = "NEVER"` to let `process.exit(0)` scale the container to zero between firings — Railway treats clean exit on an `ALWAYS`-restart service as a failure and respawns indefinitely. The web service needs `restartPolicyType = "ALWAYS"` because it's serving HTTP and must stay up. Two services keep both modes in their natural shape; cost is one extra Hobby-tier container (~$5/mo). Both services build from the same repo and the same `package.json`; the only difference is the `startCommand` (`npx tsx bin/supervisor.ts` vs `npx tsx bin/web.ts`).
 
 ### Why Cache Components
 
@@ -350,7 +391,7 @@ Cost: every dynamic data access must be wrapped in `<Suspense>` and call `connec
 
 ## Trade-offs we accepted
 
-- **2-second SSE poll latency.** True Redis pub/sub from Vercel Functions is awkward (each connection is a TCP subscription, Upstash REST doesn't support it). 2s is well under the natural data-change rate (~7s minimum between inning transitions).
+- **SSE latency is now true pub/sub** (Upstash REST `/subscribe` from the long-lived Railway web service), not a 2-second hash-poll. The old Vercel SSE route did a 2s `iterateSnapshotChanges` poll because each Vercel function reset on a ~300s lifecycle; Railway's persistent process can hold the subscribe call indefinitely. Updates land within ~50ms of `publishGameState`.
 - **Park + weather double-counting** is now mitigated. v2 applies park factors per outcome (HR most, K/BB not at all) and weather likewise.
 - **HTML scraping fragility.** Both Baseball Savant and covers.com return HTML. Scrapers wrap try/catch with neutral fallbacks. Captured fixtures in `lib/env/__fixtures__/` give regression tests.
 - **Switch hitters use canonical platoon advantage** (v2 `actual` rule). `NRXI_SWITCH_HITTER_RULE=max` revives v1's generous `max(L, R)`.

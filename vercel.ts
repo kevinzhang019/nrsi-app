@@ -5,14 +5,19 @@ import type { VercelConfig } from "@vercel/config/v1";
 // (deleted in Phase D) and burn the Functions cap; Railway is the source of
 // truth for scheduled work now.
 //
-// `functions` memory ceilings: Vercel default is 2048 MB. nrXi routes do thin
-// Redis/Supabase reads + RSC render — 512 MB is plenty with cold-start
-// headroom. /api/stream is an SSE endpoint held open ~290s per connection;
-// memory × wall-time dominates its bill, so it gets the lowest tier.
+// SSE + snapshot JSON + history reads previously lived in app/api/* and are
+// now hosted on a separate always-on Railway "web" service (bin/web.ts).
+// Vercel's per-request provisioned-memory billing made long-lived /api/stream
+// connections (256 MB × ~290s held open) the dominant memory-time cost. The
+// client EventSource and history-page RSC fetches go straight to the Railway
+// host via NEXT_PUBLIC_NRXI_API_BASE / NRXI_API_BASE env vars.
+//
+// `functions` memory ceiling: Vercel default is 2048 MB. nrXi routes now do
+// thin RSC renders + at most one Redis/HTTP read — 512 MB has plenty of
+// cold-start headroom.
 export const config: VercelConfig = {
   framework: "nextjs",
   functions: {
     "app/**/*": { memory: 512 },
-    "app/api/stream/route.ts": { memory: 256, maxDuration: 300 },
   },
 };

@@ -95,27 +95,29 @@ function PitcherTable({ rows }: { rows: PitcherLine[] }) {
 function PlayLog({ rows }: { rows: PlayRow[] }) {
   if (rows.length === 0) return null;
   return (
-    <ol className="space-y-1 text-xs text-[var(--color-muted)]">
-      {rows.map((p) => (
-        <li
-          key={`${p.gamePk}-${p.atBatIndex}`}
-          className="flex items-baseline gap-3 border-t border-[var(--color-border)] pt-1.5"
-        >
-          <span className="w-8 shrink-0 text-right tabular-nums opacity-60">
-            #{p.atBatIndex}
-          </span>
-          <span className="text-[var(--color-fg)]">{p.batterName}</span>
-          <span className="opacity-60">vs</span>
-          <span>{p.pitcherName}</span>
-          <span className="ml-auto whitespace-nowrap text-[var(--color-fg)]">
-            {p.event ?? "—"}
-          </span>
-          <span className="w-12 shrink-0 text-right tabular-nums opacity-60">
-            {p.awayScore ?? 0}–{p.homeScore ?? 0}
-          </span>
-        </li>
-      ))}
-    </ol>
+    <div className="overflow-x-auto">
+      <ol className="min-w-max space-y-1 text-xs text-[var(--color-muted)]">
+        {rows.map((p) => (
+          <li
+            key={`${p.gamePk}-${p.atBatIndex}`}
+            className="flex items-baseline gap-3 whitespace-nowrap border-t border-[var(--color-border)] pt-1.5"
+          >
+            <span className="w-8 shrink-0 text-right tabular-nums opacity-60">
+              #{p.atBatIndex}
+            </span>
+            <span className="text-[var(--color-fg)]">{p.batterName}</span>
+            <span className="opacity-60">vs</span>
+            <span>{p.pitcherName}</span>
+            <span className="ml-auto whitespace-nowrap text-[var(--color-fg)]">
+              {p.event ?? "—"}
+            </span>
+            <span className="w-12 shrink-0 text-right tabular-nums opacity-60">
+              {p.awayScore ?? 0}–{p.homeScore ?? 0}
+            </span>
+          </li>
+        ))}
+      </ol>
+    </div>
   );
 }
 
@@ -159,7 +161,7 @@ export function HistoricalPlaysPanel({
     const batters = rollupBatters(slice);
     const pitchers = rollupPitchers(slice);
     return (
-      <div className="grid gap-6 rounded-md border border-[var(--color-border)] bg-[var(--color-card)] p-6 md:grid-cols-2">
+      <div className="grid gap-4 rounded-md border border-[var(--color-border)] bg-[var(--color-card)] p-4 sm:gap-6 sm:p-6 md:grid-cols-2">
         <Section title="batters this half">
           <HitterTable rows={batters} />
         </Section>
@@ -188,7 +190,7 @@ export function HistoricalPlaysPanel({
   return (
     <div className="space-y-6">
       {top.length > 0 && (
-        <div className="grid gap-6 rounded-md border border-[var(--color-border)] bg-[var(--color-card)] p-6 md:grid-cols-2">
+        <div className="grid gap-4 rounded-md border border-[var(--color-border)] bg-[var(--color-card)] p-4 sm:gap-6 sm:p-6 md:grid-cols-2">
           <div className="md:col-span-2">
             <h3 className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-accent)]">
               top {selection.inning}
@@ -208,7 +210,7 @@ export function HistoricalPlaysPanel({
         </div>
       )}
       {bottom.length > 0 && (
-        <div className="grid gap-6 rounded-md border border-[var(--color-border)] bg-[var(--color-card)] p-6 md:grid-cols-2">
+        <div className="grid gap-4 rounded-md border border-[var(--color-border)] bg-[var(--color-card)] p-4 sm:gap-6 sm:p-6 md:grid-cols-2">
           <div className="md:col-span-2">
             <h3 className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-accent)]">
               bottom {selection.inning}

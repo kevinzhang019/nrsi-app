@@ -2,7 +2,7 @@
 
 Everyday inspection, recovery, and cache-management commands. Most local commands assume `.env.local` is loaded for the Redis + Supabase tokens (`bin/*` scripts auto-load it via `services/lib/load-env.ts`; raw `curl` against Upstash needs `set -a; source .env.local; set +a`).
 
-The watcher lives on **Railway**; the frontend on **Vercel**; data in **Upstash Redis** + **Supabase**. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system picture.
+The watcher lives on **Railway** (cron service "supervisor"). The SSE multiplexer + JSON snapshot + history reads live on a second always-on Railway service ("web", `bin/web.ts`). The frontend shell renders on **Vercel**. Data plane = **Upstash Redis** + **Supabase**. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system picture.
 
 ---
 
@@ -35,8 +35,9 @@ JSON shape: `{t, level, scope, msg, ...payload}`. `gamePk` is in payload for per
 # Field-key dump of nrxi:snapshot (read-only, no writes)
 npx tsx bin/inspect-snapshot.ts
 
-# Snapshot via the public API (requires Vercel SSO if project is restricted)
-curl -s https://nrsi-app.vercel.app/api/snapshot | python3 -m json.tool
+# Snapshot via the public API — Railway web service, not Vercel
+curl -s "$NRXI_API_BASE/snapshot" | python3 -m json.tool
+# Or directly: curl -s https://nrxi-web.up.railway.app/snapshot | python3 -m json.tool
 
 # Raw Redis (load env first)
 set -a; source .env.local; set +a
@@ -276,18 +277,32 @@ If rows with stale `officialDate` keep appearing, something is writing to `nrxi:
 
 ## Env var checklist
 
-**Required on Railway:**
+**Required on Railway "supervisor" service** (cron, `bin/supervisor.ts`):
 - `KV_REST_API_URL` + `KV_REST_API_TOKEN` — Upstash Redis. **Use the read/write token, NOT `KV_REST_API_READ_ONLY_TOKEN`** — the watcher writes constantly (locks, snapshots, watcher-state, pubsub). `lib/cache/redis.ts:6-7` also accepts the `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` aliases.
 - `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` — from the Supabase dashboard (Settings → API). Persistence silently no-ops when these are unset.
 - `TZ=UTC` — keeps `todayInTz` and log timestamps unambiguous.
 
-**Optional:**
+**Required on Railway "web" service** (always-on, `bin/web.ts`):
+- `KV_REST_API_URL` + `KV_REST_API_TOKEN` — same as supervisor (read/write token; the web service publishes nothing but reads `nrxi:snapshot` + subscribes to `nrxi:games`).
+- `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` — same as supervisor; powers `/history/*` reads.
+- `PORT` — auto-injected by Railway. Local dev defaults to `3001`.
+
+**Optional on Railway "web" service:**
+- `NRXI_ALLOWED_ORIGINS` — comma-separated CORS allow-list. Defaults to `https://nrsi-app.vercel.app,http://localhost:3000,http://127.0.0.1:3000`. Add preview-deploy URLs (e.g. `https://nrsi-app-git-feature-x.vercel.app`) when needed; remove an origin to deny it. Requests with no `Origin` header (RSC, curl) get `*` regardless.
+
+**Optional on supervisor (model tuning knobs):**
 - `MLB_USER_AGENT` — defaults to `nrxi-app/0.1`. Only set for MLB-side request attribution.
 - `NRXI_DISABLE_FRAMING=1` — robo-ump kill switch (zeroes the framing factor).
 - `NRXI_FRAMING_CLAMP=0.02` — override the framing-factor half-width (default `0.03`). Useful mid-season if ABS adoption keeps shrinking the human zone faster than the default clamp tightening anticipated. Range `[0, 0.2]`; out-of-range values fall back to the default.
 - `NRXI_SWITCH_HITTER_RULE=max` — revives v1's `max(L, R)` switch-hitter rule (default is canonical platoon `actual`).
 
-**Required on Vercel** (after unpause): same `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` + `KV_REST_API_*`. Both providers read from the same data plane.
+**Required on Vercel:**
+- `NRXI_API_BASE` — full Railway "web" service URL with scheme, no trailing slash (e.g. `https://nrxi-web.up.railway.app`). Used by RSC fetches from `app/history/page.tsx` and `app/history/[pk]/page.tsx`. Picks up on the next request.
+- `NEXT_PUBLIC_NRXI_API_BASE` — same value. Used by `lib/hooks/use-game-stream.ts` for the browser EventSource → Railway connection. **Baked into the client bundle at build time**; a redeploy is required after changing it.
+
+**Optional on Vercel:**
+- `KV_REST_API_URL` + `KV_REST_API_TOKEN` — still required if `/` (homepage) or `/games/[pk]` reads `nrxi:snapshot` directly for initial paint. Vercel's Upstash Marketplace integration auto-injects these.
+- `SUPABASE_*` env vars are **no longer required on Vercel** — Vercel history pages don't touch Supabase directly. Leave them set (Marketplace auto-injects) but the runtime path no longer reads them.
 
 ---
 
@@ -316,24 +331,61 @@ If costs creep above ~$15/mo for three consecutive months, the migration plan ca
 
 ## Vercel function memory
 
-Fluid Compute bills `provisioned_memory × instance_lifetime`. Defaults are wildly oversized for nrXi's thin RSC + Redis/Supabase workload, so `vercel.ts` declares explicit ceilings:
+Fluid Compute bills `provisioned_memory × instance_lifetime`. Defaults are wildly oversized for nrXi's thin RSC workload, so `vercel.ts` declares an explicit ceiling:
 
 ```ts
 functions: {
   "app/**/*": { memory: 512 },
-  "app/api/stream/route.ts": { memory: 256, maxDuration: 300 },
 }
 ```
 
-- **512 MB default** for all RSC pages and route handlers (down from 2048 MB). Page routes do thin Redis/Supabase reads + RSC render; 512 leaves cold-start headroom on React 19 + motion + tailwind.
-- **256 MB on `/api/stream`** because the SSE route is held open ~290s per connection and the memory × wall-time product dominates its bill. The route does almost no allocation per connection — one Upstash subscription + a `TextEncoder`.
+- **512 MB default** for all RSC pages (down from 2048 MB). The remaining Vercel routes (`/`, `/games/[pk]`, `/history`, `/history/[pk]`) do thin Redis/HTTP reads + RSC render; 512 leaves cold-start headroom on React 19 + motion + tailwind.
 
-**Check in Vercel dashboard:** Project → Functions tab shows each route's memory tier on the latest deployment. Compare provisioned-memory line in Usage → Invocations week-over-week after a config change.
+**No more `/api/stream` per-route override** — SSE moved to the Railway "web" service in 2026-05 because Fluid Compute's per-connection provisioned-memory bill (256 MB × ~290s held open × concurrent viewers) was the dominant cost driver. See [ARCHITECTURE.md](ARCHITECTURE.md) → "Railway web service" for the migration rationale.
+
+**Check in Vercel dashboard:** Project → Functions tab shows each route's memory tier on the latest deployment. Compare provisioned-memory line in Usage → Invocations week-over-week after a config change. Post-migration the line should be **a small fraction** of pre-migration values — if it isn't, check whether something on Vercel still imports `@supabase/supabase-js` (run `grep -rl "supabase\|SupabaseClient\|createClient" .next/server/app` after a build; expect zero matches).
 
 **If you add new routes / fire-and-forget work:**
 - New `app/**` routes inherit the 512 MB default automatically (glob match).
 - Adding `waitUntil(...)` or `after(...)` extends instance lifetime past the response — re-size the affected route in `vercel.ts` at the same time. There's currently **zero `waitUntil` / `after()` on the Vercel side**; it's audited and recorded in CLAUDE.md.
 - If a page route OOMs (visible in function logs as `Process exited`), bump that specific glob to 1024 MB rather than the whole project.
+- **Don't move SSE or long-lived HTTP back to Vercel without a memory-time analysis** — it's what caused the prior overrun.
+
+---
+
+## Railway "web" service health checks
+
+Always-on, separate from the cron supervisor. Capture the public URL from the Railway dashboard → service → Settings → Networking. With `NRXI_API_BASE` set locally:
+
+```bash
+# Liveness
+curl -s "$NRXI_API_BASE/healthz"
+# → ok
+
+# Snapshot wire shape
+curl -s "$NRXI_API_BASE/snapshot" | jq '.games | length, .ts'
+
+# SSE stream (3s sample; should emit `retry: 1000`, `event: snapshot`, then heartbeats)
+curl -sN --max-time 3 "$NRXI_API_BASE/stream" | head -c 600
+
+# History endpoints
+curl -s "$NRXI_API_BASE/history/dates" | jq '.dates | length'
+curl -s "$NRXI_API_BASE/history/games?date=$(date -u +%F)" | jq '.games | length'
+curl -s "$NRXI_API_BASE/history/game/<gamePk>" | jq '.game.gamePk, (.innings | length), (.plays | length)'
+
+# CORS preflight
+curl -s -o /dev/null -w "%{http_code}\n" -X OPTIONS \
+  -H "Origin: https://nrsi-app.vercel.app" \
+  -H "Access-Control-Request-Method: GET" \
+  "$NRXI_API_BASE/stream"
+# → 204
+```
+
+**If the web service is down** — Vercel dashboard shows the homepage rendering but the live cards never update; `/history` shows the "History service unavailable" shell. Railway dashboard → service → Logs to inspect. Recovery: usual Railway redeploy or "Run Now" from the dashboard. Watchers + supervisor cron are unaffected — they only touch Upstash + Supabase, not the web service.
+
+**Recovering from a CORS misconfig** — if a Vercel preview URL gets the "Access-Control-Allow-Origin missing" error in the browser, add it to `NRXI_ALLOWED_ORIGINS` on the Railway web service and restart. Production `https://nrsi-app.vercel.app` is always in the default allow-list.
+
+**Local dev parity:** `npx tsx bin/web.ts` (uses `.env.local`, listens on `:3001`). Set `NEXT_PUBLIC_NRXI_API_BASE=http://localhost:3001` in `.env.local` for the Next dev server to point at it.
 
 ---
 

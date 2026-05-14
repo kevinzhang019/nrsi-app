@@ -33,7 +33,13 @@ export function useGameStream(initial: GameState[]) {
   }));
 
   useEffect(() => {
-    const es = new EventSource("/api/stream");
+    // SSE is hosted on the Railway "web" service (see bin/web.ts), not on
+    // Vercel — Fluid Compute's per-request provisioned-memory billing makes
+    // long-lived connections prohibitively expensive. NEXT_PUBLIC_NRXI_API_BASE
+    // is set per-environment on Vercel and falls back to a relative path so
+    // local dev can proxy via `vercel dev` if needed.
+    const apiBase = process.env.NEXT_PUBLIC_NRXI_API_BASE ?? "";
+    const es = new EventSource(`${apiBase}/stream`);
     es.addEventListener("snapshot", (e) => {
       try {
         const data = JSON.parse((e as MessageEvent).data);
